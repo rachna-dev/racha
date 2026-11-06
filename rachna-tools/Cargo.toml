@@ -1,0 +1,16 @@
+[package]
+name = "rachna-tools"
+description = "Declared tool exposure: .rachna/bin generation and per-tool scoping."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rachna-core.workspace = true
+camino.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

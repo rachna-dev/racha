@@ -1,0 +1,98 @@
+# Rachna — flat workspace. Crates live at the repo root, not under crates/.
+# Layout and seam rationale: design-docs/01-ARCHITECTURE.md §1.
+
+[workspace]
+resolver = "2"
+members = [
+  "rachna-core",
+  "rachna-config",
+  "rachna-policy",
+  "rachna-store",
+  "rachna-vm",
+  "rachna-broker",
+  "rachna-proto",
+  "rachna-paths",
+  "rachna-tools",
+  "rachna-ide",
+  "rachna-cli",
+  "rachna-agent",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shriyans/rachna"
+
+[workspace.dependencies]
+# Internal crates. Kept here so member manifests stay one line each.
+rachna-core = { path = "rachna-core" }
+rachna-config = { path = "rachna-config" }
+rachna-policy = { path = "rachna-policy" }
+rachna-store = { path = "rachna-store" }
+rachna-vm = { path = "rachna-vm" }
+rachna-broker = { path = "rachna-broker" }
+rachna-proto = { path = "rachna-proto" }
+rachna-paths = { path = "rachna-paths" }
+rachna-tools = { path = "rachna-tools" }
+rachna-ide = { path = "rachna-ide" }
+
+# External. See 01-ARCHITECTURE.md §10 for why each is here.
+anyhow = "1"
+async-trait = "0.1"
+camino = { version = "1", features = ["serde1"] }
+clap = { version = "4", features = ["derive", "env"] }
+notify = "7"
+rnix = "0.11"
+rowan = "0.15"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = [
+  "serde",
+  "formatting",
+  "parsing",
+  "macros",
+] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "process",
+  "fs",
+  "io-util",
+  "net",
+  "sync",
+  "time",
+  "signal",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Dev-dependencies shared across crates.
+insta = { version = "1", features = ["json"] }
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# The broker and policy engine are security-relevant: no silent panics.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+# Catch the "I'll just convert this integer" class of bug early.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+
+[profile.release]
+# A shim binary is spawned per editor tool invocation (00-PRODUCT.md §6.6),
+# so startup size and time matter more than peak throughput.
+lto = "thin"
+codegen-units = 1
+strip = true

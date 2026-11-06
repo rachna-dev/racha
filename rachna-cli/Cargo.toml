@@ -1,0 +1,32 @@
+[package]
+name = "rachna-cli"
+description = "The rachna binary: argv dispatch, multi-call shims, and all human-facing output."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rachna"
+path = "src/main.rs"
+
+[dependencies]
+rachna-core.workspace = true
+rachna-broker.workspace = true
+rachna-config.workspace = true
+rachna-ide.workspace = true
+rachna-paths.workspace = true
+rachna-policy.workspace = true
+rachna-store.workspace = true
+rachna-tools.workspace = true
+rachna-vm.workspace = true
+anyhow.workspace = true
+camino.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

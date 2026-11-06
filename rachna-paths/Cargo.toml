@@ -1,0 +1,19 @@
+[package]
+name = "rachna-paths"
+description = "The host↔guest path and URI translation library. Used by every shim, without exception."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rachna-core.workspace = true
+camino.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

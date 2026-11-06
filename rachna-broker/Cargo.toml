@@ -1,0 +1,23 @@
+[package]
+name = "rachna-broker"
+description = "Rachna's trusted host-side supervisor: watch, evaluate, classify, enforce, record."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rachna-core.workspace = true
+rachna-config.workspace = true
+rachna-policy.workspace = true
+rachna-store.workspace = true
+rachna-vm.workspace = true
+rachna-proto.workspace = true
+camino.workspace = true
+notify.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

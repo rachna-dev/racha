@@ -1,0 +1,21 @@
+[package]
+name = "rachna-config"
+description = "Evaluates rachna.nix into an ExecSpec and a PolicySpec; edits it surgically."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rachna-core.workspace = true
+camino.workspace = true
+rnix.workspace = true
+rowan.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

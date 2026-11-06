@@ -1,0 +1,19 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Rachna's own per-project state. Observed data and VM disks, never permissions
+# — those live in rachna.nix, which is always committed.
+# See design-docs/00-PRODUCT.md §8.
+/.rachna
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
