@@ -161,6 +161,7 @@ mod tests {
     }
 }
 
+pub mod decide;
 pub mod decision;
 pub mod grant;
 pub mod policy;
