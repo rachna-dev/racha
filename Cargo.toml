@@ -47,6 +47,7 @@ publish = false
 # added in the commit that first uses it.
 
 [dev-dependencies]
+proptest = { version = "1.12.0", default-features = false, features = ["std", "bit-set"] }
 # Also pending the comparison — property testing lands with the path
 # translation and policy work that needs it.
 

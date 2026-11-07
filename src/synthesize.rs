@@ -160,7 +160,23 @@ fn network_grants(observed: &[Request]) -> Vec<Grant> {
     let endpoints: BTreeSet<&Endpoint> = observed
         .iter()
         .filter_map(|request| match request {
-            Request::Network { endpoint, .. } => Some(endpoint),
+            // A wildcard-shaped observation is DROPPED, not emitted.
+            //
+            // Found by the property test in `tests/properties.rs` on its first
+            // run: an observation of host `*.a` was echoed verbatim, and the
+            // resulting grant covers every `*.a` subdomain — synthesize
+            // widening a policy while claiming to narrow it, which is rule 1
+            // inverted and the worst bug this function can have.
+            //
+            // `*` is not valid in a hostname a client can dial (RFC 1035
+            // allows letters, digits and hyphen), so the broker should never
+            // construct one. That makes this unreachable today — and it is
+            // still fixed here rather than argued away, because the broker
+            // parses data the guest influences, and `17` §1 already records
+            // what happens when host-side code trusts attacker-chosen bytes.
+            // Dropping is correct over sanitising: an observation we cannot
+            // trust must not become a rule.
+            Request::Network { endpoint, .. } if !endpoint.is_wildcard() => Some(endpoint),
             _ => None,
         })
         .collect();
@@ -395,6 +411,62 @@ mod tests {
                 },
             ],
             "duplicates collapse; no wildcard is invented"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_shaped_observation_is_dropped_rather_than_echoed() {
+        // Found by the property test, not by review. An observation whose host
+        // is itself wildcard-shaped must not become a grant: echoing it would
+        // produce a rule covering every subdomain, which is synthesize
+        // widening a policy while claiming to narrow it.
+        //
+        // `*` is not dialable (RFC 1035), so the broker should never build
+        // this — fixed anyway, because the broker parses guest-influenced data
+        // (`17` §1).
+        let grants = synthesized(vec![
+            net("*.evil.com", 443),
+            net("storage.googleapis.com", 443),
+        ]);
+        assert_eq!(
+            grants,
+            vec![Grant::Network {
+                endpoint: endpoint("storage.googleapis.com", 443)
+            }],
+            "the wildcard observation must be dropped, the real one kept"
+        );
+    }
+
+    #[test]
+    fn dropping_a_wildcard_does_not_drop_the_whole_category() {
+        // Guards the obvious wrong fix: bailing out of network_grants
+        // entirely when any observation looks suspicious would silently lose
+        // every legitimate host alongside it.
+        let grants = synthesized(vec![
+            net("*.evil.com", 443),
+            net("a.example.com", 443),
+            net("b.example.com", 443),
+        ]);
+        assert_eq!(grants.len(), 2, "only the wildcard is dropped");
+    }
+
+    #[test]
+    fn a_bare_star_is_not_a_wildcard_and_is_not_dropped() {
+        // Documents a deliberate boundary. `*` has no `*.` prefix, so it is
+        // not treated as a pattern — and `decide`'s host matching falls
+        // through to exact equality for it, meaning the resulting grant
+        // matches only a host literally named `*` rather than acting as a
+        // catch-all. Verified against `decide::host_matches`.
+        //
+        // A first draft of the test above asserted this was dropped. It is
+        // not, and keeping it is correct: dropping a harmless observation
+        // would lose information for no safety gain.
+        let grants = synthesized(vec![net("*", 443)]);
+        assert_eq!(
+            grants,
+            vec![Grant::Network {
+                endpoint: endpoint("*", 443)
+            }]
         );
     }
 
