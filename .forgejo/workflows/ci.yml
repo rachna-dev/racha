@@ -1,0 +1,73 @@
+# Forgejo Actions. Same checks as GitHub — they are in ci/gate.sh, which both
+# workflows call — but the toolchain comes from rustup rather than Nix.
+#
+# Why the difference: Forgejo runners cannot reliably use the cachix actions
+# that install and cache Nix, and installing Nix per job without a binary cache
+# is slow enough to be impractical. rustup-based jobs are self-contained and
+# fast, at the cost of not exercising the devenv shell itself. The GitHub
+# `gate` job covers that, so between the two providers both paths are checked.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    name: gate (fmt, clippy, tests)
+    runs-on: docker
+    container:
+      image: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: install tools
+        run: |
+          rustup component add rustfmt clippy
+          cargo install cargo-nextest --locked
+      - run: ci/gate.sh gate
+
+  mutants:
+    name: mutation testing (a surviving mutant fails the build)
+    runs-on: docker
+    container:
+      image: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: install tools
+        run: |
+          cargo install cargo-nextest --locked
+          cargo install cargo-mutants --locked
+      - run: ci/gate.sh mutants
+      - name: upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: mutants-report
+          path: mutants.out/
+
+  deps:
+    name: dependency audit
+    runs-on: docker
+    container:
+      image: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: install tools
+        run: |
+          cargo install cargo-machete --locked
+          cargo install cargo-deny --locked
+      - run: ci/gate.sh deps
+
+  coverage:
+    name: coverage (reported, not gated)
+    runs-on: docker
+    container:
+      image: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: install tools
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install cargo-nextest cargo-llvm-cov --locked
+      - run: cargo llvm-cov nextest --summary-only

@@ -1,8 +1,6 @@
-# CI mirrors the gate in AGENTS.md, plus the mutation bar that gates it.
-#
-# The important job is `mutants`: for a security boundary, "does the suite FAIL
-# when behaviour changes" is the honest measure. 100% line coverage with
-# assertion-free tests proves nothing, so a surviving mutant fails the build.
+# GitHub Actions. The checks themselves live in ci/gate.sh so this and the
+# Forgejo workflow cannot drift on what "passing" means — only on how the
+# toolchain is obtained.
 name: ci
 
 on:
@@ -25,12 +23,7 @@ jobs:
         with:
           name: devenv
       - run: nix profile install nixpkgs#devenv
-      - name: fmt
-        run: devenv shell -- cargo fmt --all --check
-      - name: clippy
-        run: devenv shell -- cargo clippy --workspace --all-targets -- -D warnings
-      - name: tests
-        run: devenv shell -- cargo nextest run --workspace
+      - run: devenv shell -- ci/gate.sh gate
 
   mutants:
     name: mutation testing (a surviving mutant fails the build)
@@ -42,11 +35,7 @@ jobs:
         with:
           name: devenv
       - run: nix profile install nixpkgs#devenv
-      # cargo-mutants exits non-zero when a mutant survives, which is exactly
-      # the gate we want: a surviving mutant in policy or path code is a bug in
-      # the test suite, not an acceptable gap.
-      - name: mutants
-        run: devenv shell -- cargo mutants --colors=never --in-place
+      - run: devenv shell -- ci/gate.sh mutants
       - name: upload mutants report
         if: always()
         uses: actions/upload-artifact@v4
@@ -54,25 +43,6 @@ jobs:
           name: mutants-report
           path: mutants.out/
           if-no-files-found: ignore
-
-  coverage:
-    name: coverage (reported, not gated)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # Coverage is a floor, not the bar — see AGENTS.md. Reported so a drop is
-      # visible, never gated, so nobody games the number.
-      #
-      # Installed via rustup rather than the devenv shell: cargo-llvm-cov fails
-      # its own test suite in the pinned nixpkgs on both platforms, so it is
-      # deliberately absent from the shell.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: taiki-e/install-action@nextest
-      - name: coverage
-        run: cargo llvm-cov nextest --summary-only
 
   deps:
     name: dependency audit
@@ -84,5 +54,20 @@ jobs:
         with:
           name: devenv
       - run: nix profile install nixpkgs#devenv
-      - run: devenv shell -- cargo machete
-      - run: devenv shell -- cargo deny check
+      - run: devenv shell -- ci/gate.sh deps
+
+  coverage:
+    name: coverage (reported, not gated)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Installed via rustup rather than the devenv shell: cargo-llvm-cov fails
+      # its own test suite in the pinned nixpkgs on both platforms, so it is
+      # deliberately absent there. Coverage is a floor, never gated, so nobody
+      # games the number — see AGENTS.md.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+      - run: cargo llvm-cov nextest --summary-only

@@ -65,13 +65,10 @@
   scripts = {
     # THE GATE from AGENTS.md: before starting a task and before calling it
     # done. A gate already failing when you start gets fixed first.
-    check.exec = ''
-      set -euo pipefail
-      echo "▸ fmt"    && cargo fmt --all --check
-      echo "▸ clippy" && cargo clippy --workspace --all-targets -- -D warnings
-      echo "▸ test"   && cargo nextest run --workspace
-      echo "✓ gate passed"
-    '';
+    #
+    # Defined in ci/gate.sh so the shell, GitHub and Forgejo all run exactly
+    # the same checks — they cannot drift on what "passing" means.
+    check.exec = "exec ./ci/gate.sh gate";
 
     fix.exec = ''
       set -euo pipefail
@@ -82,10 +79,7 @@
     # Mutation testing is the honest measure for a security boundary: 100%
     # line coverage with assertion-free tests proves nothing. A surviving
     # mutant means the suite does not actually check that behaviour.
-    mutants.exec = ''
-      set -euo pipefail
-      cargo mutants --colors=always "$@"
-    '';
+    mutants.exec = "exec ./ci/gate.sh mutants";
 
     # Coverage is deliberately NOT in this shell.
     #
@@ -101,10 +95,7 @@
       exit 1
     '';
 
-    deps.exec = ''
-      set -euo pipefail
-      cargo machete && cargo deny check
-    '';
+    deps.exec = "exec ./ci/gate.sh deps";
   };
 
   # https://devenv.sh/basics/
