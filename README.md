@@ -88,6 +88,7 @@ Decisions that now rest on evidence rather than reputation:
 | [`13-SPIKE-ISOLATION-ROUND3.md`](design-docs/13-SPIKE-ISOLATION-ROUND3.md) | The last open questions closed: I/O throttling, TOCTOU, virtiofsd's confinement, macOS escapes. |
 | [`14-MACOS-INODE-FIXES.md`](design-docs/14-MACOS-INODE-FIXES.md) | The two macOS escapes are fixable by us — both fixes verified working. |
 | [`16-SPIKE-REAL-SERVICES.md`](design-docs/16-SPIKE-REAL-SERVICES.md) | PostgreSQL + Node across pause, suspend and restore. The services story validated. |
+| [`17-DEPENDENCIES.md`](design-docs/17-DEPENDENCIES.md) | Every library choice with the alternatives compared — including three of the first six that were wrong. |
 | [`idea.md`](idea.md) | The original brain-dump. Superseded where it disagrees with the above. |
 | [`AGENTS.md`](AGENTS.md) | Rules for anyone — human or agent — changing this repo: the gate, code quality, testing bar. |
 

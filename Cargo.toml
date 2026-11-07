@@ -7,20 +7,32 @@ name = "rachna"
 description = "A declarative, isolated development environment you can pause, resume, and throw away."
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.82"
+# Raised from 1.82 on evidence, not preference. 1.82 silently capped `time` at
+# 0.3.44 — inside the range of RUSTSEC-2026-0009, a stack-exhaustion DoS whose
+# fix requires 1.88 — and held back rusqlite, rnix, clap, notify and proptest.
+# Edition-2024 crates need >=1.85 regardless of their declared MSRV, because
+# the resolver does not filter on edition: you get a version that resolves and
+# then fails to compile. 1.82 was buying nothing and costing a live advisory.
+# See design-docs/17-DEPENDENCIES.md.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shriyans/rachna"
 publish = false
 
 [dependencies]
-camino = { version = "1", features = ["serde1"] }
-serde = { version = "1", features = ["derive"] }
-thiserror = "2"
-time = { version = "0.3", features = ["serde", "macros"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+# DELIBERATELY EMPTY until step 2 needs something and the alternatives have
+# been compared (AGENTS.md, "Evaluate alternatives before adding a
+# dependency"). An earlier version of this file listed camino, serde,
+# thiserror, time and uuid — 23 transitive crates — chosen before that rule
+# existed and before any code used them. `time` and `uuid` were referenced
+# nowhere at all.
+#
+# The comparison lives in design-docs/17-DEPENDENCIES.md; each dependency is
+# added in the commit that first uses it.
 
 [dev-dependencies]
-proptest = "1"
+# Also pending the comparison — property testing lands with the path
+# translation and policy work that needs it.
 
 [lints.rust]
 unsafe_code = "deny"
