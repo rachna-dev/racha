@@ -29,6 +29,11 @@ unreachable_pub = "warn"
 
 [lints.clippy]
 # This is a security boundary: no silent panics in policy or path code.
+#
+# NOTE these also fire in test code, where AGENTS.md says unwrap/expect are
+# fine and clearer than ceremony. src/lib.rs therefore carries a
+# cfg_attr(test, allow(..)) at the crate root. Verified rather than assumed:
+# without it, a single unwrap() in a test fails the gate.
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
