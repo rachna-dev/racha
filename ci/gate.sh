@@ -36,7 +36,16 @@ mutants() {
   echo "  missed   = broken code went unnoticed      -> want this ZERO"
   echo "  unviable = did not compile, nothing tested -> neutral"
   echo
-  cargo mutants --colors=never --in-place
+  # NOT --in-place. That flag mutates the real source tree, so an
+  # interrupted run (Ctrl-C, a timeout, a killed shell) leaves mutated code
+  # behind — and a mutated `is_met_by` or `network_grants` can be staged and
+  # committed, which happened once in development. The default copies the tree
+  # instead, and a crashed run can corrupt only the copy.
+  #
+  # Measured, and it is also FASTER: 35s vs 104s on one file, because the copy
+  # mode parallelises across trees while --in-place must serialise on the one.
+  # The flag was costing both safety and speed.
+  cargo mutants --colors=never
 }
 
 deps() {

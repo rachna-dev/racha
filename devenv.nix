@@ -124,6 +124,32 @@
     clippy.enable = true;
     nixfmt.enable = true;
     shellcheck.enable = true;
+
+    # Refuse to commit a cargo-mutants artifact.
+    #
+    # `cargo mutants --in-place` edits the real source tree, so an interrupted
+    # run leaves deliberately-broken code behind. This happened once in
+    # development: a mutated `is_met_by` (the audit evidence threshold) and a
+    # gutted `network_grants` were staged by a commit that ran while mutation
+    # testing was still going. `ci/gate.sh` no longer passes --in-place, and
+    # this is the backstop for a run started by hand.
+    #
+    # Committing a mutant is not a cosmetic mistake: every mutant is a
+    # security-relevant behaviour change that the test suite is known to
+    # detect, so it would land as code whose tests are guaranteed to fail.
+    no-mutation-artifacts = {
+      enable = true;
+      name = "no cargo-mutants artifacts";
+      entry = "${pkgs.writeShellScript "no-mutation-artifacts" ''
+        if grep -rln 'changed by cargo-mutants' "$@" 2>/dev/null; then
+          echo "refusing to commit: the files above hold cargo-mutants edits." >&2
+          echo "restore them with: git checkout HEAD -- <file>" >&2
+          exit 1
+        fi
+      ''}";
+      files = "\\.rs$";
+      pass_filenames = true;
+    };
   };
 
   # See full reference at https://devenv.sh/reference/options/
