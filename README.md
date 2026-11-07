@@ -99,6 +99,12 @@ What does not hold: the declared guest **process limit is silently ignored** (51
 
 **On keeping policy in the repo.** `devvm` deliberately does not, reasoning that *"Rules never come from the project folder, because the VM can write it."* The objection is correct: a guest that can write its own policy file can grant itself permissions — concretely, via an `npm` postinstall script appending an `allow` rule. Rachna's answer is to **exclude `rachna.nix` from the workspace mount**, so the guest cannot see or write it and the host evaluates it before any guest exists. The policy stays committed, diffable and shared with the team; it simply is not visible from inside the thing it governs. ([`00-PRODUCT.md` §3.11](design-docs/00-PRODUCT.md))
 
+## What comes first
+
+**Security, correctness and consistency are the core; performance is not.** Performance improves over time — a boundary that leaks, a check that can be bypassed, or a datastore that silently loses writes does not.
+
+So the build list ([`15-FINDINGS.md` §7](design-docs/15-FINDINGS.md)) is ordered that way. Tier 1 is correctness defects that measurement actually found: inode-aware exclusion checking, snapshot encryption on Linux, durable service data, enforcing the guest process limit, credential placeholders, and verifying enforcement rather than trusting it. Cold boot at 6.97 s and restore at ~2.2 s are tier 3, and can get better later.
+
 ## Development
 
 ```bash
