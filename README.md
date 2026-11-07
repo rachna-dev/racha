@@ -89,6 +89,7 @@ Decisions that now rest on evidence rather than reputation:
 | [`14-MACOS-INODE-FIXES.md`](design-docs/14-MACOS-INODE-FIXES.md) | The two macOS escapes are fixable by us — both fixes verified working. |
 | [`16-SPIKE-REAL-SERVICES.md`](design-docs/16-SPIKE-REAL-SERVICES.md) | PostgreSQL + Node across pause, suspend and restore. The services story validated. |
 | [`17-DEPENDENCIES.md`](design-docs/17-DEPENDENCIES.md) | Every library choice with the alternatives compared — including three of the first six that were wrong. |
+| [`18-NIX-BOUNDARY.md`](design-docs/18-NIX-BOUNDARY.md) | What Rachna does with Nix and what it refuses to — evaluation, editing, search, formatting, LSP. |
 | [`idea.md`](idea.md) | The original brain-dump. Superseded where it disagrees with the above. |
 | [`AGENTS.md`](AGENTS.md) | Rules for anyone — human or agent — changing this repo: the gate, code quality, testing bar. |
 
