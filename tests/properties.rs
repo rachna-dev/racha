@@ -16,6 +16,7 @@ use rachna::decide::{decide, Capabilities, Policy};
 use rachna::decision::{Access, Category, Decision};
 use rachna::grant::{Endpoint, Grant, Request};
 use rachna::policy::{Profile, Tier};
+use rachna::summary::AccessSummary;
 use rachna::synthesize::{synthesize, Evidence, Observations, Threshold};
 use std::path::PathBuf;
 
@@ -247,6 +248,44 @@ proptest! {
         if a.covers(b) && b.covers(a) {
             prop_assert_eq!(a, b);
         }
+    }
+
+    /// The access summary names every category, for any config.
+    ///
+    /// A category missing from the output is a grant the user believes they do
+    /// not have (`00` §3.10c). This must hold for arbitrary grant sets, not
+    /// just the ones in the unit tests.
+    #[test]
+    fn the_summary_always_names_every_category(
+        tier in tier(),
+        profile in profile(),
+        grants in prop::collection::vec(grant(), 0..10),
+    ) {
+        let rendered = AccessSummary::new(tier, profile, &grants).to_string();
+        for category in Category::ALL {
+            prop_assert!(
+                rendered.contains(category.as_str()),
+                "{category} missing from summary:\n{rendered}",
+            );
+        }
+    }
+
+    /// The summary fingerprint ignores grant order and duplication.
+    ///
+    /// Reformatting or reordering `rachna.nix` must not re-gate, or the
+    /// acknowledgement becomes noise people learn to alias away.
+    #[test]
+    fn the_fingerprint_ignores_order_and_duplicates(
+        tier in tier(),
+        profile in profile(),
+        grants in prop::collection::vec(grant(), 1..8),
+    ) {
+        let mut shuffled: Vec<_> = grants.iter().rev().cloned().collect();
+        shuffled.extend(grants.iter().cloned());  // every grant twice, reversed first
+        prop_assert_eq!(
+            AccessSummary::new(tier, profile, &grants).fingerprint(),
+            AccessSummary::new(tier, profile, &shuffled).fingerprint(),
+        );
     }
 
     /// A profile never claims authority over the network axis.
