@@ -25,6 +25,23 @@ use std::collections::BTreeSet;
 
 /// What a config grants, grouped for display.
 ///
+/// # Example
+///
+/// ```text
+///   rachna.nix grants, first run:
+///
+///   network   github.com:443
+///             registry.npmjs.org:443
+///   fs        /Users/you/.npmrc  read-only
+///             /workspace  read-write
+///   tool      rust-analyzer  lsp, no network
+///   port      3000 -> 3000
+///   secret    aws  <- credential access
+///
+///   this config has not run here before.
+///   review it, then:  rachna start --accept
+/// ```
+///
 /// Built from an evaluated policy. Holds the axes as well as the grants
 /// because `tier = open` grants network access that no [`Grant`] records —
 /// omitting it would be a completeness hole of exactly the kind property 1
@@ -84,7 +101,10 @@ impl AccessSummary {
                     format!("{name}  {kind}, {net}")
                 }
                 Grant::Port { guest, host } => format!("{guest} -> {host}"),
-                Grant::Secret { name } => name.clone(),
+                // Marked, because credential access is the grant a user most
+                // needs to notice in a repo they just cloned. Everything else
+                // here is scoped; a credential is the thing that leaves.
+                Grant::Secret { name } => format!("{name}  <- credential access"),
             });
         }
         entries.into_iter().collect()
@@ -149,7 +169,9 @@ impl fmt::Display for AccessSummary {
                 }
             }
         }
-        Ok(())
+        // Trailing blank line, so a caller appending the acknowledgement
+        // prompt does not have to remember one.
+        writeln!(f)
     }
 }
 
@@ -421,7 +443,7 @@ mod tests {
         );
         assert_eq!(find("fs"), vec!["/workspace  read-write"]);
         assert_eq!(find("port"), vec!["3000 -> 3000"]);
-        assert_eq!(find("secret"), vec!["aws"]);
+        assert_eq!(find("secret"), vec!["aws  <- credential access"]);
         assert_eq!(find("tool"), vec!["rust-analyzer  lsp, no network"]);
     }
 
@@ -457,6 +479,9 @@ mod tests {
         let rendered = summary.to_string();
         assert!(rendered.contains("secret"), "{rendered}");
         assert!(rendered.contains("aws"), "{rendered}");
+        // Flagged explicitly: everything else in this summary is scoped, and
+        // a credential is the thing that leaves the machine.
+        assert!(rendered.contains("<- credential access"), "{rendered}");
     }
 
     #[test]
