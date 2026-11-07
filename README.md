@@ -20,9 +20,11 @@ A declarative, security-focused development environment manager. Each project ge
   services.postgres = { enable = true; port = 5432; };
 
   isolation = {
-    profile = "development";
+    tier    = "allowlist";                 # network: only what you allow
+    profile = "development";               # filesystem, devices, credentials
+
     network.allow = [ "registry.npmjs.org:443" ];
-    credentials.default = "deny";          # your SSH keys are not in there
+    credentials = "placeholder";           # the guest never holds a real token
   };
 
   tools.expose = [
@@ -34,14 +36,16 @@ A declarative, security-focused development environment manager. Each project ge
 
 A command that needs something undeclared fails and tells you the narrowest grant that would fix it. Weeks later, `rachna audit` tells you which grants were never used and offers to remove them. **There are no prompts** — the file is the only place a permission can exist, so `git diff` is a complete audit of your environment's authority.
 
-## Why not a container
+## What is actually new here
 
-Dev Containers solved "reproducible environment, editor works," and Rachna does not try to beat them at that. It targets four things container-based tooling structurally cannot do:
+Isolation is **not** the differentiator. Several projects ship per-project microVMs with host-enforced deny-by-default networking — [`devvm`](https://github.com/devvmhq/devvm) is the nearest neighbour and independently arrived at much of this design — and Docker now ships a first-party microVM sandbox. Treat that as parity, not a pitch. ([`07-LANDSCAPE.md`](design-docs/07-LANDSCAPE.md) is the full survey.)
 
-1. **Real isolation** — a VM boundary with host-enforced policy, not a shared kernel with `~/.ssh` mounted in for convenience.
-2. **The permission loop** — deny-by-default made survivable: diagnose what was blocked, then audit what went unused and narrow it.
-3. **Suspend / resume / snapshot** — close the laptop, come back to a warm Postgres and a still-running server.
-4. **Nix-grade reproducibility** — actually pinned, with a binary cache instead of a Dockerfile that rots.
+What is unclaimed, sharpest first:
+
+1. **Tool exposure as a scoped permission.** Your LSP, formatter and debugger are policy objects — `rust-analyzer` gets the workspace and no network. **Not found anywhere in the field.** The proxy mechanics are a solved, crowded problem; tool-as-permission exists only for LLM/MCP allowlisting; the two have never been joined. Dev Containers structurally cannot do it — the extension host in a container holds the container's full ambient authority by construction.
+2. **Suspend / resume / snapshot.** Close the laptop, come back to a warm Postgres and a running server. Nearly unclaimed in a cohort that treats VMs as disposable. Measured: 150 ms restore.
+3. **The permission loop closing.** Diagnose what was blocked, then audit what went *unused* and narrow it. Unclaimed in shipped dev tooling — but a competitor has it planned, and the pattern is twenty years old elsewhere (`aa-logprof`, `audit2rbac`). **A race, not a moat.**
+4. **Project-local, version-controlled policy as sole authority.** The one clean separation from `devvm`, which keeps policy host-side on purpose — and whose reasoning is a live objection to this premise, still unresolved ([§6](design-docs/07-LANDSCAPE.md)).
 
 ## What the spike established
 
@@ -73,9 +77,12 @@ Decisions that now rest on evidence rather than reputation:
 | [`03-ENFORCEABILITY.md`](design-docs/03-ENFORCEABILITY.md) | Which policy categories each backend can actually enforce. |
 | [`04-SPIKE-LINUX-CH.md`](design-docs/04-SPIKE-LINUX-CH.md) | Cloud Hypervisor lifecycle, measured. |
 | [`05-SPIKE-NIXOS-GUEST.md`](design-docs/05-SPIKE-NIXOS-GUEST.md) | The pinned guest, and three bugs worth not rediscovering. |
+| [`07-LANDSCAPE.md`](design-docs/07-LANDSCAPE.md) | What already exists, what is unclaimed, and ideas adopted from the field. |
 | [`idea.md`](idea.md) | The original brain-dump. Superseded where it disagrees with the above. |
 
 Each spike doc has an explicit **"what was NOT tested"** section. The largest remaining gap is that no spike ran a real service: nothing yet says anything about application-consistent snapshots with Postgres mid-transaction.
+
+**One premise is unresolved.** `devvm` keeps policy out of the project folder on purpose — *"Rules never come from the project folder, because the VM can write it."* That objection is correct, and it lands on point 4 above. The recommended fix is to hide `rachna.nix` from the workspace mount and keep a host-side approval record of its hash, so a changed policy is inert until approved. Recommended, not ratified — it should be settled before implementation starts.
 
 ## Development
 
