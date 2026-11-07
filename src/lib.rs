@@ -31,33 +31,24 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// The NixOS release this build's guest is pinned to, if one is pinned yet.
+/// The NixOS release carried in a version string, if it has build metadata.
 ///
-/// `None` only before the first release that ships a guest; from then on the
-/// build metadata is always present, because a `rachna` with no guest cannot
-/// start a VM.
+/// `None` for a version with no guest pinned — which is every version before
+/// the first release that ships one.
 ///
-/// # One surviving mutant, deliberately
+/// # Why this takes the version rather than reading it
 ///
-/// `cargo-mutants` reports `replace guest_release with None` as MISSED while
-/// the version is `0.0.0`. That is correct and not a test gap: with no guest
-/// pinned the honest answer *is* `None`, so the mutant is behaviourally
-/// identical and no test can distinguish it. Verified by setting the version
-/// to `0.4.1+26.11`, where all 8 mutants in this file are caught. It resolves
-/// itself at the first release that ships a guest — do not paper over it with
-/// a test that asserts something untrue.
+/// There was a `guest_release()` that read `CARGO_PKG_VERSION` directly. It is
+/// deleted: nothing called it but its own tests, and because the only
+/// observable input was `0.0.0`, a mutant returning a constant `None` was
+/// behaviourally identical and survived every test that could be written.
+/// Suppressing that mutant would have left untested, uncalled code in a
+/// security tool. Taking the version as an argument makes the logic testable
+/// against any input, which is the actual fix.
+///
+/// A caller wanting this build's guest release passes [`version()`].
 #[must_use]
-pub fn guest_release() -> Option<&'static str> {
-    guest_release_of(version())
-}
-
-/// The guest release carried in `version`, if it has build metadata.
-///
-/// Split out from [`guest_release`] so the logic is reachable with versions
-/// other than this build's. Without it the only observable input is
-/// `CARGO_PKG_VERSION` — currently `0.0.0` — so a mutant returning a constant
-/// survives every test, which mutation testing demonstrated.
-fn guest_release_of(version: &str) -> Option<&str> {
+pub fn guest_release_of(version: &str) -> Option<&str> {
     version.split_once('+').map(|(_, guest)| guest)
 }
 
@@ -128,35 +119,49 @@ mod tests {
     }
 
     #[test]
-    fn guest_release_reads_the_metadata_of_the_version_it_is_given() {
-        // `guest_release()` reads CARGO_PKG_VERSION, which is `0.0.0` today,
-        // so the test above cannot distinguish a correct implementation from
-        // one that always returns None. Mutation testing caught exactly that.
-        // Calls the real function rather than a copy of it: a duplicated
-        // implementation in a test leaves the shipped one unmutated.
+    fn the_guest_release_is_the_metadata_after_the_first_plus() {
         assert_eq!(guest_release_of("0.4.1+26.11"), Some("26.11"));
-        assert_eq!(guest_release_of("0.0.0"), None);
-        // Build metadata may itself contain dots and dashes; only the first
+        // Build metadata may itself contain dots and dashes; only the FIRST
         // `+` separates, so the whole remainder is the guest identity.
         assert_eq!(
             guest_release_of("1.0.0+26.11-3181085"),
             Some("26.11-3181085")
         );
-        // And the public accessor agrees with it for this build.
-        assert_eq!(guest_release(), guest_release_of(version()));
+        assert_eq!(guest_release_of("2.0.0+a+b"), Some("a+b"));
     }
 
     #[test]
-    fn guest_release_is_absent_only_while_no_guest_is_pinned() {
-        // Build order step 1 has no guest to pin to, so `0.0.0` carries no
-        // metadata. Once it does, the accessor must return it rather than the
-        // whole string.
-        match guest_release() {
-            None => assert_eq!(version(), "0.0.0", "only 0.0.0 may omit a guest"),
-            Some(guest) => {
-                assert!(!guest.is_empty());
-                assert!(!guest.contains('+'), "one `+` separator, not several");
-            }
+    fn a_version_with_no_metadata_has_no_guest() {
+        assert_eq!(guest_release_of("0.0.0"), None);
+        assert_eq!(guest_release_of("1.2.3"), None);
+    }
+
+    #[test]
+    fn an_empty_metadata_section_is_present_but_empty() {
+        // Documents a boundary rather than claiming it is good: `1.0.0+`
+        // parses to `Some("")`. Cargo rejects a trailing `+`, so this cannot
+        // reach us from a manifest — recorded so it is deliberate rather than
+        // discovered later.
+        assert_eq!(guest_release_of("1.0.0+"), Some(""));
+    }
+
+    #[test]
+    fn this_builds_guest_release_agrees_with_its_version_string() {
+        // Asserts the RELATIONSHIP, not today's value. A first draft asserted
+        // `== None`, which is true at 0.0.0 and becomes false at the first
+        // release that ships a guest — the same brittleness as pinning the
+        // literal version, caught by running the suite at 0.4.1+26.11.
+        match guest_release_of(version()) {
+            None => assert!(
+                !version().contains('+'),
+                "no guest reported, but {:?} carries metadata",
+                version()
+            ),
+            Some(guest) => assert!(
+                version().ends_with(guest) && version().contains('+'),
+                "reported guest {guest:?} is not the metadata of {:?}",
+                version()
+            ),
         }
     }
 }
