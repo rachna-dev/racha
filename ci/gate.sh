@@ -27,6 +27,15 @@ gate() {
 # in the test suite, not an acceptable gap.
 mutants() {
   step "mutants"
+  # cargo-mutants' own summary reads as a failure count at a glance —
+  # "1 missed, 119 caught" invites "why are 119 failing?". They are not:
+  # CAUGHT means the suite detected deliberately broken code, which is the
+  # goal, and MISSED is the number to worry about. Spelled out here because
+  # this line is read in CI logs by whoever is least in context.
+  echo "  caught   = the suite detected broken code  -> want this HIGH"
+  echo "  missed   = broken code went unnoticed      -> want this ZERO"
+  echo "  unviable = did not compile, nothing tested -> neutral"
+  echo
   cargo mutants --colors=never --in-place
 }
 
