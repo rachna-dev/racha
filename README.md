@@ -70,7 +70,8 @@ Decisions that now rest on evidence rather than reputation:
 
 | | |
 |---|---|
-| [`06-VISION-AND-DX.md`](design-docs/06-VISION-AND-DX.md) | **Start here.** The pitch, the workflow, installation. |
+| [`15-FINDINGS.md`](design-docs/15-FINDINGS.md) | **Start here for what we know.** Every measured result in one place, with what must be built and what is still unmeasured. |
+| [`06-VISION-AND-DX.md`](design-docs/06-VISION-AND-DX.md) | The pitch, the workflow, installation. |
 | [`00-PRODUCT.md`](design-docs/00-PRODUCT.md) | Product model: the permission loop, feature rings, the CLI. |
 | [`01-ARCHITECTURE.md`](design-docs/01-ARCHITECTURE.md) | Seams, testing posture, build order. |
 | [`02-SPIKE-MACOS-VZ.md`](design-docs/02-SPIKE-MACOS-VZ.md) | Virtualization.framework lifecycle, measured. |
