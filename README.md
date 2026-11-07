@@ -45,7 +45,7 @@ What is unclaimed, sharpest first:
 1. **Tool exposure as a scoped permission.** Your LSP, formatter and debugger are policy objects — `rust-analyzer` gets the workspace and no network. **Not found anywhere in the field.** The proxy mechanics are a solved, crowded problem; tool-as-permission exists only for LLM/MCP allowlisting; the two have never been joined. Dev Containers structurally cannot do it — the extension host in a container holds the container's full ambient authority by construction.
 2. **Suspend / resume / snapshot.** Close the laptop, come back to a warm Postgres and a running server. Nearly unclaimed in a cohort that treats VMs as disposable. Measured: 150 ms restore.
 3. **The permission loop closing.** Diagnose what was blocked, then audit what went *unused* and narrow it. Unclaimed in shipped dev tooling — but a competitor has it planned, and the pattern is twenty years old elsewhere (`aa-logprof`, `audit2rbac`). **A race, not a moat.**
-4. **Project-local, version-controlled policy as sole authority.** The one clean separation from `devvm`, which keeps policy host-side on purpose — and whose reasoning is a live objection to this premise, still unresolved ([§6](design-docs/07-LANDSCAPE.md)).
+4. **Project-local, version-controlled policy as sole authority.** The one clean separation from `devvm`, which keeps policy host-side on purpose. Their reasoning is sound and Rachna answers it differently — by hiding the file from the guest rather than moving it off the repo (see below).
 
 ## What the spike established
 
@@ -82,7 +82,7 @@ Decisions that now rest on evidence rather than reputation:
 
 Each spike doc has an explicit **"what was NOT tested"** section. The largest remaining gap is that no spike ran a real service: nothing yet says anything about application-consistent snapshots with Postgres mid-transaction.
 
-**One premise is unresolved.** `devvm` keeps policy out of the project folder on purpose — *"Rules never come from the project folder, because the VM can write it."* That objection is correct, and it lands on point 4 above. The recommended fix is to hide `rachna.nix` from the workspace mount and keep a host-side approval record of its hash, so a changed policy is inert until approved. Recommended, not ratified — it should be settled before implementation starts.
+**On keeping policy in the repo.** `devvm` deliberately does not, reasoning that *"Rules never come from the project folder, because the VM can write it."* The objection is correct: a guest that can write its own policy file can grant itself permissions — concretely, via an `npm` postinstall script appending an `allow` rule. Rachna's answer is to **exclude `rachna.nix` from the workspace mount**, so the guest cannot see or write it and the host evaluates it before any guest exists. The policy stays committed, diffable and shared with the team; it simply is not visible from inside the thing it governs. ([`00-PRODUCT.md` §3.11](design-docs/00-PRODUCT.md))
 
 ## Development
 
