@@ -1,11 +1,17 @@
-# Forgejo Actions. Same checks as GitHub — they are in ci/gate.sh, which both
-# workflows call — but the toolchain comes from rustup rather than Nix.
+# Forgejo Actions. Same checks as GitHub — they live in ci/gate.sh, which both
+# workflows call — but the toolchain comes from rustup in containers rather
+# than from Nix.
 #
 # Why the difference: Forgejo runners cannot reliably use the cachix actions
 # that install and cache Nix, and installing Nix per job without a binary cache
-# is slow enough to be impractical. rustup-based jobs are self-contained and
-# fast, at the cost of not exercising the devenv shell itself. The GitHub
-# `gate` job covers that, so between the two providers both paths are checked.
+# is slow enough to be impractical. The GitHub `devenv` job covers the shell
+# itself, so between the two providers both paths are checked.
+#
+# Platform coverage differs too, and the reason is structural rather than a
+# choice: Forgejo runners are typically self-hosted Linux, with no macOS
+# available. So this provider covers the Linux variants and GitHub covers
+# macOS. Tests that encode macOS-specific behaviour — APFS case-insensitivity
+# especially (design-docs/12 §3) — are therefore gated by GitHub, not here.
 name: ci
 
 on:
@@ -15,17 +21,46 @@ on:
 
 jobs:
   gate:
-    name: gate (fmt, clippy, tests)
+    name: gate · ${{ matrix.name }}
     runs-on: docker
     container:
-      image: rust:1-bookworm
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debian (stable)
+            image: rust:1-bookworm
+          - name: ubuntu (24.04)
+            image: ubuntu:24.04
+          # Rolling release: catches breakage from a newer glibc, kernel or
+          # toolchain before the LTS distros do.
+          - name: arch (rolling)
+            image: archlinux:latest
     steps:
-      - uses: actions/checkout@v4
-      - name: install tools
+      - name: prerequisites
         run: |
+          set -eux
+          if command -v pacman >/dev/null; then
+            pacman -Sy --noconfirm --needed base-devel git rustup nodejs
+            rustup default stable
+          elif command -v apt-get >/dev/null && ! command -v cargo >/dev/null; then
+            apt-get update
+            apt-get install -y --no-install-recommends build-essential curl git ca-certificates
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - uses: actions/checkout@v4
+      - name: install components and nextest
+        run: |
+          set -eux
+          export PATH="$HOME/.cargo/bin:$PATH"
           rustup component add rustfmt clippy
           cargo install cargo-nextest --locked
-      - run: ci/gate.sh gate
+      - name: gate
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          ci/gate.sh gate
 
   mutants:
     name: mutation testing (a surviving mutant fails the build)
@@ -34,10 +69,7 @@ jobs:
       image: rust:1-bookworm
     steps:
       - uses: actions/checkout@v4
-      - name: install tools
-        run: |
-          cargo install cargo-nextest --locked
-          cargo install cargo-mutants --locked
+      - run: cargo install cargo-nextest cargo-mutants --locked
       - run: ci/gate.sh mutants
       - name: upload mutants report
         if: always()
@@ -53,10 +85,7 @@ jobs:
       image: rust:1-bookworm
     steps:
       - uses: actions/checkout@v4
-      - name: install tools
-        run: |
-          cargo install cargo-machete --locked
-          cargo install cargo-deny --locked
+      - run: cargo install cargo-machete cargo-deny --locked
       - run: ci/gate.sh deps
 
   coverage:
@@ -66,8 +95,6 @@ jobs:
       image: rust:1-bookworm
     steps:
       - uses: actions/checkout@v4
-      - name: install tools
-        run: |
-          rustup component add llvm-tools-preview
-          cargo install cargo-nextest cargo-llvm-cov --locked
+      - run: rustup component add llvm-tools-preview
+      - run: cargo install cargo-nextest cargo-llvm-cov --locked
       - run: cargo llvm-cov nextest --summary-only

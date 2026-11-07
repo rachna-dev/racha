@@ -44,6 +44,10 @@
       # or path code is a bug in the test suite.
       cargo-deny # licence + advisory audit
       cargo-machete # unused dependencies
+
+      # ci/gate.sh runs on bare Ubuntu and Arch containers without the devenv
+      # shell, so it must stay portable.
+      shellcheck
     ]
     ++ lib.optionals pkgs.stdenv.isLinux [
       # Chosen Linux backend (design-docs/03 §1), with virtiofsd for the
@@ -119,6 +123,7 @@
     rustfmt.enable = true;
     clippy.enable = true;
     nixfmt.enable = true;
+    shellcheck.enable = true;
   };
 
   # See full reference at https://devenv.sh/reference/options/

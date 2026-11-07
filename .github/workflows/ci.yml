@@ -1,6 +1,14 @@
 # GitHub Actions. The checks themselves live in ci/gate.sh so this and the
 # Forgejo workflow cannot drift on what "passing" means — only on how the
 # toolchain is obtained.
+#
+# WHY A PLATFORM MATRIX MATTERS HERE, rather than being thoroughness theatre:
+# the spikes found behaviour that differs per platform and would be missed by
+# a Linux-only run. APFS is case-insensitive by default, which defeats a
+# name-based exclusion check (design-docs/12 §3); macOS has no cgroups, so
+# resource limits are advisory there (12 §4); and Linux needs CAP_NET_ADMIN
+# where macOS needs nothing (04 §3.2). Tests covering those paths must run on
+# the platform whose behaviour they encode.
 name: ci
 
 on:
@@ -13,8 +21,73 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The gate on every platform we support. rustup rather than Nix, because a
+  # five-way matrix through the devenv shell would be slow and macOS runners
+  # have no binary cache; the `devenv` job below covers the shell itself.
   gate:
-    name: gate (fmt, clippy, tests)
+    name: gate · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu 24.04 (x86_64)
+            os: ubuntu-24.04
+          - name: ubuntu 22.04 (x86_64)
+            os: ubuntu-22.04
+          # Arch is not a GitHub-hosted runner, so it comes as a container.
+          # Worth having: it is a rolling release, so it catches breakage from
+          # newer glibc/kernel/toolchain before the LTS distros do.
+          - name: arch (rolling, x86_64)
+            os: ubuntu-latest
+            container: archlinux:latest
+          # macos-latest is Apple silicon; macos-15-intel keeps x86_64 covered,
+          # which matters because the two differ in virtualization support.
+          - name: macos (arm64)
+            os: macos-latest
+          - name: macos (x86_64)
+            os: macos-15-intel
+    steps:
+      - name: arch prerequisites
+        if: matrix.container == 'archlinux:latest'
+        run: pacman -Sy --noconfirm --needed base-devel git rustup nodejs
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - run: ci/gate.sh gate
+        shell: bash
+
+  # Mutation testing is THE bar for this project (AGENTS.md). One platform is
+  # enough: it asks whether the suite *discriminates*, which is a property of
+  # the tests rather than of the host.
+  mutants:
+    name: mutation testing (a surviving mutant fails the build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-mutants
+      - uses: Swatinem/rust-cache@v2
+      - run: ci/gate.sh mutants
+      - name: upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: mutants.out/
+          if-no-files-found: ignore
+
+  # The devenv shell itself, which the matrix above deliberately bypasses.
+  # Without this job a devenv regression would pass unnoticed.
+  devenv:
+    name: devenv shell
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,49 +98,27 @@ jobs:
       - run: nix profile install nixpkgs#devenv
       - run: devenv shell -- ci/gate.sh gate
 
-  mutants:
-    name: mutation testing (a surviving mutant fails the build)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
-      - uses: cachix/cachix-action@v15
-        with:
-          name: devenv
-      - run: nix profile install nixpkgs#devenv
-      - run: devenv shell -- ci/gate.sh mutants
-      - name: upload mutants report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mutants-report
-          path: mutants.out/
-          if-no-files-found: ignore
-
   deps:
     name: dependency audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
-      - uses: cachix/cachix-action@v15
-        with:
-          name: devenv
-      - run: nix profile install nixpkgs#devenv
-      - run: devenv shell -- ci/gate.sh deps
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - uses: taiki-e/install-action@cargo-machete
+      - run: ci/gate.sh deps
 
   coverage:
     name: coverage (reported, not gated)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Installed via rustup rather than the devenv shell: cargo-llvm-cov fails
-      # its own test suite in the pinned nixpkgs on both platforms, so it is
-      # deliberately absent there. Coverage is a floor, never gated, so nobody
-      # games the number — see AGENTS.md.
+      # Coverage is a floor, not the bar — see AGENTS.md. Reported so a drop is
+      # visible, never gated, so nobody games the number.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
       - run: cargo llvm-cov nextest --summary-only
