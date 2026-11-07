@@ -5,6 +5,17 @@
 [package]
 name = "rachna"
 description = "A declarative, isolated development environment you can pause, resume, and throw away."
+# Major.Minor.Patch+<NixOS release> — the guest system version is carried in
+# the rachna version, so the pairing is visible wherever a version appears
+# (design-docs/08-POLICY-AND-STORE.md §4.1.1).
+#
+# `+` not `-`: SemVer reads a hyphen as a PRE-RELEASE, which would sort before
+# 0.4.0 and make `cargo add` skip it. `+` is build metadata — ignored for
+# precedence, and exactly the field for "what this was built against".
+# Tested: Cargo rejects `0.4-26.11` outright.
+#
+# Still 0.0.0 while there is no guest to pin to; becomes e.g. 0.1.0+26.11 at
+# the first release that ships one.
 version = "0.0.0"
 edition = "2021"
 # Raised from 1.82 on evidence, not preference. 1.82 silently capped `time` at
