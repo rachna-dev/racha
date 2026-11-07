@@ -56,6 +56,7 @@ Measured on an M2 Pro (macOS 15.3.2) and a NixOS x86_64 host. Full numbers in `d
 | Pause / resume | **7 ms / 4 ms** (Cloud Hypervisor), **0.6 ms / 0.2 ms** (macOS) |
 | Restore + resume | **150 ms** @ 2 GiB (Linux), ~190 ms/GiB (macOS) |
 | Snapshots reusable | **yes, verified** — restored the same snapshot repeatedly, state preserved |
+| **Real services across suspend/restore** | **yes** — PostgreSQL + a stateful Node server survived a full save-to-disk and restore into a new VM, same in-memory nonce, 305 rows / 0 nulls / 305 distinct. ~2.2 s restore. |
 | Network policy enforceable | **yes** — direct-IP TCP SYN, UDP, IPv6 and ARP all intercepted host-side |
 | Live workspace mount | **yes** — a `git commit` made inside the guest was visible on the host |
 | Cold boot, real dev guest | **6.97 s** (so resume, not boot, is the steady state) |
@@ -86,6 +87,7 @@ Decisions that now rest on evidence rather than reputation:
 | [`12-SPIKE-ISOLATION-MACOS.md`](design-docs/12-SPIKE-ISOLATION-MACOS.md) | The same on macOS, where three mechanisms differ — and one earlier claim was wrong. |
 | [`13-SPIKE-ISOLATION-ROUND3.md`](design-docs/13-SPIKE-ISOLATION-ROUND3.md) | The last open questions closed: I/O throttling, TOCTOU, virtiofsd's confinement, macOS escapes. |
 | [`14-MACOS-INODE-FIXES.md`](design-docs/14-MACOS-INODE-FIXES.md) | The two macOS escapes are fixable by us — both fixes verified working. |
+| [`16-SPIKE-REAL-SERVICES.md`](design-docs/16-SPIKE-REAL-SERVICES.md) | PostgreSQL + Node across pause, suspend and restore. The services story validated. |
 | [`idea.md`](idea.md) | The original brain-dump. Superseded where it disagrees with the above. |
 | [`AGENTS.md`](AGENTS.md) | Rules for anyone — human or agent — changing this repo: the gate, code quality, testing bar. |
 
