@@ -14,10 +14,12 @@
 use proptest::prelude::*;
 use rachna::decide::{decide, Capabilities, Policy};
 use rachna::decision::{Access, Category, Decision};
+use rachna::exclusion::{check, FileId, ShareEntry};
 use rachna::grant::{Endpoint, Grant, Request};
 use rachna::policy::{Profile, Tier};
 use rachna::summary::AccessSummary;
 use rachna::synthesize::{synthesize, Evidence, Observations, Threshold};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// Hostname-ish strings, including the shapes that have caused real bugs:
@@ -340,6 +342,86 @@ proptest! {
                 grant.category(),
             );
         }
+    }
+
+    /// An excluded inode inside the share is NEVER allowed when linked.
+    ///
+    /// The hardlink escape (`13` §4) and the case-variant escape (`12` §3)
+    /// both reduce to one shape: a second name for an excluded inode. This
+    /// must hold for any tree, any name, any link count above one — the name
+    /// is attacker-chosen, so no property may depend on it.
+    #[test]
+    fn a_linked_excluded_inode_is_always_refused(
+        name in "[a-zA-Z0-9._/-]{1,40}",
+        inode in 1u64..1000,
+        links in 2u64..10,
+        others in prop::collection::vec((1u64..1000, 1u64..4), 0..8),
+    ) {
+        let dev = 1;
+        let excluded: BTreeSet<FileId> = [FileId { device: dev, inode }].into_iter().collect();
+
+        let mut entries = vec![ShareEntry {
+            path: PathBuf::from(&name),
+            id: FileId { device: dev, inode },
+            links,
+        }];
+        // Surround it with arbitrary other entries: the attack must be found
+        // regardless of what else is in the tree or where it sits.
+        for (i, (other_inode, other_links)) in others.into_iter().enumerate() {
+            entries.push(ShareEntry {
+                path: PathBuf::from(format!("other{i}")),
+                id: FileId { device: dev, inode: other_inode },
+                links: other_links,
+            });
+        }
+
+        let verdict = check(dev, &excluded, &entries);
+        prop_assert!(
+            !verdict.is_allowed(),
+            "a hardlink named {name:?} to excluded inode {inode} was allowed",
+        );
+    }
+
+    /// An entry on a foreign device is always refused.
+    ///
+    /// The exclusion set is resolved on the share's device, so an entry
+    /// elsewhere was never compared against anything (`14` §3 step 3).
+    #[test]
+    fn a_foreign_device_entry_is_always_refused(
+        share_dev in 1u64..100,
+        entry_dev in 1u64..100,
+        inode in 1u64..1000,
+        links in 1u64..5,
+    ) {
+        prop_assume!(share_dev != entry_dev);
+        let excluded: BTreeSet<FileId> =
+            [FileId { device: share_dev, inode: 1 }].into_iter().collect();
+        let entries = [ShareEntry {
+            path: PathBuf::from("x"),
+            id: FileId { device: entry_dev, inode },
+            links,
+        }];
+        prop_assert!(!check(share_dev, &excluded, &entries).is_allowed());
+    }
+
+    /// A verdict that resolved no exclusions always admits it is vacuous.
+    ///
+    /// The failure mode this project keeps hitting: a check that examined
+    /// nothing reporting success (`11` §7, `23` §1.1).
+    #[test]
+    fn an_empty_exclusion_set_is_always_vacuous(
+        entries in prop::collection::vec((1u64..100, 1u64..5), 0..10),
+    ) {
+        let built: Vec<ShareEntry> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, (inode, links))| ShareEntry {
+                path: PathBuf::from(format!("e{i}")),
+                id: FileId { device: 1, inode },
+                links,
+            })
+            .collect();
+        prop_assert!(check(1, &BTreeSet::new(), &built).is_vacuous());
     }
 
     /// A profile never claims authority over the network axis.
