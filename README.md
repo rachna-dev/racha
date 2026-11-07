@@ -79,6 +79,7 @@ Decisions that now rest on evidence rather than reputation:
 | [`05-SPIKE-NIXOS-GUEST.md`](design-docs/05-SPIKE-NIXOS-GUEST.md) | The pinned guest, and three bugs worth not rediscovering. |
 | [`07-LANDSCAPE.md`](design-docs/07-LANDSCAPE.md) | What already exists, what is unclaimed, and ideas adopted from the field. |
 | [`idea.md`](idea.md) | The original brain-dump. Superseded where it disagrees with the above. |
+| [`AGENTS.md`](AGENTS.md) | Rules for anyone — human or agent — changing this repo: the gate, code quality, testing bar. |
 
 Each spike doc has an explicit **"what was NOT tested"** section. The largest remaining gap is that no spike ran a real service: nothing yet says anything about application-consistent snapshots with Postgres mid-transaction.
 
@@ -89,6 +90,8 @@ Each spike doc has an explicit **"what was NOT tested"** section. The largest re
 ```bash
 devenv shell      # Rust toolchain, plus cloud-hypervisor + virtiofsd on Linux
 ```
+
+**[`AGENTS.md`](AGENTS.md) is the contract for changing this repo** — the gate that must pass before and after every task, one-crate-until-forced, extend-the-owner, and a testing bar measured by surviving mutants rather than a coverage percentage.
 
 Implementation starts at `01-ARCHITECTURE.md` §7 step 1 — the TDD harness, before any product code. The milestone that matters is step 9: the complete permission loop demoable with **no hypervisor at all**.
 
