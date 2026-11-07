@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f4b71ec533efef7adf690970eb7321e434a8c979b34f337ecc68c6a54c4653aa # shrinks to observed = [Network { endpoint: Endpoint { host: "*.a", port: 0 }, literal_address: false }]
+cc 21fb4f09c4bcb844c11f5442869af837511fceba360d5cc3100462c2a1ae448f # shrinks to tier = Open, profile = Sealed, grants = [Secret { name: "a" }]

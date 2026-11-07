@@ -59,7 +59,7 @@ impl AccessSummary {
     pub fn new(tier: Tier, profile: Profile, grants: &[Grant]) -> Self {
         let lines = Category::ALL
             .iter()
-            .map(|&category| (category, Self::detail(category, tier, grants)))
+            .map(|&category| (category, Self::detail(category, tier, profile, grants)))
             .collect();
         Self {
             tier,
@@ -73,7 +73,20 @@ impl AccessSummary {
     /// Sorted rather than source-ordered so the rendering — and therefore the
     /// fingerprint built from it — does not change when a list is reordered
     /// in `rachna.nix` (property 2).
-    fn detail(category: Category, tier: Tier, grants: &[Grant]) -> Vec<String> {
+    fn detail(category: Category, tier: Tier, profile: Profile, grants: &[Grant]) -> Vec<String> {
+        // A category the profile forbids is reported as forbidden, NOT as the
+        // grants that happen to be written down.
+        //
+        // Found by the fingerprint/diff agreement test: with `profile =
+        // sealed`, this listed `secret aws` for a config where `decide` denies
+        // every secret at step 1 (`08` §1.2). Overstating access is the same
+        // class of bug as omitting a category — the user reads a permission
+        // they do not have — and it is the more dangerous direction here,
+        // because it invites accepting a config on a false basis.
+        if profile.forbids(category) {
+            return vec![format!("none ({profile} profile forbids it)")];
+        }
+
         // `open` and `internet` permit any host without an allowlist entry, so
         // the grants list would understate the access. This is the completeness
         // hole that made holding the axes necessary.
@@ -110,6 +123,26 @@ impl AccessSummary {
         entries.into_iter().collect()
     }
 
+    /// Every granted entry as a flat set, for comparison.
+    ///
+    /// Built from the same `lines` the rendering and the fingerprint use, so
+    /// a diff can never disagree with what was displayed.
+    fn entries(&self) -> BTreeSet<(Category, String)> {
+        let mut out = BTreeSet::new();
+        for (category, entries) in &self.lines {
+            for entry in entries {
+                // A "forbidden" marker describes an absence, so it is not an
+                // entry: counting it would make a sealed config look as though
+                // it granted something, and would put it in the diff.
+                if entry.starts_with("none (") {
+                    continue;
+                }
+                out.insert((*category, entry.clone()));
+            }
+        }
+        out
+    }
+
     /// A stable identifier for *what this grants*, not for the file's bytes.
     ///
     /// Property 2. Two configs that permit exactly the same things share a
@@ -134,9 +167,12 @@ impl AccessSummary {
     }
 
     /// Whether this grants anything at all beyond the defaults.
+    ///
+    /// A `none (… forbids it)` line is not a grant, so a config whose profile
+    /// forbids everything still reports as empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.lines.iter().all(|(_, entries)| entries.is_empty())
+        self.entries().is_empty()
     }
 
     /// The categories that grant nothing.
@@ -145,11 +181,72 @@ impl AccessSummary {
     /// config does not touch credentials", which is a different claim.
     #[must_use]
     pub fn empty_categories(&self) -> Vec<Category> {
+        let granted = self.entries();
         self.lines
             .iter()
-            .filter(|(_, entries)| entries.is_empty())
+            .filter(|(category, _)| !granted.iter().any(|(c, _)| c == category))
             .map(|(category, _)| *category)
             .collect()
+    }
+}
+
+/// How a grant set changed since the last accepted one.
+///
+/// The edit loop in `00-PRODUCT.md` §3.10c is *review, edit, start again*, so
+/// the second showing must answer "what changed" rather than reprinting the
+/// whole list. Reprinting is what trains people to stop reading it.
+///
+/// Both directions are reported. A **removed** grant is as important as an
+/// added one: it is the evidence that the edit you made actually took effect,
+/// and silently showing only additions would leave a failed edit looking
+/// identical to a successful one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantDiff {
+    added: Vec<(Category, String)>,
+    removed: Vec<(Category, String)>,
+}
+
+impl GrantDiff {
+    /// What changed going from `previous` to `current`.
+    #[must_use]
+    pub fn between(previous: &AccessSummary, current: &AccessSummary) -> Self {
+        let before = previous.entries();
+        let after = current.entries();
+        Self {
+            added: after.difference(&before).cloned().collect(),
+            removed: before.difference(&after).cloned().collect(),
+        }
+    }
+
+    /// Whether anything changed at all.
+    ///
+    /// `true` means the fingerprint is unchanged, so no re-acknowledgement is
+    /// needed — the two must never disagree, which a test asserts.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+
+    /// Whether this change grants anything that was not granted before.
+    ///
+    /// The question the gate actually turns on. A purely *narrowing* edit —
+    /// removing grants and adding none — still changes the fingerprint, but a
+    /// user who has already seen the wider set has nothing new to review.
+    #[must_use]
+    pub fn widens(&self) -> bool {
+        !self.added.is_empty()
+    }
+}
+
+impl fmt::Display for GrantDiff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (category, entry) in &self.removed {
+            writeln!(f, "  - {:<7} {entry}", category.as_str())?;
+        }
+        for (category, entry) in &self.added {
+            writeln!(f, "  + {:<7} {entry}", category.as_str())?;
+        }
+        Ok(())
     }
 }
 
@@ -238,6 +335,36 @@ mod tests {
         let summary = AccessSummary::new(Tier::Allowlist, Profile::Sealed, &[]);
         let rendered = summary.to_string();
         assert!(rendered.contains("secret    none"), "{rendered}");
+    }
+
+    #[test]
+    fn empty_categories_names_exactly_the_ones_with_no_grants() {
+        // Mutation testing found this: existing tests only checked the
+        // all-empty and all-granted extremes, so a comparison flipped to `!=`
+        // — reporting the categories that DO have grants — survived. A mixed
+        // config is the case that distinguishes them.
+        let summary = AccessSummary::new(
+            Tier::Allowlist,
+            Profile::Online,
+            &[
+                Grant::Secret {
+                    name: "aws".to_owned(),
+                },
+                Grant::Port {
+                    guest: 3000,
+                    host: 3000,
+                },
+            ],
+        );
+        let empty = summary.empty_categories();
+        for category in Category::ALL {
+            let granted = matches!(category, Category::Secret | Category::Port);
+            assert_eq!(
+                empty.contains(&category),
+                !granted,
+                "{category}: granted={granted} but empty_categories disagrees"
+            );
+        }
     }
 
     #[test]
@@ -484,6 +611,162 @@ mod tests {
         assert!(rendered.contains("<- credential access"), "{rendered}");
     }
 
+    // ---- the edit loop: selective acceptance by editing the file --------
+
+    #[test]
+    fn removing_the_credential_shows_as_a_removal() {
+        // The §3.10c flow: you do not want the credential, so you delete it
+        // and start again. The second summary must show that the edit took
+        // effect, which is why removals are reported and not only additions.
+        let before = AccessSummary::new(Tier::Allowlist, Profile::Online, &realistic_grants());
+        let narrowed: Vec<Grant> = realistic_grants()
+            .into_iter()
+            .filter(|g| g.category() != Category::Secret)
+            .collect();
+        let after = AccessSummary::new(Tier::Allowlist, Profile::Online, &narrowed);
+
+        let diff = GrantDiff::between(&before, &after);
+        assert_eq!(diff.to_string(), "  - secret  aws  <- credential access\n");
+        assert!(!diff.is_empty());
+        // The key property: narrowing does not need a fresh review.
+        assert!(!diff.widens(), "removing a grant must not re-gate");
+    }
+
+    #[test]
+    fn an_added_grant_widens_and_a_removed_one_does_not() {
+        let base = AccessSummary::new(Tier::Allowlist, Profile::Online, &[]);
+        let wider = AccessSummary::new(
+            Tier::Allowlist,
+            Profile::Online,
+            &[Grant::Secret {
+                name: "aws".to_owned(),
+            }],
+        );
+        assert!(GrantDiff::between(&base, &wider).widens());
+        assert!(!GrantDiff::between(&wider, &base).widens());
+    }
+
+    #[test]
+    fn a_diff_reports_both_directions_at_once() {
+        // An edit that swaps one host for another is both, and showing only
+        // the addition would hide that the old grant is gone.
+        let before = AccessSummary::new(
+            Tier::Allowlist,
+            Profile::Online,
+            &[Grant::Network {
+                endpoint: endpoint("old.example", 443),
+            }],
+        );
+        let after = AccessSummary::new(
+            Tier::Allowlist,
+            Profile::Online,
+            &[Grant::Network {
+                endpoint: endpoint("new.example", 443),
+            }],
+        );
+        let rendered = GrantDiff::between(&before, &after).to_string();
+        assert!(rendered.contains("- network old.example:443"), "{rendered}");
+        assert!(rendered.contains("+ network new.example:443"), "{rendered}");
+    }
+
+    #[test]
+    fn an_unchanged_grant_set_produces_an_empty_diff() {
+        let a = AccessSummary::new(Tier::Allowlist, Profile::Online, &realistic_grants());
+        let mut reordered = realistic_grants();
+        reordered.reverse();
+        let b = AccessSummary::new(Tier::Allowlist, Profile::Online, &reordered);
+        let diff = GrantDiff::between(&a, &b);
+        assert!(diff.is_empty(), "a reorder is not a change");
+        assert!(!diff.widens());
+        assert_eq!(diff.to_string(), "");
+    }
+
+    #[test]
+    fn an_empty_diff_and_an_equal_fingerprint_always_agree() {
+        // These two answer the same question by different routes — "must this
+        // re-gate?" — so disagreement would mean either a silent re-prompt or
+        // a silently-skipped review. Checked across a realistic set of edits.
+        let base = AccessSummary::new(Tier::Allowlist, Profile::Online, &realistic_grants());
+        let mut widened = realistic_grants();
+        widened.push(Grant::Port {
+            guest: 9999,
+            host: 9999,
+        });
+        let variants = [
+            AccessSummary::new(Tier::Allowlist, Profile::Online, &realistic_grants()),
+            AccessSummary::new(Tier::Allowlist, Profile::Online, &widened),
+            AccessSummary::new(Tier::Open, Profile::Online, &realistic_grants()),
+            AccessSummary::new(Tier::Allowlist, Profile::Sealed, &realistic_grants()),
+            AccessSummary::new(Tier::Allowlist, Profile::Online, &[]),
+        ];
+        for variant in &variants {
+            let same_fingerprint = base.fingerprint() == variant.fingerprint();
+            let empty_diff = GrantDiff::between(&base, variant).is_empty();
+            assert_eq!(
+                same_fingerprint, empty_diff,
+                "fingerprint and diff disagree for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forbidden_category_is_reported_as_forbidden_not_as_its_grants() {
+        // The bug the fingerprint/diff agreement test found. A sealed profile
+        // denies every secret at step 1 of the matching order (08 §1.2), so
+        // listing `secret aws` would tell the user they have a credential
+        // grant that `decide` will refuse.
+        //
+        // Overstating access is the same class of bug as omitting a category,
+        // and the more dangerous direction: it invites accepting a config on
+        // a false basis.
+        let summary = AccessSummary::new(
+            Tier::Allowlist,
+            Profile::Sealed,
+            &[Grant::Secret {
+                name: "aws".to_owned(),
+            }],
+        );
+        let rendered = summary.to_string();
+        assert!(
+            rendered.contains("none (sealed profile forbids it)"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("aws"),
+            "a forbidden grant must not be listed as granted:\n{rendered}"
+        );
+        // And it is not counted as a grant.
+        assert!(summary.is_empty());
+        assert!(summary.empty_categories().contains(&Category::Secret));
+    }
+
+    #[test]
+    fn changing_a_profile_shows_up_in_the_diff() {
+        // Profiles gate whole categories, so tightening one is a real change
+        // to what is granted and must be visible in the diff rather than only
+        // in the fingerprint.
+        let grants = vec![Grant::Secret {
+            name: "aws".to_owned(),
+        }];
+        let online = AccessSummary::new(Tier::Allowlist, Profile::Online, &grants);
+        let sealed = AccessSummary::new(Tier::Allowlist, Profile::Sealed, &grants);
+        let diff = GrantDiff::between(&online, &sealed);
+        assert!(!diff.is_empty(), "sealing a profile is a change");
+        assert!(!diff.widens(), "sealing only removes access");
+        assert!(diff.to_string().contains("- secret"), "{diff}");
+    }
+
+    #[test]
+    fn changing_a_tier_shows_up_in_the_diff() {
+        // The axes are part of what is granted, so a tier change must appear
+        // in the diff and not only in the fingerprint.
+        let before = AccessSummary::new(Tier::Allowlist, Profile::Online, &[]);
+        let after = AccessSummary::new(Tier::Open, Profile::Online, &[]);
+        let diff = GrantDiff::between(&before, &after);
+        assert!(diff.widens(), "opening the network is a widening");
+        assert!(diff.to_string().contains("any host"), "{diff}");
+    }
+
     #[test]
     fn multiple_entries_in_one_category_are_all_shown() {
         // A summary that truncated would be a completeness hole.
@@ -493,7 +776,10 @@ mod tests {
                 host: 3000 + i,
             })
             .collect();
-        let rendered = AccessSummary::new(Tier::None, Profile::Sealed, &grants).to_string();
+        // Online, not Sealed: the sealed profile forbids ports, so a sealed
+        // config would correctly report them as forbidden rather than listing
+        // them — which is what this test's first draft got wrong.
+        let rendered = AccessSummary::new(Tier::None, Profile::Online, &grants).to_string();
         for i in 0..5 {
             assert!(
                 rendered.contains(&format!("{} -> {}", 3000 + i, 3000 + i)),

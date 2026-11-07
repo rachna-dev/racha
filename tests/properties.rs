@@ -288,6 +288,60 @@ proptest! {
         );
     }
 
+    /// The summary never claims access that `decide` would refuse.
+    ///
+    /// The summary exists so a user can accept a config knowing what it
+    /// grants (`00` §3.10c). If it lists a permission the engine then denies,
+    /// the user accepted on a false basis — the more dangerous direction of
+    /// the completeness property, and the bug the profile fix closed.
+    #[test]
+    fn the_summary_never_overstates_what_decide_permits(
+        tier in tier(),
+        profile in profile(),
+        grants in prop::collection::vec(grant(), 0..8),
+    ) {
+        let rendered = AccessSummary::new(tier, profile, &grants).to_string();
+        let policy = Policy {
+            tier,
+            profile,
+            grants: grants.clone(),
+            capabilities: Capabilities::all(),
+        };
+
+        // For every grant, ask the ENGINE whether the thing it names is
+        // actually permitted, then require the summary not to claim it is.
+        // Going through `decide` rather than re-deriving the rule is the point:
+        // a reimplementation here could agree with a buggy summary.
+        for grant in &grants {
+            let probe = match grant {
+                Grant::Secret { name } => Request::Secret { name: name.clone() },
+                Grant::Port { guest, .. } => Request::Port { guest: *guest },
+                // Network and filesystem grants are patterns, so a request
+                // derived from one is not necessarily the same act; those are
+                // covered by decide's own tests.
+                Grant::Network { .. } | Grant::Filesystem { .. } | Grant::Tool { .. } => continue,
+            };
+            if decide(&policy, &probe).is_allowed() {
+                continue;  // the summary may list it; the engine agrees
+            }
+            // The engine refuses it, so the summary must not present it as
+            // granted. Checked on that CATEGORY's own line rather than by
+            // searching the whole rendering: a first draft used a bare
+            // `contains`, and a one-character secret name matched "any host"
+            // and "sealed" elsewhere in the output — a false positive that
+            // made a correct summary look broken.
+            let line = rendered
+                .lines()
+                .find(|l| l.trim_start().starts_with(grant.category().as_str()))
+                .unwrap_or("");
+            prop_assert!(
+                line.contains("none"),
+                "summary presents a {} grant that decide refuses:\n{rendered}",
+                grant.category(),
+            );
+        }
+    }
+
     /// A profile never claims authority over the network axis.
     ///
     /// Network belongs to `Tier` (`00` §3.9); a profile answering for it would
