@@ -79,13 +79,14 @@ Decisions that now rest on evidence rather than reputation:
 | [`05-SPIKE-NIXOS-GUEST.md`](design-docs/05-SPIKE-NIXOS-GUEST.md) | The pinned guest, and three bugs worth not rediscovering. |
 | [`07-LANDSCAPE.md`](design-docs/07-LANDSCAPE.md) | What already exists, what is unclaimed, and ideas adopted from the field. |
 | [`08-POLICY-AND-STORE.md`](design-docs/08-POLICY-AND-STORE.md) | The policy engine's two query shapes, decision records, the SQLite store, and where state lives. |
-| [`09-ISOLATION.md`](design-docs/09-ISOLATION.md) | Memory, CPU and filesystem isolation; what is verified and what is not; one measured security gap. |
+| [`09-ISOLATION.md`](design-docs/09-ISOLATION.md) | Memory, CPU and filesystem isolation: the design and the threat model. |
+| [`10-SPIKE-ISOLATION-MEASURED.md`](design-docs/10-SPIKE-ISOLATION-MEASURED.md) | All of it measured against a real guest. Two boundaries hold, two do not. |
 | [`idea.md`](idea.md) | The original brain-dump. Superseded where it disagrees with the above. |
 | [`AGENTS.md`](AGENTS.md) | Rules for anyone — human or agent — changing this repo: the gate, code quality, testing bar. |
 
 Each spike doc has an explicit **"what was NOT tested"** section. The largest remaining gap is that no spike ran a real service: nothing yet says anything about application-consistent snapshots with Postgres mid-transaction.
 
-**One measured security gap.** Cloud Hypervisor writes guest memory to a plaintext file — the spike recovered the guest's init script verbatim out of a snapshot. Anything in guest RAM at snapshot time is unencrypted on disk, and snapshots are a headline feature. macOS does not share this problem (Apple encrypts with a host-tied key). Encryption is required before snapshots ship, and until then the UI must say so ([`09-ISOLATION.md` §4](design-docs/09-ISOLATION.md)).
+**Isolation, measured.** Filesystem escape, memory ceilings and host CPU quotas were tested against a real guest and **hold** — every symlink and traversal attempt failed, the guest kernel OOM-kills at its declared ceiling, and the kernel throttled CPU 119 times against a quota. Two things do not hold: the declared guest **process limit is silently ignored** (512 declared, 7754 actual, and a host `TasksMax` cannot cover for it), and **Linux snapshots are plaintext guest memory** — three deliberately planted secrets were all recovered from the image, which gzips to 0.8 %. macOS encrypts its snapshots; Linux does not. Encryption is required before snapshots ship. ([`10-SPIKE-ISOLATION-MEASURED.md`](design-docs/10-SPIKE-ISOLATION-MEASURED.md))
 
 **On keeping policy in the repo.** `devvm` deliberately does not, reasoning that *"Rules never come from the project folder, because the VM can write it."* The objection is correct: a guest that can write its own policy file can grant itself permissions — concretely, via an `npm` postinstall script appending an `allow` rule. Rachna's answer is to **exclude `rachna.nix` from the workspace mount**, so the guest cannot see or write it and the host evaluates it before any guest exists. The policy stays committed, diffable and shared with the team; it simply is not visible from inside the thing it governs. ([`00-PRODUCT.md` §3.11](design-docs/00-PRODUCT.md))
 
