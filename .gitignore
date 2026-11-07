@@ -2,9 +2,11 @@
 /target
 **/*.rs.bk
 
-# Rachna's own per-project state. Observed data and VM disks, never permissions
-# — those live in rachna.nix, which is always committed.
-# See design-docs/00-PRODUCT.md §8.
+# Rachna's per-project convenience folder. Holds nothing load-bearing: the
+# real state (store, shims, disks, snapshots) lives in
+# ~/.local/share/rachna/<project-id>/, outside the workspace mount, because the
+# guest can write anything inside the project folder.
+# See design-docs/08-POLICY-AND-STORE.md §4.
 /.rachna
 
 # Devenv

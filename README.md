@@ -78,6 +78,7 @@ Decisions that now rest on evidence rather than reputation:
 | [`04-SPIKE-LINUX-CH.md`](design-docs/04-SPIKE-LINUX-CH.md) | Cloud Hypervisor lifecycle, measured. |
 | [`05-SPIKE-NIXOS-GUEST.md`](design-docs/05-SPIKE-NIXOS-GUEST.md) | The pinned guest, and three bugs worth not rediscovering. |
 | [`07-LANDSCAPE.md`](design-docs/07-LANDSCAPE.md) | What already exists, what is unclaimed, and ideas adopted from the field. |
+| [`08-POLICY-AND-STORE.md`](design-docs/08-POLICY-AND-STORE.md) | The policy engine's two query shapes, decision records, the SQLite store, and where state lives. |
 | [`idea.md`](idea.md) | The original brain-dump. Superseded where it disagrees with the above. |
 | [`AGENTS.md`](AGENTS.md) | Rules for anyone — human or agent — changing this repo: the gate, code quality, testing bar. |
 
