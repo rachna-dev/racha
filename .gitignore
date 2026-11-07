@@ -19,3 +19,7 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
+
+# cargo-mutants working output
+/mutants.out
+/mutants.out.old

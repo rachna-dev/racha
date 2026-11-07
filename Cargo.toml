@@ -1,0 +1,51 @@
+# Rachna — ONE crate. Modules, not crates, until something forces a split.
+# See AGENTS.md "One crate until forced" and design-docs/01-ARCHITECTURE.md §1
+# for why the previous twelve-crate workspace was deleted.
+
+[package]
+name = "rachna"
+description = "A declarative, isolated development environment you can pause, resume, and throw away."
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shriyans/rachna"
+publish = false
+
+[dependencies]
+camino = { version = "1", features = ["serde1"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+time = { version = "0.3", features = ["serde", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+# This is a security boundary: no silent panics in policy or path code.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+# The "I'll just convert this integer" class of bug.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+
+[profile.release]
+# A shim binary is spawned per editor tool invocation, so startup cost matters
+# more than peak throughput (design-docs/00-PRODUCT.md §6.6).
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# cargo-mutants: the real testing bar for this project (AGENTS.md).
+[package.metadata.mutants]
+# Timeout multiplier — a mutant that hangs should fail fast rather than stall
+# the run.
+timeout_multiplier = 3.0

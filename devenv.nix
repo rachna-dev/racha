@@ -9,9 +9,8 @@
 {
   # Rachna — a declarative, isolated development environment manager.
   #
-  # The feasibility spike is complete (design-docs/02 through 05); the
-  # implementation has not started. This shell carries the toolchain the spike
-  # established we need, so it is ready when code lands.
+  # Build order and the reasoning behind it: design-docs/01-ARCHITECTURE.md §7.
+  # Everything measured so far: design-docs/15-FINDINGS.md.
 
   # https://devenv.sh/languages/
   languages.rust = {
@@ -24,6 +23,7 @@
       "rustfmt"
       "rust-analyzer"
       "rust-src" # rust-analyzer needs this to resolve std
+      "llvm-tools-preview" # cargo-llvm-cov needs this
     ];
   };
 
@@ -37,15 +37,20 @@
       # shelling out to `nix eval --json` rather than linking libnixexpr.
       nix
 
-      # Cloud Hypervisor is the chosen Linux backend (design-docs/03 §1), with
-      # virtiofsd for the workspace mount. Linux only — on macOS the backend is
-      # Virtualization.framework, which needs no package.
-      #
-      # NOTE: a macOS build must be ad-hoc codesigned with the
-      # com.apple.security.virtualization entitlement or it CRASHES rather than
-      # failing gracefully (design-docs/02 §5).
+      # ── the testing bar (AGENTS.md) ──────────────────────────────────────
+      cargo-nextest # faster runs, better output than `cargo test`
+      cargo-mutants # THE bar for a security boundary: does the suite FAIL
+      # when behaviour changes? A surviving mutant in policy
+      # or path code is a bug in the test suite.
+      cargo-deny # licence + advisory audit
+      cargo-machete # unused dependencies
     ]
     ++ lib.optionals pkgs.stdenv.isLinux [
+      # Chosen Linux backend (design-docs/03 §1), with virtiofsd for the
+      # workspace mount. On macOS the backend is Virtualization.framework,
+      # which needs no package — but a macOS build MUST be ad-hoc codesigned
+      # with com.apple.security.virtualization or it CRASHES rather than
+      # failing gracefully (design-docs/02 §5).
       cloud-hypervisor
       virtiofsd
     ];
@@ -56,15 +61,72 @@
     RUST_BACKTRACE = "1";
   };
 
+  # https://devenv.sh/scripts/
+  scripts = {
+    # THE GATE from AGENTS.md: before starting a task and before calling it
+    # done. A gate already failing when you start gets fixed first.
+    check.exec = ''
+      set -euo pipefail
+      echo "▸ fmt"    && cargo fmt --all --check
+      echo "▸ clippy" && cargo clippy --workspace --all-targets -- -D warnings
+      echo "▸ test"   && cargo nextest run --workspace
+      echo "✓ gate passed"
+    '';
+
+    fix.exec = ''
+      set -euo pipefail
+      cargo fmt --all
+      cargo clippy --workspace --all-targets --fix --allow-dirty -- -D warnings
+    '';
+
+    # Mutation testing is the honest measure for a security boundary: 100%
+    # line coverage with assertion-free tests proves nothing. A surviving
+    # mutant means the suite does not actually check that behaviour.
+    mutants.exec = ''
+      set -euo pipefail
+      cargo mutants --colors=always "$@"
+    '';
+
+    # Coverage is deliberately NOT in this shell.
+    #
+    # cargo-llvm-cov 0.9.0 fails its own test suite in this nixpkgs revision on
+    # both aarch64-darwin and x86_64-linux, so it cannot be built here. That is
+    # an acceptable loss rather than a workaround to carry: coverage is a floor
+    # and `mutants` is the actual bar (AGENTS.md). Revisit when nixpkgs fixes
+    # the package; until then CI reports coverage via rustup instead.
+    cov.exec = ''
+      echo "coverage is not available in this shell — cargo-llvm-cov is broken" >&2
+      echo "in this nixpkgs revision. Mutation testing (\`mutants\`) is the bar;" >&2
+      echo "see AGENTS.md. CI reports coverage separately." >&2
+      exit 1
+    '';
+
+    deps.exec = ''
+      set -euo pipefail
+      cargo machete && cargo deny check
+    '';
+  };
+
   # https://devenv.sh/basics/
   enterShell = ''
-    echo "rachna · spike complete, implementation not started"
-    echo "  design-docs/00-PRODUCT.md       what we are building"
-    echo "  design-docs/02..05              measured findings"
+    echo "rachna"
+    echo "  check     the gate: fmt + clippy + tests  (run before and after every task)"
+    echo "  mutants   mutation testing — the real bar for policy and path code"
+    echo "  cov       coverage summary (a floor, not the goal)"
+    echo "  deps      unused deps + advisories"
+  '';
+
+  # https://devenv.sh/tests/
+  enterTest = ''
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo nextest run --workspace
   '';
 
   # https://devenv.sh/git-hooks/
   git-hooks.hooks = {
+    rustfmt.enable = true;
+    clippy.enable = true;
     nixfmt.enable = true;
   };
 
