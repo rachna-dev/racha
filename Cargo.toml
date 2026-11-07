@@ -14,6 +14,11 @@ description = "A declarative, isolated development environment you can pause, re
 # precedence, and exactly the field for "what this was built against".
 # Tested: Cargo rejects `0.4-26.11` outright.
 #
+# Patch is kept and SHOWN, not elided to a shorter `Major.Minor+guest`: a patch
+# bump is the promise "bug fix only, same guest, snapshots still restore", which
+# is the signal users of a security tool most need to read off the version
+# itself. A guest bump invalidates snapshots and is therefore never a patch.
+#
 # Still 0.0.0 while there is no guest to pin to; becomes e.g. 0.1.0+26.11 at
 # the first release that ships one.
 version = "0.0.0"
