@@ -90,6 +90,7 @@ Decisions that now rest on evidence rather than reputation:
 | [`16-SPIKE-REAL-SERVICES.md`](design-docs/16-SPIKE-REAL-SERVICES.md) | PostgreSQL + Node across pause, suspend and restore. The services story validated. |
 | [`17-DEPENDENCIES.md`](design-docs/17-DEPENDENCIES.md) | Every library choice with the alternatives compared — including three of the first six that were wrong. |
 | [`18-NIX-BOUNDARY.md`](design-docs/18-NIX-BOUNDARY.md) | What Rachna does with Nix and what it refuses to — evaluation, editing, search, formatting, LSP. |
+| [`19-RACHNA-NIX-SURFACE.md`](design-docs/19-RACHNA-NIX-SURFACE.md) | What `rachna.nix` lets you control, what Rachna forces, and why. |
 | [`idea.md`](idea.md) | The original brain-dump. Superseded where it disagrees with the above. |
 | [`AGENTS.md`](AGENTS.md) | Rules for anyone — human or agent — changing this repo: the gate, code quality, testing bar. |
 
