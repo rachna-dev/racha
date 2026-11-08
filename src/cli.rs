@@ -19,6 +19,7 @@
 //! table-testable, which is what makes step 10's "demoable with no VM"
 //! claim checkable rather than aspirational.
 
+use crate::decision::{Access, Category};
 use core::fmt;
 use std::ffi::OsString;
 
@@ -39,6 +40,174 @@ pub enum Invocation {
         /// Every argument after `argv[0]`, uninterpreted.
         args: Vec<OsString>,
     },
+}
+
+/// A change to `rachna.nix` that a verb is asking for.
+///
+/// `00` §5.3 lists seven verbs that all do the same thing — `revoke`,
+/// `expose`, `unexpose`, `add`, `port`, `set` and `secret` — and the reason
+/// they are one type rather than seven `Command` variants is that they share
+/// the part that is hard. Rule 2 of §5.3 applies to every one of them:
+///
+/// > Surgical, comment-preserving edits via an rnix CST — not AST
+/// > re-printing. If the file uses a construct that can't be safely modified,
+/// > **refuse and print the snippet to paste.** Never silently rewrite.
+///
+/// Seven variants would mean seven places to get that refusal wrong. One type
+/// means the editor and the fallback snippet are written once.
+///
+/// # Why these are not in `Command` individually
+///
+/// `21` §2.5 found these seven missing while eight others were correctly
+/// deferred for needing a backend. These need nothing — they edit a file —
+/// which is why they belong here now and the other eight do not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Edit {
+    /// `rachna allow <category> <target>...`
+    ///
+    /// Grants access. `Access` rather than two bools: `00` §5.3's example
+    /// `allow fs ~/.npmrc --read-only` has to distinguish read from write,
+    /// and `decision.rs` already owns that distinction.
+    Allow {
+        category: Category,
+        targets: Vec<String>,
+        access: Option<Access>,
+    },
+    /// `rachna revoke <category> <target>...`
+    ///
+    /// The inverse of `Allow`, and deliberately the same shape: a user who
+    /// can write the grant can remove it by retyping it with a different
+    /// verb. No `--all`, because `00` §10 is explicit that there is one
+    /// authority and removing a grant you cannot name is how you remove one
+    /// you did not mean to.
+    Revoke {
+        category: Category,
+        targets: Vec<String>,
+    },
+    /// `rachna expose <kind> <name>`
+    ///
+    /// `00` §6.4: exposing a tool is a *declared permission*, not a shim
+    /// directory entry. The kind is required because it decides the scope a
+    /// tool gets — an LSP needs the workspace read-write, a formatter does
+    /// not.
+    Expose { kind: ToolKind, name: String },
+    /// `rachna unexpose <name>`
+    ///
+    /// No kind: the name is already unique in `tools.expose`, and asking for
+    /// the kind again to remove something would mean a user who got it wrong
+    /// could not undo it.
+    Unexpose { name: String },
+    /// `rachna add package <name>`
+    ///
+    /// `00` §5.3's example. The `package` word is kept rather than implied so
+    /// the verb can grow a second noun without changing meaning.
+    AddPackage { name: String },
+    /// `rachna port <number>`
+    ///
+    /// A `u16` because that is what a port is; a port of 70000 is a usage
+    /// error caught by the parser rather than a policy error caught later.
+    Port { number: u16 },
+    /// `rachna set <path> <value>`
+    ///
+    /// `00` §5.3's example is `set resources.memory 8GB`. The path is not
+    /// validated here: `00` §5.3 rule 4 requires an unknown key to be an
+    /// **error**, and the thing that can tell is `lib.evalModules`, not a
+    /// parser. Refusing here on a guess would reject valid options.
+    Set { path: String, value: String },
+    /// `rachna secret <name>`
+    ///
+    /// Declares a credential placeholder (`00` §3.6). Name only — the same
+    /// rule as [`Grant::Secret`](crate::grant::Grant::Secret), which holds a
+    /// name and never a value, so a secret cannot reach the store or a log by
+    /// passing through this type.
+    Secret { name: String },
+}
+
+impl Edit {
+    /// The verb a user typed to ask for this edit.
+    #[must_use]
+    pub const fn verb(&self) -> &'static str {
+        match self {
+            Self::Allow { .. } => "allow",
+            Self::Revoke { .. } => "revoke",
+            Self::Expose { .. } => "expose",
+            Self::Unexpose { .. } => "unexpose",
+            Self::AddPackage { .. } => "add",
+            Self::Port { .. } => "port",
+            Self::Set { .. } => "set",
+            Self::Secret { .. } => "secret",
+        }
+    }
+
+    /// Whether this edit widens what the project may do.
+    ///
+    /// The distinction `00` §3 rests on, surfaced as a question the type can
+    /// answer: a widening edit is one a reviewer must look at, and
+    /// `rachna.nix` landing in a diff is the whole review mechanism. Removing
+    /// access needs no such scrutiny.
+    ///
+    /// `Set` counts as widening because `resources.memory` and
+    /// `isolation.network.default` go through the same verb, and a parser
+    /// cannot tell which without the module schema. Treating the unknown case
+    /// as widening is the safe direction.
+    #[must_use]
+    pub const fn widens_access(&self) -> bool {
+        match self {
+            Self::Allow { .. }
+            | Self::Expose { .. }
+            | Self::AddPackage { .. }
+            | Self::Port { .. }
+            | Self::Secret { .. }
+            | Self::Set { .. } => true,
+            Self::Revoke { .. } | Self::Unexpose { .. } => false,
+        }
+    }
+}
+
+/// What kind of protocol endpoint a declared tool is.
+///
+/// `00` §6.4's `kind` field. An enum rather than a string because the kind
+/// decides the *scope* a tool gets — §6.4 gives an LSP `workspace =
+/// "read-write"` and a formatter nothing — so an unrecognised kind must be a
+/// parse error rather than a tool exposed with no scope at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    /// A language server.
+    Lsp,
+    /// A formatter.
+    Formatter,
+    /// A debug adapter.
+    Debugger,
+    /// A plain command, run and exited.
+    Command,
+}
+
+impl ToolKind {
+    /// Every kind, for exhaustive tests.
+    pub const ALL: [Self; 4] = [Self::Lsp, Self::Formatter, Self::Debugger, Self::Command];
+
+    /// The word a user types, matching `00` §6.4's `kind` values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lsp => "lsp",
+            Self::Formatter => "formatter",
+            Self::Debugger => "debugger",
+            Self::Command => "command",
+        }
+    }
+
+    /// Parses the word.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == word)
+    }
+}
+
+impl fmt::Display for ToolKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A `rachna` subcommand.
@@ -67,13 +236,12 @@ pub enum Command {
     Audit { narrow: bool, ci: bool },
     /// `rachna explain <run-id>`
     Explain { run_id: String },
-    /// `rachna allow <category> <target>...`
-    Allow {
-        category: String,
-        targets: Vec<String>,
-        read_only: bool,
-        read_write: bool,
-    },
+    /// A change to `rachna.nix`: `allow`, `revoke`, `expose`, `unexpose`,
+    /// `add`, `port`, `set` or `secret`.
+    ///
+    /// One variant rather than eight, because `00` §5.3 rule 2 applies
+    /// identically to all of them — see [`Edit`].
+    Edit(Edit),
     /// `rachna --version`
     Version,
     /// `rachna --help` or no arguments.
@@ -105,7 +273,9 @@ impl Command {
             },
             Self::Audit { .. } => "audit",
             Self::Explain { .. } => "explain",
-            Self::Allow { .. } => "allow",
+            // Delegated rather than listed: the edit verbs' names live on
+            // `Edit`, so there is one list, not two that can disagree.
+            Self::Edit(edit) => edit.verb(),
             Self::Version => "--version",
             Self::Help => "--help",
         }
@@ -174,6 +344,32 @@ pub enum CliError {
     /// round-trip, and a hostname or run-id that cannot be represented must
     /// be refused rather than silently altered.
     NotUtf8 { command: &'static str },
+    /// More arguments than the verb takes.
+    ///
+    /// Its own variant rather than reusing [`Self::UnexpectedFlag`], because
+    /// the two have different fixes: a bad flag is a typo, while an extra
+    /// argument usually means the user expected the verb to take a list.
+    TooManyArguments {
+        command: &'static str,
+        expected: &'static str,
+    },
+    /// Not one of the five access categories.
+    ///
+    /// Caught at parse time rather than at policy time: `allow nework x`
+    /// previously produced a `String` the parser accepted and something later
+    /// rejected, which is the "declared and never enforced" shape `00` §5.3
+    /// rule 4 argues against.
+    UnknownCategory { given: String },
+    /// Not one of the four tool kinds.
+    UnknownToolKind { given: String },
+    /// The verb took a noun it does not know, as in `add thing`.
+    UnknownNoun {
+        command: &'static str,
+        given: String,
+        expected: &'static str,
+    },
+    /// Not a usable port number.
+    NotAPort { given: String },
 }
 
 impl fmt::Display for CliError {
@@ -200,6 +396,41 @@ impl fmt::Display for CliError {
                     f,
                     "`rachna {command}` was given an argument that is not valid UTF-8"
                 )
+            }
+            Self::TooManyArguments { command, expected } => {
+                write!(f, "`rachna {command}` takes {expected}")
+            }
+            // Each of these names the valid set rather than only rejecting,
+            // because `22` §4.2's format and `00` §3.3's rules both require a
+            // message to carry the fix. "unknown category" alone makes the
+            // user go and find the list.
+            Self::UnknownCategory { given } => {
+                write!(
+                    f,
+                    "`{given}` is not an access category. The five are: {}",
+                    Category::ALL.map(Category::as_str).join(", ")
+                )
+            }
+            Self::UnknownToolKind { given } => {
+                write!(
+                    f,
+                    "`{given}` is not a tool kind. The four are: {}",
+                    ToolKind::ALL.map(ToolKind::as_str).join(", ")
+                )
+            }
+            Self::UnknownNoun {
+                command,
+                given,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "`rachna {command} {given}` is not a thing to {command} — \
+                     try `rachna {command} {expected} <name>`"
+                )
+            }
+            Self::NotAPort { given } => {
+                write!(f, "`{given}` is not a port number: a port is 1 to 65535")
             }
         }
     }
@@ -287,8 +518,16 @@ fn split_equals(args: &[OsString]) -> Vec<OsString> {
 }
 
 /// Every subcommand name, for suggestions.
+/// Every verb the parser accepts.
+///
+/// Used both for dispatch's nearest-match suggestion and by the test that
+/// every one of these appears in `--help`. One list, so a verb cannot be
+/// added to the parser and missed by either.
 const COMMANDS: &[&str] = &[
-    "init", "start", "stop", "status", "doctor", "config", "audit", "explain", "allow",
+    "init", "start", "stop", "status", "doctor", "config", "audit", "explain",
+    // The `rachna.nix`-editing verbs (`00` §5.3). `21` §2.5 found these
+    // missing from step 10 while the backend verbs were correctly deferred.
+    "allow", "revoke", "expose", "unexpose", "add", "port", "set", "secret",
 ];
 
 fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
@@ -314,6 +553,13 @@ fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
         "audit" => parse_audit(rest),
         "explain" => parse_explain(rest),
         "allow" => parse_allow(rest),
+        "revoke" => parse_revoke(rest),
+        "expose" => parse_expose(rest),
+        "unexpose" => parse_unexpose(rest),
+        "add" => parse_add(rest),
+        "port" => parse_port(rest),
+        "set" => parse_set(rest),
+        "secret" => parse_secret(rest),
         other => Err(CliError::UnknownCommand {
             given: other.to_owned(),
             suggestion: nearest_command(other),
@@ -413,8 +659,16 @@ fn parse_explain(args: &[OsString]) -> Result<Command, CliError> {
     expect_no_args("explain", &args[1..], Command::Explain { run_id })
 }
 
-fn parse_allow(args: &[OsString]) -> Result<Command, CliError> {
-    let mut category = None;
+/// A category plus one or more targets, shared by `allow` and `revoke`.
+///
+/// One function because the two verbs take the same arguments and must
+/// disagree about nothing: a user who can write a grant must be able to name
+/// it identically to remove it.
+fn parse_category_and_targets(
+    command: &'static str,
+    args: &[OsString],
+) -> Result<(Category, Vec<String>, Option<Access>), CliError> {
+    let mut category_word = None;
     let mut targets = Vec::new();
     let mut read_only = false;
     let mut read_write = false;
@@ -426,21 +680,20 @@ fn parse_allow(args: &[OsString]) -> Result<Command, CliError> {
             "--read-write" => read_write = true,
             flag if flag.starts_with("--") => {
                 return Err(CliError::UnexpectedFlag {
-                    command: "allow",
+                    command,
                     flag: flag.to_owned(),
                 })
             }
-            value if category.is_none() => {
-                category = Some(
+            _ if category_word.is_none() => {
+                category_word = Some(
                     arg.to_str()
-                        .ok_or(CliError::NotUtf8 { command: "allow" })?
+                        .ok_or(CliError::NotUtf8 { command })?
                         .to_owned(),
                 );
-                let _ = value;
             }
             _ => targets.push(
                 arg.to_str()
-                    .ok_or(CliError::NotUtf8 { command: "allow" })?
+                    .ok_or(CliError::NotUtf8 { command })?
                     .to_owned(),
             ),
         }
@@ -456,22 +709,226 @@ fn parse_allow(args: &[OsString]) -> Result<Command, CliError> {
         });
     }
 
-    let category = category.ok_or(CliError::MissingArgument {
-        command: "allow",
+    let word = category_word.ok_or(CliError::MissingArgument {
+        command,
         what: "a category: network, fs, port, secret or tool",
     })?;
+    // Parsed through `Category` rather than kept as a `String`, so
+    // `rachna allow nework github.com` is a usage error here instead of a
+    // confusing policy error much later. `Category::parse` lives next to
+    // `as_str`, which is the one definition of these words.
+    let category = Category::parse(&word).ok_or(CliError::UnknownCategory { given: word })?;
+
     if targets.is_empty() {
         return Err(CliError::MissingArgument {
-            command: "allow",
+            command,
             what: "at least one target",
         });
     }
-    Ok(Command::Allow {
+
+    let access = match (read_only, read_write) {
+        (true, _) => Some(Access::ReadOnly),
+        (_, true) => Some(Access::ReadWrite),
+        _ => None,
+    };
+    Ok((category, targets, access))
+}
+
+fn parse_allow(args: &[OsString]) -> Result<Command, CliError> {
+    let (category, targets, access) = parse_category_and_targets("allow", args)?;
+    Ok(Command::Edit(Edit::Allow {
         category,
         targets,
-        read_only,
-        read_write,
-    })
+        access,
+    }))
+}
+
+fn parse_revoke(args: &[OsString]) -> Result<Command, CliError> {
+    // `revoke` accepts the access flags and ignores them rather than
+    // refusing: a user copying their own `allow` line and changing the verb
+    // is doing the obvious thing, and `fs ~/.npmrc --read-only` names exactly
+    // one grant whether or not the flag is repeated.
+    let (category, targets, _) = parse_category_and_targets("revoke", args)?;
+    Ok(Command::Edit(Edit::Revoke { category, targets }))
+}
+
+fn parse_expose(args: &[OsString]) -> Result<Command, CliError> {
+    let mut words = Vec::new();
+    for arg in args {
+        let word = arg.to_string_lossy();
+        if word.starts_with("--") {
+            return Err(CliError::UnexpectedFlag {
+                command: "expose",
+                flag: word.into_owned(),
+            });
+        }
+        words.push(
+            arg.to_str()
+                .ok_or(CliError::NotUtf8 { command: "expose" })?,
+        );
+    }
+    let (kind_word, name) = match words.as_slice() {
+        [] => {
+            return Err(CliError::MissingArgument {
+                command: "expose",
+                what: "a kind: lsp, formatter, debugger or command",
+            })
+        }
+        [_] => {
+            return Err(CliError::MissingArgument {
+                command: "expose",
+                what: "the tool's name, as in `expose formatter prettier`",
+            })
+        }
+        [kind, name] => (*kind, *name),
+        // Deliberately refused rather than exposing the first: `00` §6.4
+        // gives each tool its own scope, so two names mean two decisions.
+        _ => {
+            return Err(CliError::TooManyArguments {
+                command: "expose",
+                expected: "one kind and one tool name",
+            })
+        }
+    };
+    let kind = ToolKind::parse(kind_word).ok_or(CliError::UnknownToolKind {
+        given: kind_word.to_owned(),
+    })?;
+    Ok(Command::Edit(Edit::Expose {
+        kind,
+        name: name.to_owned(),
+    }))
+}
+
+fn parse_unexpose(args: &[OsString]) -> Result<Command, CliError> {
+    let name = exactly_one("unexpose", args, "the tool's name")?;
+    Ok(Command::Edit(Edit::Unexpose { name }))
+}
+
+fn parse_add(args: &[OsString]) -> Result<Command, CliError> {
+    let mut words = Vec::new();
+    for arg in args {
+        let word = arg.to_string_lossy();
+        if word.starts_with("--") {
+            return Err(CliError::UnexpectedFlag {
+                command: "add",
+                flag: word.into_owned(),
+            });
+        }
+        words.push(arg.to_str().ok_or(CliError::NotUtf8 { command: "add" })?);
+    }
+    match words.as_slice() {
+        // `00` §5.3's spelling is `add package <name>`. The noun is required
+        // rather than implied so a future `add service` cannot change what an
+        // existing command means.
+        ["package", name] => Ok(Command::Edit(Edit::AddPackage {
+            name: (*name).to_owned(),
+        })),
+        [] => Err(CliError::MissingArgument {
+            command: "add",
+            what: "what to add: `add package <name>`",
+        }),
+        [other] => Err(CliError::UnknownNoun {
+            command: "add",
+            given: (*other).to_owned(),
+            expected: "package",
+        }),
+        [other, ..] if *other != "package" => Err(CliError::UnknownNoun {
+            command: "add",
+            given: (*other).to_owned(),
+            expected: "package",
+        }),
+        _ => Err(CliError::TooManyArguments {
+            command: "add",
+            expected: "one package name",
+        }),
+    }
+}
+
+fn parse_port(args: &[OsString]) -> Result<Command, CliError> {
+    let word = exactly_one("port", args, "a port number")?;
+    // A port is a `u16`, so 70000 is refused here rather than becoming a
+    // policy error later. `00` §3.3's rule applies: say what is wrong at the
+    // point the user can still fix it cheaply.
+    let number: u16 = word
+        .parse()
+        .map_err(|_| CliError::NotAPort { given: word })?;
+    if number == 0 {
+        return Err(CliError::NotAPort {
+            given: "0".to_owned(),
+        });
+    }
+    Ok(Command::Edit(Edit::Port { number }))
+}
+
+fn parse_set(args: &[OsString]) -> Result<Command, CliError> {
+    let mut words = Vec::new();
+    for arg in args {
+        let word = arg.to_string_lossy();
+        // Checked before collecting, because a value may legitimately look
+        // like a flag (`set isolation.network.default --deny` is a user
+        // meaning `deny`), and guessing which is which is worse than asking.
+        if word.starts_with("--") {
+            return Err(CliError::UnexpectedFlag {
+                command: "set",
+                flag: word.into_owned(),
+            });
+        }
+        words.push(arg.to_str().ok_or(CliError::NotUtf8 { command: "set" })?);
+    }
+    match words.as_slice() {
+        [path, value] => Ok(Command::Edit(Edit::Set {
+            path: (*path).to_owned(),
+            value: (*value).to_owned(),
+        })),
+        [] => Err(CliError::MissingArgument {
+            command: "set",
+            what: "an option path, as in `set resources.memory 8GB`",
+        }),
+        [_] => Err(CliError::MissingArgument {
+            command: "set",
+            what: "a value for that option",
+        }),
+        _ => Err(CliError::TooManyArguments {
+            command: "set",
+            expected: "one option path and one value",
+        }),
+    }
+}
+
+fn parse_secret(args: &[OsString]) -> Result<Command, CliError> {
+    let name = exactly_one("secret", args, "the secret's name")?;
+    Ok(Command::Edit(Edit::Secret { name }))
+}
+
+/// Exactly one non-flag argument, or a specific error about what was wrong.
+///
+/// Shared by the three verbs that take a single name, so "none given" and
+/// "two given" are distinguished identically everywhere rather than
+/// three times with slightly different wording.
+fn exactly_one(
+    command: &'static str,
+    args: &[OsString],
+    what: &'static str,
+) -> Result<String, CliError> {
+    let mut found = None;
+    for arg in args {
+        let word = arg.to_string_lossy();
+        if word.starts_with("--") {
+            return Err(CliError::UnexpectedFlag {
+                command,
+                flag: word.into_owned(),
+            });
+        }
+        let value = arg.to_str().ok_or(CliError::NotUtf8 { command })?;
+        if found.is_some() {
+            return Err(CliError::TooManyArguments {
+                command,
+                expected: what,
+            });
+        }
+        found = Some(value.to_owned());
+    }
+    found.ok_or(CliError::MissingArgument { command, what })
 }
 
 fn expect_no_args(
@@ -536,10 +993,22 @@ CONFIG
   config inspect            the effective config, with defaults visible
   config diff               live runtime versus the file
   config validate           check without applying
+
+PERMISSIONS  (every one of these edits rachna.nix; there is no
+              temporary grant, because rachna.nix is the only authority)
   allow <category> <target>...
                             add a grant. category is one of:
                             network, fs, port, secret, tool
                             fs takes --read-only or --read-write
+  revoke <category> <target>...
+                            remove a grant, named the same way
+  expose <kind> <name>      declare a tool. kind is one of:
+                            lsp, formatter, debugger, command
+  unexpose <name>           stop declaring a tool
+  add package <name>        add a package to the environment
+  port <number>             forward a port
+  set <path> <value>        set an option, e.g. set resources.memory 8GB
+  secret <name>             declare a credential placeholder
 
 AUDIT
   audit [--narrow] [--ci]   find unused and over-broad grants
@@ -675,39 +1144,36 @@ mod tests {
         );
         assert!(text.len() > 400, "help is suspiciously short");
 
-        // Every verb, via the SAME `verb()` the error messages use, so adding
-        // a command to the parser and forgetting help is a test failure.
-        for command in [
-            Command::Init { template: None },
-            Command::Start { accept: false },
-            Command::Stop,
-            Command::Status,
-            Command::Doctor,
-            Command::Audit {
-                narrow: false,
-                ci: false,
-            },
-            Command::Explain {
-                run_id: "r".to_owned(),
-            },
-            Command::Allow {
-                category: "c".to_owned(),
-                targets: vec![],
-                read_only: false,
-                read_write: false,
-            },
-            Command::Version,
-            Command::Help,
-        ] {
-            let verb = command.verb();
+        // Driven by `COMMANDS` — the parser's OWN list — rather than a list
+        // written out here. The first version of this test enumerated
+        // commands by hand and then failed to notice seven verbs being added,
+        // which is the exact drift it exists to prevent: a test with its own
+        // copy of the list only checks the copy.
+        assert!(
+            COMMANDS.len() >= 16,
+            "COMMANDS has shrunk to {}; is dispatch still reading it?",
+            COMMANDS.len()
+        );
+        for verb in COMMANDS {
             assert!(
                 text.contains(verb),
                 "`{verb}` parses but is undocumented in help"
             );
         }
 
-        // `config` is listed with its three actions rather than bare, so it
-        // is checked through the actions the parser accepts.
+        // And every verb is actually dispatched, not merely listed: a word in
+        // COMMANDS that the parser rejects would make the loop above pass
+        // while `rachna <verb>` says "unknown command".
+        for verb in COMMANDS {
+            let parsed = parse(&["rachna", verb]);
+            assert!(
+                !matches!(parsed, Err(CliError::UnknownCommand { .. })),
+                "`{verb}` is listed and documented but not dispatched"
+            );
+        }
+
+        // The flags and sub-actions, which are as easy to forget as a verb
+        // and more confusing to omit.
         for action in ConfigAction::ALL {
             let phrase = format!("config {}", action.as_str());
             assert!(
@@ -715,13 +1181,315 @@ mod tests {
                 "`{phrase}` parses but is undocumented in help"
             );
         }
-
-        // And the flags that change behaviour, which are as easy to forget as
-        // a verb and more confusing to omit.
         for flag in ["--template", "--accept", "--narrow", "--ci", "--read-only"] {
             assert!(
                 text.contains(flag),
                 "`{flag}` is accepted but undocumented in help"
+            );
+        }
+        // Both long-form switches, which have no verb to carry them.
+        for switch in ["--version", "--help"] {
+            assert!(text.contains(switch), "`{switch}` is undocumented");
+        }
+    }
+
+    // ---- the rachna.nix-editing verbs (00 §5.3, found missing by 21 §2.5)
+
+    #[test]
+    fn every_edit_verb_parses_the_spec_example_verbatim() {
+        // `00` §5.3 gives six concrete examples. They are typed here exactly
+        // as written, because a surface that does not accept its own
+        // documentation is a surface that was never run.
+        assert_eq!(
+            command(&["rachna", "allow", "network", "registry.npmjs.org"]),
+            Command::Edit(Edit::Allow {
+                category: Category::Network,
+                targets: vec!["registry.npmjs.org".to_owned()],
+                access: None,
+            })
+        );
+        assert_eq!(
+            command(&["rachna", "allow", "fs", "~/.npmrc", "--read-only"]),
+            Command::Edit(Edit::Allow {
+                category: Category::Filesystem,
+                targets: vec!["~/.npmrc".to_owned()],
+                access: Some(Access::ReadOnly),
+            })
+        );
+        assert_eq!(
+            command(&["rachna", "expose", "formatter", "prettier"]),
+            Command::Edit(Edit::Expose {
+                kind: ToolKind::Formatter,
+                name: "prettier".to_owned(),
+            })
+        );
+        assert_eq!(
+            command(&["rachna", "add", "package", "postgresql_16"]),
+            Command::Edit(Edit::AddPackage {
+                name: "postgresql_16".to_owned(),
+            })
+        );
+        assert_eq!(
+            command(&["rachna", "port", "3000"]),
+            Command::Edit(Edit::Port { number: 3000 })
+        );
+        assert_eq!(
+            command(&["rachna", "set", "resources.memory", "8GB"]),
+            Command::Edit(Edit::Set {
+                path: "resources.memory".to_owned(),
+                value: "8GB".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_misspelled_category_is_refused_at_parse_time() {
+        // The reason `Category` replaced a `String`. Previously
+        // `allow nework github.com` parsed fine and failed somewhere later —
+        // the same "declared and silently means nothing" shape `00` §5.3
+        // rule 4 rejects for config keys.
+        //
+        // First assert the attack target exists: the correct spelling works.
+        assert!(matches!(
+            command(&["rachna", "allow", "network", "x"]),
+            Command::Edit(Edit::Allow { .. })
+        ));
+
+        let error = parse(&["rachna", "allow", "nework", "github.com"])
+            .expect_err("a misspelled category must not parse");
+        assert!(matches!(error, CliError::UnknownCategory { .. }), "{error}");
+        // The message lists the valid set, so the user does not go looking.
+        let text = error.to_string();
+        for category in Category::ALL {
+            assert!(
+                text.contains(category.as_str()),
+                "the error omits `{category}`: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_tool_kind_is_refused_and_lists_the_kinds() {
+        assert!(matches!(
+            command(&["rachna", "expose", "lsp", "rust-analyzer"]),
+            Command::Edit(Edit::Expose { .. })
+        ));
+        let error = parse(&["rachna", "expose", "linter", "eslint"])
+            .expect_err("`linter` is not one of 00 §6.4's kinds");
+        assert!(matches!(error, CliError::UnknownToolKind { .. }), "{error}");
+        let text = error.to_string();
+        for kind in ToolKind::ALL {
+            assert!(text.contains(kind.as_str()), "the error omits `{kind}`");
+        }
+    }
+
+    #[test]
+    fn every_tool_kind_round_trips() {
+        for kind in ToolKind::ALL {
+            assert_eq!(ToolKind::parse(kind.as_str()), Some(kind));
+            assert_eq!(
+                command(&["rachna", "expose", kind.as_str(), "t"]),
+                Command::Edit(Edit::Expose {
+                    kind,
+                    name: "t".to_owned(),
+                })
+            );
+        }
+        for rejected in ["", "LSP", "lint", "formatters"] {
+            assert_eq!(ToolKind::parse(rejected), None, "`{rejected}` accepted");
+        }
+    }
+
+    #[test]
+    fn a_port_outside_the_range_is_a_usage_error_not_a_policy_error() {
+        // Caught where the user can still fix it cheaply, rather than
+        // becoming a confusing failure after the config is written.
+        assert_eq!(
+            command(&["rachna", "port", "65535"]),
+            Command::Edit(Edit::Port { number: 65535 })
+        );
+        for rejected in ["70000", "-1", "0", "3000.5", "http", ""] {
+            let error =
+                parse(&["rachna", "port", rejected]).expect_err("`{rejected}` is not a port");
+            assert!(
+                matches!(error, CliError::NotAPort { .. }),
+                "`{rejected}` gave {error:?}"
+            );
+            assert!(
+                error.to_string().contains("1 to 65535"),
+                "the error must say the range"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verb_taking_one_name_refuses_none_and_refuses_two() {
+        // Both directions, because "too few" and "too many" have different
+        // fixes and a single `Missing` for both would mislead.
+        for verb in ["unexpose", "secret"] {
+            let missing = parse(&["rachna", verb]).expect_err("needs a name");
+            assert!(
+                matches!(missing, CliError::MissingArgument { .. }),
+                "{verb}: {missing:?}"
+            );
+            let extra = parse(&["rachna", verb, "one", "two"]).expect_err("takes one name");
+            assert!(
+                matches!(extra, CliError::TooManyArguments { .. }),
+                "{verb}: {extra:?}"
+            );
+        }
+        // And one name works, so the above is not rejecting everything.
+        assert_eq!(
+            command(&["rachna", "unexpose", "lldb-dap"]),
+            Command::Edit(Edit::Unexpose {
+                name: "lldb-dap".to_owned(),
+            })
+        );
+        assert_eq!(
+            command(&["rachna", "secret", "AWS_ACCESS_KEY_ID"]),
+            Command::Edit(Edit::Secret {
+                name: "AWS_ACCESS_KEY_ID".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn add_requires_its_noun_and_names_the_one_it_knows() {
+        let unknown = parse(&["rachna", "add", "service", "redis"])
+            .expect_err("`service` is not a thing to add");
+        assert!(
+            matches!(unknown, CliError::UnknownNoun { .. }),
+            "{unknown:?}"
+        );
+        assert!(unknown.to_string().contains("package"), "{unknown}");
+        // A bare `add` says what shape it wants rather than only refusing.
+        let bare = parse(&["rachna", "add"]).expect_err("needs a noun");
+        assert!(bare.to_string().contains("add package"), "{bare}");
+    }
+
+    #[test]
+    fn set_needs_both_halves_and_distinguishes_which_is_missing() {
+        let no_path = parse(&["rachna", "set"]).expect_err("needs a path");
+        assert!(no_path.to_string().contains("option path"), "{no_path}");
+        let no_value = parse(&["rachna", "set", "resources.memory"]).expect_err("needs a value");
+        assert!(no_value.to_string().contains("a value"), "{no_value}");
+        // An option path is NOT validated here: `00` §5.3 rule 4 makes an
+        // unknown key an error, and the thing that can tell is
+        // `lib.evalModules`. Refusing on a guess would reject valid options,
+        // so a plausible-but-unknown path must parse.
+        assert_eq!(
+            command(&["rachna", "set", "some.future.option", "v"]),
+            Command::Edit(Edit::Set {
+                path: "some.future.option".to_owned(),
+                value: "v".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn revoke_takes_exactly_what_allow_takes() {
+        // The property that matters: a user must be able to remove a grant by
+        // retyping the line that created it with a different verb. If the two
+        // parsers ever diverge, a grant becomes unremovable by the obvious
+        // means.
+        for args in [
+            vec!["network", "github.com"],
+            vec!["fs", "~/.npmrc", "--read-only"],
+            vec!["secret", "AWS_SECRET"],
+            vec!["network", "a.com", "b.com", "c.com"],
+        ] {
+            let mut allow_parts = vec!["rachna", "allow"];
+            allow_parts.extend(args.iter().copied());
+            let mut revoke_parts = vec!["rachna", "revoke"];
+            revoke_parts.extend(args.iter().copied());
+
+            let Command::Edit(Edit::Allow {
+                category: ac,
+                targets: at,
+                ..
+            }) = command(&allow_parts)
+            else {
+                panic!("allow {args:?} did not parse as an allow")
+            };
+            let Command::Edit(Edit::Revoke {
+                category: rc,
+                targets: rt,
+            }) = command(&revoke_parts)
+            else {
+                panic!("revoke {args:?} did not parse as a revoke")
+            };
+            assert_eq!(ac, rc, "{args:?} disagreed on category");
+            assert_eq!(at, rt, "{args:?} disagreed on targets");
+        }
+    }
+
+    #[test]
+    fn an_edit_knows_whether_it_widens_access() {
+        // The distinction a reviewer needs: `rachna.nix` in a diff is the
+        // whole review mechanism, so "does this grant more" must be a
+        // question the type answers rather than a judgement at a call site.
+        let widening = [
+            Edit::Allow {
+                category: Category::Network,
+                targets: vec!["x".to_owned()],
+                access: None,
+            },
+            Edit::Expose {
+                kind: ToolKind::Lsp,
+                name: "t".to_owned(),
+            },
+            Edit::AddPackage {
+                name: "p".to_owned(),
+            },
+            Edit::Port { number: 1 },
+            Edit::Secret {
+                name: "s".to_owned(),
+            },
+            // `set` counts as widening because a parser cannot tell
+            // `resources.memory` from `isolation.network.default` without the
+            // module schema, and unknown must mean "look at it".
+            Edit::Set {
+                path: "p".to_owned(),
+                value: "v".to_owned(),
+            },
+        ];
+        for edit in widening {
+            assert!(edit.widens_access(), "{edit:?} should widen");
+        }
+        let narrowing = [
+            Edit::Revoke {
+                category: Category::Network,
+                targets: vec!["x".to_owned()],
+            },
+            Edit::Unexpose {
+                name: "t".to_owned(),
+            },
+        ];
+        for edit in narrowing {
+            assert!(!edit.widens_access(), "{edit:?} should not widen");
+        }
+    }
+
+    #[test]
+    fn no_edit_verb_silently_accepts_an_unknown_flag() {
+        // `00` §5.3 rule 1: there is no `--persist`, because there is no
+        // non-persistent alternative. A user who types one must be told,
+        // not quietly ignored — an ignored flag means the user believes
+        // something happened that did not.
+        for parts in [
+            vec!["rachna", "allow", "network", "x", "--persist"],
+            vec!["rachna", "revoke", "network", "x", "--once"],
+            vec!["rachna", "expose", "lsp", "t", "--global"],
+            vec!["rachna", "unexpose", "t", "--force"],
+            vec!["rachna", "add", "package", "p", "--dev"],
+            vec!["rachna", "port", "3000", "--host"],
+            vec!["rachna", "set", "a.b", "--deny"],
+            vec!["rachna", "secret", "S", "--env"],
+        ] {
+            let error = parse(&parts).expect_err("an unknown flag must be refused");
+            assert!(
+                matches!(error, CliError::UnexpectedFlag { .. }),
+                "{parts:?} gave {error:?}"
             );
         }
     }
@@ -810,12 +1578,11 @@ mod tests {
             Command::Explain {
                 run_id: "r".to_owned(),
             },
-            Command::Allow {
-                category: "c".to_owned(),
+            Command::Edit(Edit::Allow {
+                category: Category::Network,
                 targets: vec![],
-                read_only: false,
-                read_write: false,
-            },
+                access: None,
+            }),
             Command::Version,
             Command::Help,
         ]
@@ -935,12 +1702,11 @@ mod tests {
         // Only `--flag=value` splits. A target like `KEY=value` is a value.
         assert_eq!(
             command(&["rachna", "allow", "secret", "KEY=value"]),
-            Command::Allow {
-                category: "secret".to_owned(),
+            Command::Edit(Edit::Allow {
+                category: Category::Secret,
                 targets: vec!["KEY=value".to_owned()],
-                read_only: false,
-                read_write: false,
-            }
+                access: None,
+            })
         );
     }
 
@@ -985,15 +1751,14 @@ mod tests {
                 "registry.npmjs.org:443",
                 "github.com:443"
             ]),
-            Command::Allow {
-                category: "network".to_owned(),
+            Command::Edit(Edit::Allow {
+                category: Category::Network,
                 targets: vec![
                     "registry.npmjs.org:443".to_owned(),
                     "github.com:443".to_owned()
                 ],
-                read_only: false,
-                read_write: false,
-            }
+                access: None,
+            })
         );
     }
 
@@ -1007,12 +1772,11 @@ mod tests {
         ] {
             assert_eq!(
                 command(&parts),
-                Command::Allow {
-                    category: "fs".to_owned(),
+                Command::Edit(Edit::Allow {
+                    category: Category::Filesystem,
                     targets: vec!["/w".to_owned()],
-                    read_only: true,
-                    read_write: false,
-                },
+                    access: Some(Access::ReadOnly),
+                }),
                 "{parts:?}"
             );
         }
@@ -1086,12 +1850,11 @@ mod tests {
         // And a target that merely looks unusual is still a target.
         assert_eq!(
             command(&["rachna", "allow", "fs", "-weird-name"]),
-            Command::Allow {
-                category: "fs".to_owned(),
+            Command::Edit(Edit::Allow {
+                category: Category::Filesystem,
                 targets: vec!["-weird-name".to_owned()],
-                read_only: false,
-                read_write: false,
-            }
+                access: None,
+            })
         );
     }
 
@@ -1102,8 +1865,15 @@ mod tests {
         // from `init` but 3*1 > 3, so only the ratio rejects it — and
         // suggesting `init` for someone who typed `ini` deliberately would
         // be wrong, while suggesting a command for `st` would be a guess.
-        assert_eq!(nearest_command("st"), None, "2 edits on a 2-letter word");
-        assert_eq!(nearest_command("au"), None);
+        // `st` USED to be here as "2 edits on a 2-letter word". Adding the
+        // `00` §5.3 verbs made it 1 edit from `set`, which passes both bounds
+        // — and suggesting `set` to someone who typed `st` is a reasonable
+        // correction rather than a guess, so the right answer changed with
+        // the vocabulary. Recorded rather than quietly deleted: the rule is
+        // about distance and length, not about a fixed list of words, so a
+        // new verb legitimately changes which fragments are near-misses.
+        assert_eq!(nearest_command("st"), Some("set"));
+        assert_eq!(nearest_command("au"), None, "2 edits on a 2-letter word");
         // Three-letter fragments: 3 edits against a 5-7 letter command. These
         // are what distinguish `d * 3 <= max_len` from `d + 3 <= max_len` —
         // found by enumerating the two formulations rather than guessing,

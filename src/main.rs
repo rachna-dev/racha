@@ -66,9 +66,25 @@ fn run(command: Command) -> ExitCode {
             print!("{}", rachna::cli::help());
             ExitCode::from(OK)
         }
-        // Everything below needs a VM, a store on disk, or a config file, and
-        // those arrive with steps 11-13. Naming them individually rather than
-        // with a catch-all so adding a backend is a compile error here, not a
+        // The `rachna.nix`-editing verbs. Distinguished from the rest
+        // because they need NO backend — `00` §5.3's whole point is that they
+        // are a surgical edit to one file — so reporting "needs a backend"
+        // would name the wrong missing piece. What they wait on is the CST
+        // editor, which `00` §5.3 itself calls "a convenience, not
+        // load-bearing": the fallback is to print the snippet to paste, and
+        // that is what this message is a placeholder for.
+        Command::Edit(edit) => {
+            eprintln!(
+                "rachna: `{}` would edit rachna.nix, and the comment-preserving \
+                 editor is not built yet (00 §5.3). Until it is, add it to \
+                 rachna.nix by hand — `rachna config validate` will check it",
+                edit.verb()
+            );
+            ExitCode::from(UNIMPLEMENTED)
+        }
+        // Everything below needs a VM or a store on disk, and those arrive
+        // with steps 11-13. Naming them individually rather than with a
+        // catch-all so adding a backend is a compile error here, not a
         // silently-missing verb.
         Command::Init { .. }
         | Command::Start { .. }
@@ -77,8 +93,7 @@ fn run(command: Command) -> ExitCode {
         | Command::Doctor
         | Command::Config { .. }
         | Command::Audit { .. }
-        | Command::Explain { .. }
-        | Command::Allow { .. } => {
+        | Command::Explain { .. } => {
             eprintln!(
                 "rachna: `{}` needs a backend, which lands with build-order \
                  step 11 (design-docs/01-ARCHITECTURE.md §7)",

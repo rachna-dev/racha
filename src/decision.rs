@@ -57,6 +57,21 @@ impl Category {
             Self::Secret => "secret",
         }
     }
+
+    /// The category a user typed, or `None`.
+    ///
+    /// Lives here rather than in `cli.rs` because [`Self::as_str`] is the one
+    /// definition of these words (`AGENTS.md`, "extend the owner") — a
+    /// separate parser in the CLI would be a second list to keep in step, and
+    /// the first one to drift.
+    ///
+    /// Derived from [`Self::ALL`] rather than written as a second `match`, so
+    /// a new variant is parseable the moment it is added. The round-trip
+    /// against `as_str` is therefore a property, not a table to maintain.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == word)
+    }
 }
 
 impl fmt::Display for Category {
@@ -241,6 +256,35 @@ impl Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_category_parses_back_from_the_word_it_prints() {
+        // A property over ALL rather than a table, so a new category is
+        // covered the moment it exists. First assert the thing under attack
+        // exists: that `parse` is not simply returning the same answer for
+        // everything.
+        assert_eq!(Category::parse("network"), Some(Category::Network));
+        assert_eq!(Category::parse("fs"), Some(Category::Filesystem));
+
+        for category in Category::ALL {
+            assert_eq!(
+                Category::parse(category.as_str()),
+                Some(category),
+                "`{category}` does not round-trip"
+            );
+        }
+
+        // And the cases a CLI actually sees. `fs` is deliberately not
+        // `filesystem` on the wire (as_str), so the long spelling must NOT
+        // parse — accepting both would mean two spellings in rachna.nix.
+        for rejected in ["", "filesystem", "Network", "net", "networks", " fs"] {
+            assert_eq!(
+                Category::parse(rejected),
+                None,
+                "`{rejected}` was accepted as a category"
+            );
+        }
+    }
 
     // `Category::ALL` exists for table-driven tests, so a variant added
     // without updating it would silently shrink every table that uses it.
