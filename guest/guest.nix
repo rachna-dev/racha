@@ -205,6 +205,49 @@
     RuntimeMaxUse = "32M";
   };
 
+  # ---- durable service data (15 §7 tier 1) -------------------------------
+
+  # `16` §5.1 measured that Postgres CANNOT use a virtiofs data directory at
+  # all — `226/NAMESPACE` on every boot — and that the lifecycle story was
+  # validated only with data on **tmpfs**, meaning a database did not survive
+  # a cold boot. `15` §7 calls that a *consistency* defect rather than a
+  # performance one: a tool promising "come back to a warm Postgres" and
+  # silently losing the data on restart is broken in the way that matters
+  # most.
+  #
+  # So service data goes on the state BLOCK DEVICE, which fixes both halves:
+  # it is not virtiofs, so no namespace failure; and it is not tmpfs, so it
+  # survives. This is also the constraint `00` §7's overlay decision imposes
+  # — overlayfs semantics leak (EXDEV, copy-up, fsync durability), and a
+  # database is exactly the kind of program that notices.
+  #
+  # `/var/lib/rachna` rather than `/var/lib`, per §4.1: mounting over a
+  # directory systemd owns shadows `/var/lib/systemd` and logind fails
+  # 238/STATE_DIRECTORY on every boot.
+  services.postgresql = {
+    enable = true;
+    dataDir = "/var/lib/rachna/postgresql/${config.services.postgresql.package.psqlSchema}";
+    package = pkgs.postgresql_16;
+    settings = {
+      listen_addresses = "127.0.0.1";
+      # The host enforces network policy; the guest firewall is off
+      # (`00` §3.9), so binding loopback keeps this guest-local.
+      port = 5432;
+    };
+    authentication = lib.mkForce ''
+      local all all trust
+      host all all 127.0.0.1/32 trust
+    '';
+  };
+
+  # The data directory must exist on the state volume before Postgres starts,
+  # and the state volume is mounted by then (`nofail` + the fileSystems
+  # dependency), so this is ordering rather than creation-on-demand.
+  systemd.services.postgresql = {
+    after = [ "var-lib-rachna.mount" ];
+    requires = [ "var-lib-rachna.mount" ];
+  };
+
   # The toolchain a development environment needs. Everything else arrives on
   # the project's closure disk (`00` §7 Layer C), so this stays small.
   environment.systemPackages = with pkgs; [
