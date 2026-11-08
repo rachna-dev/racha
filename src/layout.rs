@@ -180,6 +180,25 @@ impl ProjectPaths {
         self.root.join("disks").join("state.img")
     }
 
+    /// What must not be reachable from inside this project's guest.
+    ///
+    /// Derived here rather than assembled by a caller, so there is one answer
+    /// to "what is excluded" — `00` §3.11's third bullet: *"the exclusion
+    /// list is part of the mount's definition, not a special case for one
+    /// filename."*
+    ///
+    /// Takes the project directory because `rachna.nix` lives there, in the
+    /// user's repo, while the shims live in this tree. That split is the
+    /// point: `08` §4 keeps Rachna's integrity-critical files **out** of the
+    /// mounted project folder precisely so the guest cannot reach them.
+    #[must_use]
+    pub fn exclusions(&self, project_dir: &Path) -> crate::exclusion::ExclusionSet {
+        crate::exclusion::ExclusionSet::for_project(
+            &project_dir.join("rachna.nix"),
+            &self.shim_dir(),
+        )
+    }
+
     /// Where snapshots go.
     #[must_use]
     pub fn snapshot_dir(&self) -> PathBuf {
@@ -289,6 +308,29 @@ mod tests {
         assert_eq!(
             p.snapshot_dir(),
             Path::new("/home/dev/.rachna/projects/orders-api-a3f2/snapshots")
+        );
+    }
+
+    #[test]
+    fn the_exclusion_set_names_the_policy_file_and_this_tree_s_shims() {
+        // One answer to "what is excluded", per `00` §3.11's third bullet.
+        // The split matters: rachna.nix is in the USER's repo, the shims are
+        // in Rachna's tree — `08` §4 puts them there precisely so a guest
+        // that can write the project folder cannot reach them.
+        let paths = paths();
+        let set = paths.exclusions(Path::new("/Users/you/Projects/app"));
+        assert_eq!(
+            set.paths(),
+            [
+                PathBuf::from("/Users/you/Projects/app/rachna.nix"),
+                PathBuf::from("/home/dev/.rachna/projects/orders-api-a3f2/bin"),
+            ]
+        );
+        // The shim path is NOT under the project directory, which is the
+        // property that makes it unreachable from the mount.
+        assert!(
+            !set.paths()[1].starts_with("/Users/you/Projects/app"),
+            "the shims are inside the mounted project folder"
         );
     }
 

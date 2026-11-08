@@ -45,6 +45,119 @@ impl fmt::Display for FileId {
     }
 }
 
+/// What must not be reachable from inside a guest, for one project.
+///
+/// # Why this exists as a type
+///
+/// [`check`] takes a `BTreeSet<FileId>` and **nothing produced one**. The
+/// mechanism was correct, tested against both measured attacks, and unwired
+/// — so every path `08` §4 says must be excluded was excluded by nobody. A
+/// security check whose input no code supplies is the "declared and never
+/// enforced" shape in its purest form.
+///
+/// # What belongs here, and what does not
+///
+/// `00` §3.11's third bullet gives the rule: *"Anything whose integrity the
+/// policy depends on is excluded the same way — so the exclusion list is
+/// part of the mount's definition, not a special case for one filename."*
+///
+/// Two entries, and the **second matters more than the first**:
+///
+/// - **`rachna.nix`**, so the guest cannot read or edit the policy that
+///   governs it. Since `00` §3.11a gated the reload, this is a *default*
+///   rather than a requirement — a guest-written grant is now inert until
+///   approved — but it stays because the file is not the agent's business
+///   most of the time, and because the gate is one function that was itself
+///   found as a flag nobody read.
+/// - **the shim directory**, and `08` §4's table calls this *"worse than the
+///   policy-tampering attack it mirrors"*: a guest that replaces
+///   `.rachna/bin/rustfmt` gets **code execution on the host**, because the
+///   editor is configured to run it. **No reload gate helps here** — there
+///   is no reload to gate — so this entry is load-bearing however the
+///   policy-file question is settled.
+///
+/// What is deliberately **not** here: the project's own service data. `08`
+/// §4 is explicit — *"A guest writing its own Postgres files is not an
+/// attack, it is the entire point."* The trust argument is about things
+/// *Rachna relies on*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExclusionSet {
+    paths: Vec<PathBuf>,
+}
+
+impl ExclusionSet {
+    /// What to exclude for a project whose `rachna.nix` sits at `policy_file`
+    /// and whose shims live at `shim_dir`.
+    ///
+    /// Takes paths rather than a [`ProjectPaths`](crate::layout::ProjectPaths)
+    /// so this stays usable for a project laid out differently — and so the
+    /// set is testable without a filesystem.
+    #[must_use]
+    pub fn for_project(policy_file: &Path, shim_dir: &Path) -> Self {
+        Self {
+            paths: vec![policy_file.to_path_buf(), shim_dir.to_path_buf()],
+        }
+    }
+
+    /// The paths to resolve.
+    #[must_use]
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    /// Resolves every path to a [`FileId`], via `stat`.
+    ///
+    /// # Errors
+    ///
+    /// [`ResolveError`] naming the path that could not be resolved. **A
+    /// failure must stop the start**, and `check` already enforces that: an
+    /// empty or partial set makes [`Verdict::is_vacuous`] true, because a
+    /// check against nothing refuses nothing. Returning a short set instead
+    /// of an error would be the silent half-protection `14` §3 warns about.
+    ///
+    /// A path that does not exist is **not** an error for the shim
+    /// directory, which Rachna creates on first start — but it **is** for
+    /// `rachna.nix`, whose absence means there is no policy to enforce and
+    /// therefore nothing to start. The caller distinguishes them, because
+    /// only the caller knows which is which.
+    pub fn resolve_with(
+        &self,
+        mut stat: impl FnMut(&Path) -> Option<FileId>,
+    ) -> Result<BTreeSet<FileId>, ResolveError> {
+        let mut out = BTreeSet::new();
+        for path in &self.paths {
+            let id = stat(path).ok_or_else(|| ResolveError { path: path.clone() })?;
+            out.insert(id);
+        }
+        Ok(out)
+    }
+}
+
+/// A path in the exclusion set that could not be resolved.
+///
+/// Carries the path because the fix depends on which one it was, and because
+/// `00` §3.3's rules apply: "could not resolve the exclusion set" tells a
+/// user nothing they can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveError {
+    /// The path that failed.
+    pub path: PathBuf,
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cannot stat {} to exclude it from the guest's view. \
+             Starting would mount a share this check never verified, so \
+             rachna refuses rather than protecting half of it (00 §3.11)",
+            self.path.display()
+        )
+    }
+}
+
+impl core::error::Error for ResolveError {}
+
 /// One entry found inside a share, with the facts the check needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareEntry {
@@ -254,6 +367,117 @@ mod tests {
 
     fn excluded() -> BTreeSet<FileId> {
         [POLICY].into_iter().collect()
+    }
+
+    // ---- building the set, which nothing did -----------------------------
+
+    #[test]
+    fn the_set_covers_the_policy_file_and_the_shims() {
+        // `08` §4's table lists both, and the SHIM row is the worse of the
+        // two: a guest that replaces `.rachna/bin/rustfmt` gets code
+        // execution on the host, because the editor runs it. No reload gate
+        // helps there — there is no reload to gate — so this entry is
+        // load-bearing however `00` §3.11a's policy-file question settles.
+        let set = ExclusionSet::for_project(
+            Path::new("/proj/rachna.nix"),
+            Path::new("/home/dev/.rachna/projects/app-a3f2/bin"),
+        );
+        assert_eq!(
+            set.paths(),
+            [
+                PathBuf::from("/proj/rachna.nix"),
+                PathBuf::from("/home/dev/.rachna/projects/app-a3f2/bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolving_turns_paths_into_identities() {
+        // The point of the whole module: identity, not names. `11` §5 and
+        // `12` §3 measured a hardlink and a case variant defeating a
+        // name-based check.
+        let set = ExclusionSet::for_project(Path::new("/proj/rachna.nix"), Path::new("/proj/bin"));
+        let resolved = set
+            .resolve_with(|path| {
+                Some(FileId {
+                    device: SHARE_DEV,
+                    inode: if path.ends_with("rachna.nix") { 10 } else { 20 },
+                })
+            })
+            .expect("both resolve");
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.contains(&FileId {
+            device: SHARE_DEV,
+            inode: 10
+        }));
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_resolved_is_an_error_not_a_shorter_set() {
+        // THE property. A short set makes `check` refuse nothing for the
+        // missing entry, and `Verdict::is_vacuous` is the only thing that
+        // would notice — so returning a partial set would be the silent
+        // half-protection `14` §3 warns about. First assert the success
+        // path, so the failure below is not vacuous.
+        let set = ExclusionSet::for_project(Path::new("/proj/rachna.nix"), Path::new("/proj/bin"));
+        assert!(set
+            .resolve_with(|_| Some(FileId {
+                device: SHARE_DEV,
+                inode: 1
+            }))
+            .is_ok());
+
+        // Now fail on the SECOND path, which is the dangerous direction: the
+        // first succeeded, so a buggy implementation would have a non-empty
+        // set and look like it worked.
+        let error = set
+            .resolve_with(|path| {
+                if path.ends_with("rachna.nix") {
+                    Some(FileId {
+                        device: SHARE_DEV,
+                        inode: 10,
+                    })
+                } else {
+                    None
+                }
+            })
+            .expect_err("an unresolvable path must be an error");
+        assert_eq!(error.path, PathBuf::from("/proj/bin"));
+
+        // And the message says why refusing beats protecting half.
+        let text = error.to_string();
+        assert!(text.contains("/proj/bin"), "{text}");
+        assert!(text.contains("never verified"), "{text}");
+        assert!(text.contains("half"), "{text}");
+    }
+
+    #[test]
+    fn a_resolved_set_is_what_check_needs_to_be_non_vacuous() {
+        // Ties the producer to the consumer: a set built here, fed to
+        // `check`, must refuse a hardlink to the policy file. Without this
+        // the two halves could each be correct and not fit together.
+        let set = ExclusionSet::for_project(Path::new("/proj/rachna.nix"), Path::new("/proj/bin"));
+        let resolved = set
+            .resolve_with(|path| {
+                Some(FileId {
+                    device: SHARE_DEV,
+                    inode: if path.ends_with("rachna.nix") { 10 } else { 20 },
+                })
+            })
+            .expect("resolves");
+
+        // A file in the share under an innocent name, same inode as the
+        // policy — `11` §5's measured attack.
+        let verdict = check(
+            SHARE_DEV,
+            &resolved,
+            &[entry("/workspace/notes.txt", 10, 2)],
+        );
+        assert!(!verdict.is_vacuous(), "the check had nothing to compare");
+        assert!(
+            !verdict.is_allowed(),
+            "a hardlink to rachna.nix was allowed"
+        );
     }
 
     fn entry(path: &str, inode: u64, links: u64) -> ShareEntry {
