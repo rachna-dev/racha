@@ -20,6 +20,11 @@
 //! claim checkable rather than aspirational.
 
 use crate::decision::{Access, Category};
+// `ToolKind` is grant.rs's, not a second copy. An earlier version of this
+// module defined its own with FOUR variants against grant.rs's three — two
+// lists that disagreed, and the config parser rejected the spelling `00`
+// §6.4 documents. The variant was added to the owner and this copy deleted.
+use crate::grant::ToolKind;
 use core::fmt;
 use std::ffi::OsString;
 
@@ -161,46 +166,6 @@ impl Edit {
             | Self::Set { .. } => true,
             Self::Revoke { .. } | Self::Unexpose { .. } => false,
         }
-    }
-}
-
-/// What kind of protocol endpoint a declared tool is.
-///
-/// `00` §6.4's `kind` field. An enum rather than a string because the kind
-/// decides the *scope* a tool gets — §6.4 gives an LSP `workspace =
-/// "read-write"` and a formatter nothing — so an unrecognised kind must be a
-/// parse error rather than a tool exposed with no scope at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolKind {
-    /// A language server.
-    Lsp,
-    /// A formatter.
-    Formatter,
-    /// A debug adapter.
-    Debugger,
-    /// A plain command, run and exited.
-    Command,
-}
-
-impl ToolKind {
-    /// Every kind, for exhaustive tests.
-    pub const ALL: [Self; 4] = [Self::Lsp, Self::Formatter, Self::Debugger, Self::Command];
-
-    /// The word a user types, matching `00` §6.4's `kind` values.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Lsp => "lsp",
-            Self::Formatter => "formatter",
-            Self::Debugger => "debugger",
-            Self::Command => "command",
-        }
-    }
-
-    /// Parses the word.
-    #[must_use]
-    pub fn parse(word: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|kind| kind.as_str() == word)
     }
 }
 

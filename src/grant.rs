@@ -117,11 +117,24 @@ pub enum ToolKind {
     Formatter,
     /// Debug Adapter Protocol.
     Debugger,
+    /// A plain command: run, produce output, exit.
+    ///
+    /// `00` §6.4 declares this — `{ name = "cargo"; kind = "command"; }` — and
+    /// it was missing here, so a `rachna.nix` using the documented spelling
+    /// was **rejected by the config parser**. Found by noticing that a second
+    /// `ToolKind` added to `cli.rs` had four variants against this one's
+    /// three; the duplicate is now deleted and this is the single definition.
+    ///
+    /// Distinct from the three protocol kinds because it has no protocol: a
+    /// formatter is stdin→stdout, an LSP and a DAP are long-lived JSON-RPC,
+    /// and a command is neither. `00` §6.2 makes that the thing that decides
+    /// how a shim proxies it.
+    Command,
 }
 
 impl ToolKind {
     /// Every tool kind.
-    pub const ALL: [Self; 3] = [Self::Lsp, Self::Formatter, Self::Debugger];
+    pub const ALL: [Self; 4] = [Self::Lsp, Self::Formatter, Self::Debugger, Self::Command];
 
     /// The word used in `rachna.nix`.
     #[must_use]
@@ -130,8 +143,31 @@ impl ToolKind {
             Self::Lsp => "lsp",
             Self::Formatter => "formatter",
             Self::Debugger => "debugger",
+            Self::Command => "command",
         }
     }
+
+    /// The kind a user wrote, or `None`.
+    ///
+    /// Derived from [`Self::ALL`] rather than a second `match`, so a new kind
+    /// is parseable the moment it is added. The config parser had a
+    /// hand-written match that was **missing `command`** — one list drifting
+    /// from another is exactly what this avoids (`AGENTS.md`, "extend the
+    /// owner").
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == word)
+    }
+
+    /// The words a user may write, for an error message.
+    ///
+    /// A `const` so it fits `ConfigError::NotOneOf`'s
+    /// `&'static [&'static str]`, and adjacent to [`Self::ALL`] so a reader
+    /// sees both at once. The length is tied to `ALL`, so adding a variant
+    /// without adding a word here fails to compile — which is how
+    /// `config.rs` came to name three kinds while the spec declared four.
+    pub const ALLOWED_WORDS: [&'static str; Self::ALL.len()] =
+        ["lsp", "formatter", "debugger", "command"];
 }
 
 impl fmt::Display for ToolKind {

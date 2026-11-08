@@ -403,15 +403,17 @@ fn tool_grants(root: &Object, grants: &mut Vec<Grant>, errors: &mut Vec<ConfigEr
                 return;
             };
             let name = string_field(tool, at, "name", errors);
+            // Parsed through `ToolKind::parse`, not a match written here.
+            // The hand-written version was MISSING `command`, which `00` §6.4
+            // declares for cargo — so a rachna.nix using the documented
+            // spelling was rejected. One list, derived from `ALL`.
             let kind = match tool.get("kind").and_then(|v| v.as_str()) {
-                Some("lsp") => Some(ToolKind::Lsp),
-                Some("formatter") => Some(ToolKind::Formatter),
-                Some("debugger") => Some(ToolKind::Debugger),
+                Some(word) if ToolKind::parse(word).is_some() => ToolKind::parse(word),
                 Some(other) => {
                     errors.push(ConfigError::NotOneOf {
                         at: format!("{at}.kind"),
                         found: other.to_owned(),
-                        allowed: &["lsp", "formatter", "debugger"],
+                        allowed: &ToolKind::ALLOWED_WORDS,
                     });
                     None
                 }
@@ -776,6 +778,73 @@ mod tests {
                 network: false,
             }]
         );
+    }
+
+    #[test]
+    fn every_tool_kind_the_spec_documents_parses() {
+        // THE test that was missing, and the reason the bug existed: the
+        // parser had a hand-written match listing three kinds while `00`
+        // §6.4's own example declares four — `{ name = "cargo"; kind =
+        // "command"; }`. So a rachna.nix written from the documentation was
+        // REJECTED, and nothing noticed.
+        //
+        // PINNED AGAINST THE SPEC'S LITERAL WORDS, not against
+        // `ToolKind::ALL`. A first version of this test iterated `ALL`, and
+        // that version does not catch the bug: dropping `Command` from `ALL`
+        // also drops it from the test, so the test and the defect move
+        // together. Verified by doing exactly that — every test still passed.
+        //
+        // These four strings are `00` §6.4's `kind =` values, copied from the
+        // document. A spec-conformance test has to be anchored to the
+        // document, or it only checks the code against itself.
+        for word in ["lsp", "formatter", "debugger", "command"] {
+            let kind = ToolKind::parse(word)
+                .unwrap_or_else(|| panic!("`00` §6.4 declares `kind = \"{word}\"`, unparseable"));
+            let json = format!(
+                r#"{{ "tier": "none", "profile": "development",
+                      "tools": {{ "expose": [ {{ "name": "t", "kind": "{word}" }} ] }} }}"#
+            );
+            // `parsed`, not `errors`: the latter EXPECTS a failure and
+            // panics on a clean parse, which is what my first version of
+            // this test hit. The policy that comes back is also checked, so
+            // "it parsed" cannot mean "it parsed into something else".
+            let policy = parsed(&json);
+            assert_eq!(
+                policy.grants,
+                vec![Grant::Tool {
+                    name: "t".to_owned(),
+                    kind,
+                    network: false,
+                }],
+                "`kind = \"{word}\"` did not round-trip"
+            );
+        }
+
+        // And an undocumented kind is still refused — so the loop above is
+        // not passing because the parser accepts everything.
+        let json = r#"{ "tier": "none", "profile": "development",
+                        "tools": { "expose": [ { "name": "t", "kind": "linter" } ] } }"#;
+        let found = errors(json);
+        assert!(
+            found.iter().any(|error| matches!(
+                error,
+                ConfigError::NotOneOf { found, .. } if found == "linter"
+            )),
+            "an unknown kind was accepted: {found:?}"
+        );
+        // The error must name every kind the parser accepts, which is what
+        // `ALLOWED_WORDS` being tied to `ALL`'s length enforces.
+        let message = found
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        for word in ["lsp", "formatter", "debugger", "command"] {
+            assert!(
+                message.contains(word),
+                "the error omits `{word}`, which `00` §6.4 declares: {message}"
+            );
+        }
     }
 
     #[test]
