@@ -174,6 +174,7 @@ pub mod lifecycle;
 pub mod policy;
 pub mod summary;
 pub mod synthesize;
+pub mod transport;
 pub mod untrusted;
 
 #[cfg(test)]
