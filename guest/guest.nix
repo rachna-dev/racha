@@ -288,6 +288,70 @@
     requires = [ "var-lib-rachna.mount" ];
   };
 
+  # ---- the durability probe (15 §7 tier 1) --------------------------------
+
+  # The test this exists for is NOT "did Postgres start". A database that
+  # re-initialises itself empty on every boot starts perfectly and has lost
+  # the user's data — which is precisely the defect `15` §7 names. So the
+  # guest WRITES a row on the first boot and READS IT BACK on the second,
+  # and the harness reads the verdict off the console.
+  #
+  # Which phase this is comes from the kernel cmdline (`rachna.phase=`), so
+  # one image serves both boots and the host chooses. Temporary, like the
+  # diagnostic below: it belongs in a host-driven test once the agent can
+  # execute in the guest.
+  systemd.services.rachna-durability-probe = {
+    description = "Write then read a row across boots (diagnostic)";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "postgresql.service" ];
+    requires = [ "postgresql.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      User = "postgres";
+      StandardOutput = "journal+console";
+      StandardError = "journal+console";
+    };
+    script = ''
+      set -u
+      psql=${config.services.postgresql.package}/bin/psql
+      phase=$(sed -n 's/.*rachna\.phase=\([a-z]*\).*/\1/p' /proc/cmdline)
+      echo "RACHNA-PROBE: phase=''${phase:-unset}"
+
+      if [ "$phase" = "one" ]; then
+        # `IF NOT EXISTS` deliberately NOT used for the insert: the row count
+        # read back on boot two is the measurement, so writing twice would
+        # make a lost-and-recreated database indistinguishable from a durable
+        # one.
+        $psql -U postgres -v ON_ERROR_STOP=1 -c \
+          "CREATE TABLE durability (id serial primary key, note text);" \
+          -c "INSERT INTO durability (note) VALUES ('survived');" \
+          && echo "RACHNA-PROBE: wrote=ok" || echo "RACHNA-PROBE: wrote=FAIL"
+        # Forced to disk, because the question is what survives a cold boot
+        # rather than what a running server remembers.
+        $psql -U postgres -c "CHECKPOINT;" >/dev/null 2>&1 \
+          && echo "RACHNA-PROBE: checkpoint=ok" || echo "RACHNA-PROBE: checkpoint=FAIL"
+      else
+        # `|| true` and an explicit default, because the falsification run
+        # showed what happens without them: with the data on tmpfs the table
+        # is gone, psql exits non-zero, the unit dies at THIS line under
+        # `set -u`, and no verdict is printed at all. The data loss was still
+        # detectable (the unit failed) but only as SILENCE — the same
+        # false-negative shape as the ANSI-blind failure counter. A probe must
+        # state its verdict on every path, including its own failure.
+        n=$($psql -U postgres -tAc \
+          "SELECT count(*) FROM durability WHERE note = 'survived';" \
+          2>/dev/null || true)
+        n=''${n:-<query-failed>}
+        echo "RACHNA-PROBE: rows=$n"
+        if [ "$n" = "1" ]; then
+          echo "RACHNA-PROBE: VERDICT=DURABLE"
+        else
+          echo "RACHNA-PROBE: VERDICT=DATA-LOST"
+        fi
+      fi
+    '';
+  };
+
   # Report why a service failed, on the console, where the harness can read
   # it. Without this a failure is "[FAILED] Failed to start PostgreSQL
   # Server. See 'systemctl status' for details" — and there is no way to run
