@@ -287,7 +287,9 @@ mod tests {
     fn reason(decision: &Decision) -> &DenyReason {
         match decision {
             Decision::Deny { reason } => reason,
-            Decision::Allow { scope } => panic!("expected a denial, got allow scope {scope}"),
+            Decision::Allow { scope } => {
+                panic!("expected a denial, got allow scope {}", scope.as_str())
+            }
         }
     }
 

@@ -30,7 +30,6 @@ use crate::decide::Policy;
 use crate::decision::Category;
 use crate::grant::Grant;
 use crate::summary::{AccessSummary, GrantDiff};
-use core::fmt;
 
 /// What a config change requires.
 ///
@@ -75,12 +74,6 @@ impl Disruption {
     #[must_use]
     pub const fn interrupts_work(self) -> bool {
         matches!(self, Self::RestartService | Self::Rebuild)
-    }
-}
-
-impl fmt::Display for Disruption {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -609,14 +602,27 @@ mod tests {
     // ---- naming ----------------------------------------------------------
 
     #[test]
-    fn every_disruption_has_a_distinct_name_and_renders() {
+    fn every_disruption_has_a_distinct_name() {
+        // Distinct, because the name is what a reload report prints and what
+        // the audit stores — two levels sharing one word would make a record
+        // ambiguous after the fact.
+        //
+        // The "and renders" half of this test used to assert
+        // `to_string() == as_str()`, which tested only that a `Display` impl
+        // forwarded to the accessor beside it. That impl had no production
+        // caller and is deleted (AGENTS.md, "Unfalsifiable code").
         let mut names: Vec<&str> = Disruption::ALL.iter().map(|d| d.as_str()).collect();
         let total = names.len();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total);
+        // And every name says something, so the uniqueness above is not
+        // satisfied by a set of empty strings.
         for disruption in Disruption::ALL {
-            assert_eq!(disruption.to_string(), disruption.as_str());
+            assert!(
+                !disruption.as_str().is_empty(),
+                "{disruption:?} has no name"
+            );
         }
     }
 

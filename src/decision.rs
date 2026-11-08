@@ -205,12 +205,6 @@ impl Scope {
     }
 }
 
-impl fmt::Display for Scope {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// Why a [`Scope`] could not be recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopeError {
@@ -451,7 +445,6 @@ mod tests {
     fn a_scope_round_trips_its_value() {
         let scope = Scope::new("storage.googleapis.com").expect("non-empty");
         assert_eq!(scope.as_str(), "storage.googleapis.com");
-        assert_eq!(scope.to_string(), "storage.googleapis.com");
     }
 
     #[test]
