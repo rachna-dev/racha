@@ -190,6 +190,145 @@ impl AccessSummary {
     }
 }
 
+/// One reviewable grant in a first-run or reload summary.
+///
+/// The unit a user says yes or no to. Numbered so the CLI can offer a
+/// checkbox list — `00` §3.10c's summary shows five grants, and a user who
+/// wants four should not have to find the right line in a Nix file by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reviewable {
+    /// 1-based, as displayed.
+    pub number: usize,
+    /// Which category it falls under.
+    pub category: Category,
+    /// The entry as the summary renders it.
+    pub entry: String,
+}
+
+/// A user's answer to a summary: which grants they want.
+///
+/// # This is not a stored subset, and that difference is the whole design
+///
+/// `00` §3.10c refuses *"a subset chosen at the prompt"*, and the reason is
+/// not UI preference: a subset has to be stored somewhere, and that store
+/// becomes **a second place a permission lives**. Then `rachna.nix` says one
+/// thing, the machine does another, and a teammate cloning the repo gets a
+/// different environment.
+///
+/// So a [`Selection`] is **never applied as policy**. It is turned into
+/// [`Selection::revocations`] — the `rachna revoke …` commands that remove
+/// the unwanted grants *from the file*. The grant set then changes, the
+/// fingerprint changes, and the new summary is what gets approved. §3.10c's
+/// own words: *"The grant set changed, so the fingerprint changed, so you are
+/// shown the new summary and accept **that**."*
+///
+/// Checkboxes therefore compose an **edit**, not a policy — which means the
+/// ergonomics a user wants and the invariant the design needs were never in
+/// tension. They only looked that way while the edit had to be typed by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    accepted: Vec<Reviewable>,
+    rejected: Vec<Reviewable>,
+}
+
+impl AccessSummary {
+    /// The grants a user reviews, numbered as displayed.
+    ///
+    /// Ordered by category and then as rendered, matching the summary
+    /// exactly — a number pointing at a different line than the one printed
+    /// would be worse than no numbering.
+    #[must_use]
+    pub fn reviewable(&self) -> Vec<Reviewable> {
+        let mut out = Vec::new();
+        for (category, entries) in &self.lines {
+            for entry in entries {
+                // Same exclusion as `entries()`: a "forbidden" marker
+                // describes an absence, and offering to revoke an absence
+                // would be nonsense.
+                if entry.starts_with("none (") {
+                    continue;
+                }
+                out.push(Reviewable {
+                    number: out.len() + 1,
+                    category: *category,
+                    entry: entry.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Splits the reviewable grants by the numbers a user ticked.
+    ///
+    /// Numbers outside the range are ignored rather than an error: a typo at
+    /// a prompt should not discard the whole review, and the result still
+    /// shows exactly what was kept.
+    #[must_use]
+    pub fn select(&self, wanted: &[usize]) -> Selection {
+        let (accepted, rejected) = self
+            .reviewable()
+            .into_iter()
+            .partition(|item| wanted.contains(&item.number));
+        Selection { accepted, rejected }
+    }
+
+    /// Every grant, as if the user ticked "all".
+    #[must_use]
+    pub fn select_all(&self) -> Selection {
+        Selection {
+            accepted: self.reviewable(),
+            rejected: Vec::new(),
+        }
+    }
+}
+
+impl Selection {
+    /// What the user kept.
+    #[must_use]
+    pub fn accepted(&self) -> &[Reviewable] {
+        &self.accepted
+    }
+
+    /// What the user declined.
+    #[must_use]
+    pub fn rejected(&self) -> &[Reviewable] {
+        &self.rejected
+    }
+
+    /// Whether this is a plain "accept all".
+    ///
+    /// The common case, and the one needing no edit: nothing was declined,
+    /// so the grant set already matches what is being approved.
+    #[must_use]
+    pub fn is_accept_all(&self) -> bool {
+        self.rejected.is_empty()
+    }
+
+    /// The `rachna revoke …` commands that make the file match this
+    /// selection.
+    ///
+    /// Empty for an accept-all, which is the point: approving everything
+    /// requires no edit, so there is nothing to run.
+    ///
+    /// The commands use the same vocabulary as `rachna.nix` and the CLI
+    /// (`fs`, not `files`), because `00` §3.10c requires one vocabulary
+    /// across the config file, the CLI, the audit store and this summary.
+    #[must_use]
+    pub fn revocations(&self) -> Vec<String> {
+        self.rejected
+            .iter()
+            .map(|item| {
+                // The rendered entry carries display detail a command must
+                // not: `~/.npmrc  read-only` and `aws  <- credential
+                // access`. The target is the first whitespace-delimited
+                // token, which is what the file and the CLI both name.
+                let target = item.entry.split_whitespace().next().unwrap_or(&item.entry);
+                format!("rachna revoke {} {target}", item.category.as_str())
+            })
+            .collect()
+    }
+}
+
 /// How a grant set changed since the last accepted one.
 ///
 /// The edit loop in `00-PRODUCT.md` §3.10c is *review, edit, start again*, so
@@ -303,6 +442,160 @@ mod tests {
                 network: false,
             },
         ]
+    }
+
+    // ---- reviewing grants one at a time, or all at once -------------------
+
+    fn realistic() -> AccessSummary {
+        AccessSummary::new(Tier::Allowlist, Profile::Online, &realistic_grants())
+    }
+
+    #[test]
+    fn every_grant_is_reviewable_and_numbered_as_displayed() {
+        // A number pointing at a different line than the one printed would
+        // be worse than no numbering, so the order is pinned against the
+        // rendered summary rather than asserted independently.
+        let summary = realistic();
+        let items = summary.reviewable();
+        assert_eq!(items.len(), realistic_grants().len());
+
+        let rendered = summary.to_string();
+        let mut last_position = 0;
+        for (index, item) in items.iter().enumerate() {
+            assert_eq!(item.number, index + 1, "numbering is not 1-based or dense");
+            let position = rendered
+                .find(item.entry.as_str())
+                .unwrap_or_else(|| panic!("`{}` is numbered but not displayed", item.entry));
+            assert!(
+                position >= last_position,
+                "item {} is numbered before `{}` but printed after it",
+                item.number,
+                item.entry
+            );
+            last_position = position;
+        }
+    }
+
+    #[test]
+    fn accepting_all_requires_no_edit() {
+        // The common case. Approving everything already matches the file, so
+        // there is nothing to run — and a non-empty list here would send a
+        // user to revoke grants they just said yes to.
+        let selection = realistic().select_all();
+        assert!(selection.is_accept_all());
+        assert!(selection.rejected().is_empty());
+        assert!(
+            selection.revocations().is_empty(),
+            "accept-all produced edits: {:?}",
+            selection.revocations()
+        );
+        assert_eq!(selection.accepted().len(), realistic_grants().len());
+    }
+
+    #[test]
+    fn declining_one_grant_produces_the_edit_that_removes_it() {
+        // `00` §3.10c's worked example: "You do not want the credential. You
+        // delete that line — or run `rachna revoke secret aws`". The
+        // checkbox composes exactly that command rather than storing a
+        // subset, which is what keeps the file the only authority.
+        let summary = realistic();
+        let secret = summary
+            .reviewable()
+            .into_iter()
+            .find(|item| item.category == Category::Secret)
+            .expect("the fixture grants a secret");
+
+        let wanted: Vec<usize> = summary
+            .reviewable()
+            .iter()
+            .map(|item| item.number)
+            .filter(|number| *number != secret.number)
+            .collect();
+        let selection = summary.select(&wanted);
+
+        assert!(!selection.is_accept_all());
+        assert_eq!(selection.rejected().len(), 1);
+        assert_eq!(selection.rejected()[0].category, Category::Secret);
+        assert_eq!(selection.revocations(), vec!["rachna revoke secret aws"]);
+    }
+
+    #[test]
+    fn every_revocation_the_summary_offers_actually_parses() {
+        // The test that stops this being a nice-looking dead end. A command
+        // the parser rejects is worse than no command, because the user now
+        // believes they tried — the same defect as `enforcement.rs`'s
+        // invented `--verify-enforcement` flag, caught the same way.
+        //
+        // Declining EVERY grant, so each category's command is exercised.
+        let summary = realistic();
+        let selection = summary.select(&[]);
+        assert_eq!(selection.rejected().len(), realistic_grants().len());
+
+        let commands = selection.revocations();
+        assert_eq!(commands.len(), realistic_grants().len());
+        for command in &commands {
+            let argv: Vec<std::ffi::OsString> = command
+                .split_whitespace()
+                .map(std::ffi::OsString::from)
+                .collect();
+            let parsed = crate::cli::Invocation::from_argv(&argv);
+            assert!(
+                parsed.is_ok(),
+                "the summary offers `{command}`, which the parser rejects: {:?}",
+                parsed.err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_revocation_names_the_target_without_display_detail() {
+        // `summary.rs` renders `~/.npmrc  read-only` and `aws  <- credential
+        // access` for humans. A command carrying that detail would not
+        // parse, and a command carrying the wrong token would revoke the
+        // wrong grant.
+        let summary = realistic();
+        let selection = summary.select(&[]);
+        for command in selection.revocations() {
+            assert!(
+                !command.contains("<-") && !command.contains("read-only"),
+                "a revocation carried display detail: {command}"
+            );
+            // Exactly four words: rachna, revoke, category, target.
+            assert_eq!(
+                command.split_whitespace().count(),
+                4,
+                "malformed revocation: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_number_out_of_range_is_ignored_rather_than_fatal() {
+        // A typo at a prompt should not discard the whole review. The result
+        // still shows exactly what was kept, so the user sees the mistake.
+        let summary = realistic();
+        let selection = summary.select(&[1, 999]);
+        assert_eq!(selection.accepted().len(), 1);
+        assert_eq!(selection.accepted()[0].number, 1);
+        assert_eq!(
+            selection.rejected().len(),
+            realistic_grants().len() - 1,
+            "an out-of-range number changed what was rejected"
+        );
+    }
+
+    #[test]
+    fn a_forbidden_marker_is_not_offered_for_revocation() {
+        // A sealed profile prints `none (profile forbids it)`, which
+        // describes an absence. Offering to revoke an absence would be
+        // nonsense, and the command would not parse.
+        let sealed = AccessSummary::new(Tier::None, Profile::Sealed, &[]);
+        assert!(
+            sealed.reviewable().is_empty(),
+            "a forbidden marker was offered as a grant: {:?}",
+            sealed.reviewable()
+        );
+        assert!(sealed.select_all().revocations().is_empty());
     }
 
     // ---- property 1: completeness ----------------------------------------
