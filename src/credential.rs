@@ -40,7 +40,9 @@
 //! - [`Grant::Secret`](crate::grant::Grant::Secret) already holds a name and
 //!   never a value, so the policy layer cannot carry one either.
 
+use crate::decide::{decide, Policy};
 use crate::decision::{Category, Decision, DenyReason};
+use crate::grant::{Grant, Request};
 use core::fmt;
 
 /// The public token a guest holds in place of a real credential.
@@ -372,6 +374,72 @@ impl Broker {
     }
 }
 
+/// The guest's credential environment, as `NAME=value` pairs.
+///
+/// What the agent actually needs: the guest holds `GITHUB_TOKEN=<placeholder>`
+/// in its environment, and `00` §3.6's whole mechanism depends on the *name*
+/// being the real one so an unmodified `git push` picks it up.
+///
+/// # Why this exists rather than callers formatting the pairs
+///
+/// Mutation testing: [`Placeholder::name`] had only test callers, so mutants
+/// replacing it with a constant survived — the same shape as the two
+/// `Display` impls deleted earlier today (`AGENTS.md`, "Unfalsifiable
+/// code"). The accessor was not wrong; it had no production caller *yet*,
+/// because the thing that needs it had not been written. This is that thing,
+/// and writing it is a better answer than either deleting a method the agent
+/// will need or leaving one no test can distinguish from a constant.
+#[must_use]
+pub fn guest_environment(placeholders: &[Placeholder]) -> Vec<(String, String)> {
+    placeholders
+        .iter()
+        .map(|placeholder| (placeholder.name().to_owned(), placeholder.token()))
+        .collect()
+}
+
+/// The placeholders a guest's environment should hold, for one policy.
+///
+/// This is the bridge from policy to guest, and the reason it is a function
+/// here rather than a field on `Policy` is that **it must go through
+/// [`decide`]**. Reading `policy.grants` directly and emitting a placeholder
+/// per `Grant::Secret` would be a second policy engine, and it would get the
+/// answer wrong in a specific way: `profile = sealed` denies every secret
+/// regardless of what is granted, so a grant-walking version would hand the
+/// guest placeholders for credentials it can never use.
+///
+/// That is not hypothetical. `summary.rs` had exactly this bug — it listed
+/// `secret aws` for a config where `decide` denies every secret — and it was
+/// found by a test comparing the summary against the engine rather than by
+/// review. Same shape, so the same fix: ask the engine.
+///
+/// Returns placeholders in grant order, with duplicates removed. A guest
+/// environment is a map, so emitting a name twice would silently keep one.
+///
+/// # Errors
+///
+/// [`CredentialError::EmptyName`] if a grant carries an empty secret name.
+/// `config.rs` rejects those already, so this is the belt to that braces —
+/// and it is an error rather than a skip, because silently dropping a
+/// declared secret is how a user ends up debugging a missing token.
+pub fn placeholders_for(policy: &Policy) -> Result<Vec<Placeholder>, CredentialError> {
+    let mut placeholders: Vec<Placeholder> = Vec::new();
+    for grant in &policy.grants {
+        let Grant::Secret { name } = grant else {
+            continue;
+        };
+        // The engine decides, not this function.
+        let request = Request::Secret { name: name.clone() };
+        if !decide(policy, &request).is_allowed() {
+            continue;
+        }
+        let placeholder = Placeholder::for_name(name.clone())?;
+        if !placeholders.contains(&placeholder) {
+            placeholders.push(placeholder);
+        }
+    }
+    Ok(placeholders)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +450,150 @@ mod tests {
         let mut broker = Broker::new();
         broker.declare(name, Secret::new(REAL).expect("non-empty"));
         broker
+    }
+
+    // ---- policy -> guest environment -------------------------------------
+
+    use crate::policy::{Profile, Tier};
+
+    fn policy_with(profile: Profile, names: &[&str]) -> Policy {
+        Policy {
+            tier: Tier::Allowlist,
+            profile,
+            grants: names
+                .iter()
+                .map(|name| Grant::Secret {
+                    name: (*name).to_owned(),
+                })
+                .collect(),
+            ..Policy::deny_all()
+        }
+    }
+
+    #[test]
+    fn a_granted_secret_becomes_a_placeholder() {
+        // `Profile::Online`, not `Development`. I wrote `Development` here
+        // first and all three of these tests failed: `policy.rs`'s `forbids`
+        // has "Development withholds credentials; online is what grants
+        // them". So the permissive profile for SECRETS is `Online` alone.
+        //
+        // Worth recording rather than silently corrected, because it is the
+        // agreement test below catching an author assumption — which is
+        // exactly what that test exists for, and the reason this bridge asks
+        // the engine instead of reading grants.
+        let policy = policy_with(Profile::Online, &["GITHUB_TOKEN", "NPM_TOKEN"]);
+        let placeholders = placeholders_for(&policy).expect("valid names");
+        let names: Vec<&str> = placeholders.iter().map(Placeholder::name).collect();
+        assert_eq!(names, vec!["GITHUB_TOKEN", "NPM_TOKEN"]);
+    }
+
+    #[test]
+    fn a_sealed_profile_yields_no_placeholders_even_with_grants() {
+        // THE case, and it is a bug this project has already shipped once.
+        // `summary.rs` listed `secret aws` for a config where `decide` denies
+        // every secret — found by a test comparing the summary against the
+        // engine, not by review. Walking `policy.grants` here would
+        // reproduce it exactly: the guest would hold placeholders for
+        // credentials it can never use, and the first failure would look
+        // like a broken token.
+        //
+        // First assert the attack target exists: the same grants under a
+        // permissive profile DO produce placeholders, so an empty result
+        // below means the profile was honoured rather than that the function
+        // returns nothing.
+        let permissive = policy_with(Profile::Online, &["AWS_SECRET"]);
+        assert_eq!(placeholders_for(&permissive).expect("valid").len(), 1);
+
+        let sealed = policy_with(Profile::Sealed, &["AWS_SECRET"]);
+        assert!(
+            placeholders_for(&sealed).expect("valid").is_empty(),
+            "a sealed profile handed the guest a placeholder it cannot use"
+        );
+    }
+
+    #[test]
+    fn the_bridge_agrees_with_the_engine_for_every_profile() {
+        // The general version of the test above, over every profile rather
+        // than the two that happened to come to mind. This is the property
+        // that makes `placeholders_for` not a second policy engine.
+        for profile in Profile::ALL {
+            let policy = policy_with(profile, &["TOKEN"]);
+            let request = Request::Secret {
+                name: "TOKEN".to_owned(),
+            };
+            let engine_allows = decide(&policy, &request).is_allowed();
+            let has_placeholder = !placeholders_for(&policy).expect("valid").is_empty();
+            assert_eq!(
+                engine_allows, has_placeholder,
+                "{profile:?}: engine says {engine_allows}, bridge says {has_placeholder}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_guest_environment_pairs_the_real_name_with_the_placeholder() {
+        // `00` §3.6 only works if the NAME is the real one: an unmodified
+        // `git push` reads `$GITHUB_TOKEN`, so renaming it would break the
+        // "works without granting access to anything" property that is the
+        // feature's whole point.
+        let policy = policy_with(Profile::Online, &["GITHUB_TOKEN", "NPM_TOKEN"]);
+        let env = guest_environment(&placeholders_for(&policy).expect("valid"));
+
+        assert_eq!(env.len(), 2);
+        for (name, value) in &env {
+            // The name is verbatim — not prefixed, not mangled.
+            assert!(
+                name == "GITHUB_TOKEN" || name == "NPM_TOKEN",
+                "the environment renamed a secret to `{name}`"
+            );
+            // The value is a placeholder, and the proxy can recognise it.
+            assert_eq!(Placeholder::name_in_token(value), Some(name.as_str()));
+            // And it is NOT the real value — the point of the exercise.
+            assert_ne!(value, REAL);
+        }
+    }
+
+    #[test]
+    fn a_sealed_guest_gets_an_empty_environment() {
+        // The end-to-end version of the sealed case: not merely "no
+        // placeholders" but "nothing in the environment", since that is what
+        // the agent would actually set.
+        let sealed = policy_with(Profile::Sealed, &["AWS_SECRET"]);
+        let env = guest_environment(&placeholders_for(&sealed).expect("valid"));
+        assert!(env.is_empty(), "a sealed guest was handed {env:?}");
+    }
+
+    #[test]
+    fn a_name_declared_twice_yields_one_placeholder() {
+        // A guest environment is a map, so emitting a name twice would
+        // silently keep one of them — and which one is not something a
+        // caller should have to think about.
+        let policy = policy_with(Profile::Online, &["TOKEN", "TOKEN", "OTHER"]);
+        let placeholders = placeholders_for(&policy).expect("valid");
+        let names: Vec<&str> = placeholders.iter().map(Placeholder::name).collect();
+        assert_eq!(names, vec!["TOKEN", "OTHER"]);
+    }
+
+    #[test]
+    fn a_non_secret_grant_contributes_nothing() {
+        // Guards against a `_ =>` that accidentally matched everything.
+        let policy = Policy {
+            tier: Tier::Allowlist,
+            profile: Profile::Online,
+            grants: vec![
+                Grant::Port {
+                    guest: 3000,
+                    host: 3000,
+                },
+                Grant::Tool {
+                    name: "rustfmt".to_owned(),
+                    kind: crate::grant::ToolKind::Formatter,
+                    network: false,
+                },
+            ],
+            ..Policy::deny_all()
+        };
+        assert!(placeholders_for(&policy).expect("valid").is_empty());
     }
 
     // ---- the property the whole module exists for -------------------------
