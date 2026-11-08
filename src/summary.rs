@@ -190,6 +190,14 @@ impl AccessSummary {
     }
 }
 
+/// The longest list worth reviewing item by item.
+///
+/// `20`'s nine project shapes declare 1 to 5 reviewable grants, so this is
+/// comfortably above every measured real config while still fitting a
+/// terminal alongside the surrounding prompt. See
+/// [`AccessSummary::too_long_to_itemise`].
+pub const PER_ITEM_REVIEW_LIMIT: usize = 12;
+
 /// One reviewable grant in a first-run or reload summary.
 ///
 /// The unit a user says yes or no to. Numbered so the CLI can offer a
@@ -253,6 +261,49 @@ impl AccessSummary {
                     category: *category,
                     entry: entry.clone(),
                 });
+            }
+        }
+        out
+    }
+
+    /// Whether this summary is too long to review item by item.
+    ///
+    /// **Measured, not guessed.** All nine project shapes in `20` declare
+    /// **1 to 5** reviewable grants — the largest being three hosts and two
+    /// ports. So the per-item list is the right default for every real
+    /// config surveyed.
+    ///
+    /// But "does not happen in practice" is not a bound, and the case where
+    /// it breaks is the one that matters most: `00` §3.10c exists for a
+    /// *cloned, unreviewed* config, which is precisely where a 200-host
+    /// allowlist would appear. A numbered list that long is not a review, it
+    /// is a wall — and §3.10c's own warning is that a summary people stop
+    /// reading is *"worse than nothing"*.
+    ///
+    /// Above the threshold the caller should group by category and ask per
+    /// category, with the full list available on request. Twelve is the
+    /// largest list that fits a terminal without scrolling alongside the
+    /// surrounding prompt, and is comfortably above the measured maximum of
+    /// five.
+    #[must_use]
+    pub fn too_long_to_itemise(&self) -> bool {
+        self.reviewable().len() > PER_ITEM_REVIEW_LIMIT
+    }
+
+    /// How many grants there are per category, in display order.
+    ///
+    /// What a caller renders when [`Self::too_long_to_itemise`] is true:
+    /// `network  47 hosts` is reviewable where 47 numbered lines are not.
+    #[must_use]
+    pub fn counts_by_category(&self) -> Vec<(Category, usize)> {
+        let mut out: Vec<(Category, usize)> = Vec::new();
+        for item in self.reviewable() {
+            match out
+                .iter_mut()
+                .find(|(category, _)| *category == item.category)
+            {
+                Some((_, count)) => *count += 1,
+                None => out.push((item.category, 1)),
             }
         }
         out
@@ -327,6 +378,49 @@ impl Selection {
             })
             .collect()
     }
+}
+
+/// The two things a user can do with a first-run summary.
+///
+/// Rendered because *"accept all, or choose: 1,2,3,4,6"* told a user neither
+/// how to accept nor how to choose. `00` §3.3's rules apply to this prompt as
+/// to a denial: a message that names no command is not actionable, and
+/// `00` §3.10c's whole point is that this is the moment it matters.
+///
+/// Both commands here are real: a test parses every one through
+/// [`Invocation::from_argv`](crate::cli::Invocation::from_argv), because an
+/// offered command the CLI rejects is worse than none.
+#[must_use]
+pub fn review_prompt(summary: &AccessSummary) -> String {
+    let total = summary.reviewable().len();
+    if total == 0 {
+        // Nothing granted. `00` §3.10c still requires the summary — "secrets
+        // none is information" — but there is nothing to accept or decline,
+        // so offering either would be noise.
+        return "  this config grants nothing. `rachna start` needs no acknowledgement\n"
+            .to_owned();
+    }
+
+    let mut out = String::new();
+    out.push_str("  this config has not run here before.\n\n");
+    out.push_str("  accept everything:   rachna start --accept\n");
+
+    if summary.too_long_to_itemise() {
+        // Per-category, because a numbered list this long is a wall rather
+        // than a review (`too_long_to_itemise`).
+        out.push_str(&format!(
+            "  review in full:      rachna config inspect   ({total} grants)\n"
+        ));
+        out.push_str("  drop one:            rachna revoke <category> <target>\n");
+    } else {
+        out.push_str("  drop one:            rachna revoke <category> <target>\n");
+        // No backticks: this line is copied, not read. The test caught one
+        // glued to `--accept`, which the parser then rejected as the flag
+        // "--accept`" — an offered command that cannot work, which is the
+        // defect this whole prompt exists to avoid.
+        out.push_str("                       then rachna start --accept\n");
+    }
+    out
 }
 
 /// How a grant set changed since the last accepted one.
@@ -596,6 +690,128 @@ mod tests {
             sealed.reviewable()
         );
         assert!(sealed.select_all().revocations().is_empty());
+    }
+
+    #[test]
+    fn the_prompt_tells_the_user_how_to_accept_and_how_to_choose() {
+        // The gap this closes: "accept all, or choose: 1,2,3,4,6" told a
+        // user NEITHER. `00` §3.3's rules apply to this prompt as to a
+        // denial — a message naming no command is not actionable.
+        let prompt = review_prompt(&realistic());
+        assert!(prompt.contains("rachna start --accept"), "{prompt}");
+        assert!(prompt.contains("rachna revoke"), "{prompt}");
+    }
+
+    #[test]
+    fn every_command_the_prompt_offers_parses() {
+        // Same rule as the revocations: an offered command the CLI rejects
+        // is worse than none. Placeholders in angle brackets are the one
+        // exception — they are a form to fill in, not a command to run — so
+        // they are substituted with a real target first.
+        for summary in [realistic(), long_summary()] {
+            for line in review_prompt(&summary).lines() {
+                let text = line.split('#').next().unwrap_or("").trim();
+                let Some(start) = text.find("rachna ") else {
+                    continue;
+                };
+                let command = text[start..]
+                    .replace("<category>", "network")
+                    .replace("<target>", "a.test:443");
+                // Drop a trailing parenthetical like "(47 grants)".
+                let command = command.split('(').next().unwrap_or(&command).trim();
+                let argv: Vec<std::ffi::OsString> = command
+                    .split_whitespace()
+                    .map(std::ffi::OsString::from)
+                    .collect();
+                let parsed = crate::cli::Invocation::from_argv(&argv);
+                assert!(
+                    parsed.is_ok(),
+                    "the prompt offers `{command}`, which the parser rejects: {:?}",
+                    parsed.err()
+                );
+            }
+        }
+    }
+
+    /// A summary with more grants than anyone would review one by one.
+    fn long_summary() -> AccessSummary {
+        let grants: Vec<Grant> = (0..40)
+            .map(|n| Grant::Network {
+                endpoint: endpoint(&format!("host{n}.test"), 443),
+            })
+            .collect();
+        AccessSummary::new(Tier::Allowlist, Profile::Online, &grants)
+    }
+
+    #[test]
+    fn a_realistic_config_is_reviewed_item_by_item() {
+        // MEASURED: all nine project shapes in `20` declare 1 to 5
+        // reviewable grants, so the per-item list must be the default for
+        // every real config — a threshold that excluded them would make the
+        // feature useless where it is wanted.
+        assert!(
+            !realistic().too_long_to_itemise(),
+            "a 6-grant config was treated as too long to review"
+        );
+        // And the measured worst case, with headroom.
+        let five = AccessSummary::new(Tier::Allowlist, Profile::Online, &realistic_grants()[..5]);
+        assert!(!five.too_long_to_itemise());
+    }
+
+    #[test]
+    fn a_very_long_list_is_not_offered_item_by_item() {
+        // The case `00` §3.10c cares about most: a CLONED config, which is
+        // exactly where a 40-host allowlist appears. A numbered list that
+        // long is a wall rather than a review, and §3.10c's own warning is
+        // that a summary people stop reading is "worse than nothing".
+        let long = long_summary();
+        assert!(long.too_long_to_itemise());
+
+        // The per-category rollup is what makes it reviewable at all.
+        let counts = long.counts_by_category();
+        assert_eq!(counts, vec![(Category::Network, 40)]);
+
+        // And the prompt changes shape: it points at `config inspect`
+        // rather than implying the user should read 40 numbered lines.
+        let prompt = review_prompt(&long);
+        assert!(prompt.contains("config inspect"), "{prompt}");
+        assert!(prompt.contains("40 grants"), "{prompt}");
+    }
+
+    #[test]
+    fn counts_by_category_agree_with_the_itemised_list() {
+        // Two views of one thing, so they must sum. A rollup that
+        // disagreed with the list would make the long-config path report a
+        // different total from the short one.
+        let summary = realistic();
+        let counts = summary.counts_by_category();
+        let total: usize = counts.iter().map(|(_, count)| count).sum();
+        assert_eq!(total, summary.reviewable().len());
+        // Category order matches the display, so the rollup reads in the
+        // same order as the list it replaces.
+        let displayed: Vec<Category> = summary
+            .reviewable()
+            .iter()
+            .map(|item| item.category)
+            .collect();
+        let mut seen: Vec<Category> = Vec::new();
+        for category in displayed {
+            if !seen.contains(&category) {
+                seen.push(category);
+            }
+        }
+        assert_eq!(counts.iter().map(|(c, _)| *c).collect::<Vec<_>>(), seen);
+    }
+
+    #[test]
+    fn a_config_granting_nothing_asks_for_nothing() {
+        // `00` §3.10c requires the summary even when empty — "secrets none
+        // is information" — but offering accept-or-decline for an empty set
+        // is noise.
+        let sealed = AccessSummary::new(Tier::None, Profile::Sealed, &[]);
+        let prompt = review_prompt(&sealed);
+        assert!(prompt.contains("grants nothing"), "{prompt}");
+        assert!(!prompt.contains("--accept"), "{prompt}");
     }
 
     // ---- property 1: completeness ----------------------------------------
