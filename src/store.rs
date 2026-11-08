@@ -21,6 +21,7 @@
 use rusqlite::Connection;
 use std::path::Path;
 
+pub mod audit;
 pub mod write;
 
 /// The schema, compiled in.

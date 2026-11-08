@@ -128,7 +128,7 @@ pub struct Verdict {
 impl Verdict {
     /// Whether the share may be mounted.
     #[must_use]
-    pub fn is_allowed(&self) -> bool {
+    pub const fn is_allowed(&self) -> bool {
         self.refusals.is_empty()
     }
 

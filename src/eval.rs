@@ -160,7 +160,7 @@ impl Invocation {
     /// whatever their environment happens to contain. Returned as data so a
     /// test can assert it rather than trusting the spawning code to remember.
     #[must_use]
-    pub fn cleared_env(&self) -> &'static [&'static str] {
+    pub const fn cleared_env(&self) -> &'static [&'static str] {
         &["NIX_PATH"]
     }
 
@@ -224,7 +224,7 @@ impl ImportSet {
     /// documented interface, so a Nix release could change it — and the
     /// failure must be loud rather than a silently-empty watch list.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
 }
