@@ -56,6 +56,17 @@ pub enum Incompatible {
     DeviceConfigChanged { detail: String },
     /// The backend cannot restore at all.
     NoSnapshotSupport,
+    /// The snapshot on disk is incomplete.
+    ///
+    /// **Measured, and the failure mode is silence** (`24` §6): a Cloud
+    /// Hypervisor snapshot is three files — `config.json`, `memory-ranges`,
+    /// `state.json` — and `ch-remote snapshot` returns *before* `state.json`
+    /// is flushed. Restoring from two of three exits with **no error, no log
+    /// and no process.**
+    ///
+    /// So this is checked rather than discovered: `02` §4 requires a failed
+    /// restore to fall back *loudly*, and a silent exit is the opposite.
+    Incomplete { missing: Vec<String> },
 }
 
 impl fmt::Display for Incompatible {
@@ -87,6 +98,12 @@ impl fmt::Display for Incompatible {
             Self::NoSnapshotSupport => {
                 f.write_str("this host cannot restore saved VM state — booting fresh")
             }
+            Self::Incomplete { missing } => write!(
+                f,
+                "this snapshot is incomplete ({} missing), so it was never \
+                 finished writing — booting fresh",
+                missing.join(", ")
+            ),
         }
     }
 }
@@ -202,6 +219,27 @@ impl DeviceShape {
     }
 }
 
+/// The files a complete Cloud Hypervisor snapshot contains.
+///
+/// Measured (`24` §6). Listed rather than inferred, because the consequence
+/// of a missing one is a *silent* restore failure.
+pub const REQUIRED_FILES: [&str; 3] = ["config.json", "memory-ranges", "state.json"];
+
+/// Which required files are absent from a snapshot.
+///
+/// `present` is what the caller found on disk. Pure, so the rule is testable
+/// without a filesystem — and the caller does the I/O, as everywhere else in
+/// this crate.
+#[must_use]
+pub fn missing_files<'a>(present: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let present: Vec<&str> = present.into_iter().collect();
+    REQUIRED_FILES
+        .iter()
+        .filter(|required| !present.contains(*required))
+        .map(|required| (*required).to_owned())
+        .collect()
+}
+
 /// Everything recorded alongside a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
@@ -216,6 +254,13 @@ pub struct Metadata {
     pub machine_id: String,
     /// The device shape, for the `VZErrorRestore` case.
     pub devices: DeviceShape,
+    /// The snapshot files found on disk.
+    ///
+    /// Empty means "not checked" rather than "none found", so a caller that
+    /// does not inspect the directory is not told its snapshot is broken.
+    /// When populated, [`Metadata::check_restorable`] verifies completeness
+    /// first (`24` §6).
+    pub present_files: Vec<String>,
 }
 
 impl Metadata {
@@ -233,6 +278,15 @@ impl Metadata {
     ) -> Result<(), Incompatible> {
         if !capabilities.memory_snapshot {
             return Err(Incompatible::NoSnapshotSupport);
+        }
+        // Before anything about compatibility: is the snapshot even finished?
+        // `24` §6 measured a two-of-three snapshot restoring with no error at
+        // all, so an unchecked incomplete snapshot is a silent failure.
+        if !self.present_files.is_empty() {
+            let missing = missing_files(self.present_files.iter().map(String::as_str));
+            if !missing.is_empty() {
+                return Err(Incompatible::Incomplete { missing });
+            }
         }
         // First, because it is the only one a user cannot resolve by any
         // action short of going back to the original machine.
@@ -282,6 +336,7 @@ mod tests {
             host_os_version: "15.3.2".to_owned(),
             machine_id: "machine-a".to_owned(),
             devices: shape(),
+            present_files: REQUIRED_FILES.iter().map(|f| (*f).to_owned()).collect(),
         }
     }
 
@@ -312,6 +367,7 @@ mod tests {
                 cpu_count: 8,
                 ..shape()
             },
+            ..metadata()
         };
         assert_eq!(
             taken.check_restorable(&running, Capabilities::all()),
@@ -376,6 +432,78 @@ mod tests {
             taken.check_restorable(&running, Capabilities::none()),
             Err(Incompatible::NoSnapshotSupport)
         );
+    }
+
+    // ---- the incomplete-snapshot case (24 §6) ---------------------------
+
+    #[test]
+    fn an_incomplete_snapshot_is_refused_before_any_compatibility_check() {
+        // THE measured silent failure: a CH snapshot is three files, and
+        // `ch-remote snapshot` returns before state.json is flushed. Two of
+        // three restores with NO error, NO log and NO process — which is the
+        // opposite of 02 §4's requirement to fall back loudly.
+        //
+        // Checked FIRST, because telling a user their guest version changed
+        // when the snapshot was never finished writing sends them to the
+        // wrong fix.
+        let taken = Metadata {
+            present_files: vec!["config.json".to_owned(), "memory-ranges".to_owned()],
+            guest_version: "a-different-guest".to_owned(),
+            ..metadata()
+        };
+        assert_eq!(
+            taken.check_restorable(&metadata(), Capabilities::all()),
+            Err(Incompatible::Incomplete {
+                missing: vec!["state.json".to_owned()]
+            })
+        );
+    }
+
+    #[test]
+    fn every_required_file_is_detected_when_missing() {
+        for omitted in REQUIRED_FILES {
+            let present: Vec<String> = REQUIRED_FILES
+                .iter()
+                .filter(|f| **f != omitted)
+                .map(|f| (*f).to_owned())
+                .collect();
+            assert_eq!(
+                missing_files(present.iter().map(String::as_str)),
+                vec![omitted.to_owned()],
+                "{omitted} went undetected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_complete_snapshot_reports_nothing_missing() {
+        assert!(missing_files(REQUIRED_FILES).is_empty());
+    }
+
+    #[test]
+    fn an_unchecked_snapshot_is_not_reported_as_broken() {
+        // Empty means "not inspected", not "nothing found" — a caller that
+        // does not read the directory must not be told its snapshot is
+        // incomplete.
+        let unchecked = Metadata {
+            present_files: vec![],
+            ..metadata()
+        };
+        assert_eq!(
+            unchecked.check_restorable(&metadata(), Capabilities::all()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_incomplete_message_names_what_is_missing_and_what_happens_next() {
+        let message = Incompatible::Incomplete {
+            missing: vec!["state.json".to_owned()],
+        }
+        .to_string();
+        assert!(message.contains("state.json"), "{message}");
+        assert!(message.contains("never finished writing"), "{message}");
+        assert!(message.contains("booting fresh"), "{message}");
     }
 
     // ---- the VZErrorRestore case ----------------------------------------
