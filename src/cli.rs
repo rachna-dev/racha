@@ -204,12 +204,6 @@ impl ToolKind {
     }
 }
 
-impl fmt::Display for ToolKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// A `rachna` subcommand.
 ///
 /// `00-PRODUCT.md` §5.2 lists the surface. Only the verbs reachable without a
@@ -1279,7 +1273,11 @@ mod tests {
         assert!(matches!(error, CliError::UnknownToolKind { .. }), "{error}");
         let text = error.to_string();
         for kind in ToolKind::ALL {
-            assert!(text.contains(kind.as_str()), "the error omits `{kind}`");
+            assert!(
+                text.contains(kind.as_str()),
+                "the error omits `{}`",
+                kind.as_str()
+            );
         }
     }
 
