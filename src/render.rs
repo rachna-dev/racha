@@ -566,12 +566,35 @@ mod tests {
 
     #[test]
     fn suggestions_require_closeness_relative_to_length() {
-        // Both bounds are needed: a ratio alone accepts 4 edits on a long
-        // word, a fixed cap alone accepts 3 edits on a 4-letter one.
+        // Real typos, suggested.
         assert_eq!(nearest_option("netwrk"), Some("network"));
         assert_eq!(nearest_option("filesystm"), Some("filesystem"));
         // 3 edits from a 4-letter word is not a near miss.
         assert_eq!(nearest_option("abcd"), None);
+        assert_eq!(nearest_option("xyzzy"), None);
+    }
+
+    #[test]
+    fn a_short_abbreviation_is_not_treated_as_a_typo() {
+        // Mutation testing found this gap: the test above asserted the
+        // claim that BOTH bounds are needed, but every input it used agreed
+        // under either bound alone, so three mutants of the cutoff survived.
+        //
+        // These are the inputs that actually distinguish them, and they are
+        // realistic: someone typing an abbreviation rather than misspelling a
+        // word. Suggesting `tier` for `tyr` would send them to edit a line
+        // they did not mean.
+        assert_eq!(nearest_option("tyr"), None, "2 edits on a 3-letter word");
+        assert_eq!(nearest_option("pro"), None, "abbreviation, not a typo");
+    }
+
+    #[test]
+    fn a_long_key_with_a_short_prefix_match_is_not_suggested() {
+        // `toolsxyz` is 3 edits from `tools`, and 3 <= 3 passes the cap. Only
+        // the ratio rejects it: 3 * 3 = 9 > 8. Without both bounds a user
+        // gets told they meant `tools` when they wrote something else
+        // entirely.
+        assert_eq!(nearest_option("toolsxyz"), None);
     }
 
     #[test]
