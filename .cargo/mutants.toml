@@ -12,3 +12,22 @@
 # run them for real.
 test_tool = "nextest"
 additional_cargo_test_args = ["-E", "not binary(eval_sandbox)"]
+
+# One excluded mutation, with its reasoning.
+#
+# `days_between`'s clamp compares `days > u32::MAX as i64`. Mutating `>` to
+# `>=` produces an EQUIVALENT program: at exactly `u32::MAX` the clamp returns
+# `u32::MAX` and so does the cast, so no test can distinguish them. Verified by
+# enumerating both branches, and by rewriting the function two other ways
+# (`Ord::min`, capping the span in millis) — `min` is not const-stable, and the
+# span form is identical on every input including the boundary. The ambiguity
+# is inherent to a saturating clamp rather than a property of this spelling.
+#
+# The boundary also needs a timestamp ~11.8 million years out to reach.
+#
+# Excluded by NAME, not by file: everything else in audit.rs must stay under
+# mutation. Contrast the `guest_release` survivor earlier in this project,
+# which was documented as benign and then DELETED on review — that one was
+# untested dead code, this one is tested code with a provably equivalent
+# mutant. The distinction is whether a test could exist, not whether one does.
+exclude_re = ["replace > with >= in days_between"]
