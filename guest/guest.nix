@@ -27,8 +27,25 @@
     "9p"
     "fuse"
     "overlay"
+    # The root is a squashfs (`00` §7 Layer C), so the initrd must be able to
+    # MOUNT one. Measured without these: the initrd finds /dev/vda, then
+    # fails "Dependency failed for Initrd File Systems" and drops to
+    # emergency mode — the device is present and unmountable, which reads
+    # like a missing disk rather than a missing module.
+    "squashfs"
+    "loop"
+    "zstd"
   ];
   boot.kernelModules = [ "virtiofs" ];
+
+  # `availableKernelModules` only INCLUDES a module if the generator decides
+  # it is needed, and it does not know our root is a squashfs on a virtio
+  # disk. Forcing them guarantees the initrd can mount the root it is given.
+  boot.initrd.kernelModules = [
+    "squashfs"
+    "virtio_blk"
+    "virtiofs"
+  ];
 
   # §4.3, measured: `console=ttyS0` with `--serial file=`. The hvc0 variant
   # produces ZERO output and ZERO errors, which is the worst failure shape.
