@@ -380,6 +380,75 @@ impl Selection {
     }
 }
 
+/// What a user pressed at the review gate.
+///
+/// A keypress rather than a flag to retype, because `rachna start --accept`
+/// makes a user run the command twice — once to see the summary, once to
+/// accept it — and the second run is pure ceremony. Pressing `a` is the same
+/// decision with the summary still on screen.
+///
+/// # Why this is not the prompt §3.2 forbids
+///
+/// `00` §3.10c already settles it, and the distinction is exact: this is a
+/// **read gate**, not a write path. *"Answering 'yes' here cannot produce a
+/// permission that is not in the file. Refusing cannot remove one."* The
+/// keypress accepts the file **as written** — it grants nothing, stores no
+/// subset, and leaves `rachna.nix` untouched either way. What §3.2 bans is a
+/// prompt that *creates* a permission, and none of these can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Accept every grant the file declares, and start.
+    AcceptAll,
+    /// Start nothing. The default for anything unrecognised.
+    Abort,
+    /// Print the full list, then ask again.
+    ///
+    /// Only meaningful above [`PER_ITEM_REVIEW_LIMIT`], where the summary
+    /// rolled up per category and the entries were not shown.
+    ShowAll,
+}
+
+impl Answer {
+    /// The answer for a keypress.
+    ///
+    /// **Anything unrecognised is [`Self::Abort`]**, which is the only safe
+    /// default: a stray byte — a resized terminal, a bracketed-paste escape,
+    /// a cat on the keyboard — must not accept a cloned config's
+    /// permissions. The cost of a wrong abort is retyping one command; the
+    /// cost of a wrong accept is `00` §3.10c's entire reason for existing.
+    ///
+    /// Case-insensitive, because a user with caps lock on means the same
+    /// thing and refusing them would be pedantry at a security gate.
+    #[must_use]
+    pub const fn from_key(key: char) -> Self {
+        match key.to_ascii_lowercase() {
+            'a' => Self::AcceptAll,
+            'l' => Self::ShowAll,
+            _ => Self::Abort,
+        }
+    }
+
+    /// Whether the environment should start.
+    #[must_use]
+    pub const fn starts(self) -> bool {
+        matches!(self, Self::AcceptAll)
+    }
+}
+
+/// Whether the review gate can be answered interactively.
+///
+/// False when stdin is not a terminal, which is not a detail: `00` §3.10c
+/// records that **CI needs a flag** — `RACHNA_ACCEPT=1` or `--accept` — and a
+/// pipeline blocking forever on a keypress nobody can send is worse than one
+/// that refuses. So a non-TTY gets the printed commands and no prompt.
+///
+/// Takes the answer rather than reading stdin, so the decision is testable
+/// without a terminal. The caller passes `std::io::stdin().is_terminal()`.
+#[must_use]
+pub const fn can_prompt(stdin_is_terminal: bool) -> bool {
+    stdin_is_terminal
+}
+
 /// The two things a user can do with a first-run summary.
 ///
 /// Rendered because *"accept all, or choose: 1,2,3,4,6"* told a user neither
@@ -391,7 +460,7 @@ impl Selection {
 /// [`Invocation::from_argv`](crate::cli::Invocation::from_argv), because an
 /// offered command the CLI rejects is worse than none.
 #[must_use]
-pub fn review_prompt(summary: &AccessSummary) -> String {
+pub fn review_prompt(summary: &AccessSummary, interactive: bool) -> String {
     let total = summary.reviewable().len();
     if total == 0 {
         // Nothing granted. `00` §3.10c still requires the summary — "secrets
@@ -403,22 +472,33 @@ pub fn review_prompt(summary: &AccessSummary) -> String {
 
     let mut out = String::new();
     out.push_str("  this config has not run here before.\n\n");
-    out.push_str("  accept everything:   rachna start --accept\n");
 
-    if summary.too_long_to_itemise() {
-        // Per-category, because a numbered list this long is a wall rather
-        // than a review (`too_long_to_itemise`).
-        out.push_str(&format!(
-            "  review in full:      rachna config inspect   ({total} grants)\n"
-        ));
-        out.push_str("  drop one:            rachna revoke <category> <target>\n");
+    if interactive {
+        // A keypress, because `--accept` makes the user run the command
+        // twice: once to see the summary, once to accept it. The second run
+        // is ceremony.
+        out.push_str("  [a] accept all and start\n");
+        if summary.too_long_to_itemise() {
+            out.push_str(&format!("  [l] list all {total} grants\n"));
+        }
+        out.push_str("  [q] quit, and change rachna.nix first\n");
+        out.push_str("\n  to drop one:  rachna revoke <category> <target>\n");
     } else {
-        out.push_str("  drop one:            rachna revoke <category> <target>\n");
+        // Not a TTY. `00` §3.10c: "CI needs a flag … RACHNA_ACCEPT=1 or
+        // --accept in the pipeline." A pipeline blocked forever on a
+        // keypress nobody can send is worse than one that refuses, so the
+        // non-interactive path prints commands and prompts for nothing.
+        out.push_str("  accept everything:   rachna start --accept\n");
+        if summary.too_long_to_itemise() {
+            out.push_str(&format!(
+                "  review in full:      rachna config inspect   ({total} grants)\n"
+            ));
+        }
         // No backticks: this line is copied, not read. The test caught one
         // glued to `--accept`, which the parser then rejected as the flag
         // "--accept`" — an offered command that cannot work, which is the
         // defect this whole prompt exists to avoid.
-        out.push_str("                       then rachna start --accept\n");
+        out.push_str("  drop one:            rachna revoke <category> <target>\n");
     }
     out
 }
@@ -693,13 +773,84 @@ mod tests {
     }
 
     #[test]
+    fn only_a_deliberate_key_accepts_and_everything_else_aborts() {
+        // THE safety property. A stray byte — a resized terminal, a
+        // bracketed-paste escape sequence, a cat on the keyboard — must not
+        // accept a cloned config's permissions. The cost of a wrong abort is
+        // retyping one command; the cost of a wrong accept is `00` §3.10c's
+        // entire reason for existing.
+        //
+        // First assert the thing under attack exists: `a` DOES accept, so
+        // the rejections below are not vacuous.
+        assert_eq!(Answer::from_key('a'), Answer::AcceptAll);
+        assert!(Answer::from_key('a').starts());
+
+        for key in [
+            'q', 'n', 'y', 'Y', '\n', '\r', ' ', '\t', '\0', 'z', '1',
+            // The bytes a terminal actually sends unbidden: escape, and the
+            // tail of an arrow key or a bracketed paste.
+            '\u{1b}', '[', '2', '0', '~',
+        ] {
+            if key.eq_ignore_ascii_case(&'a') || key.eq_ignore_ascii_case(&'l') {
+                continue;
+            }
+            assert_eq!(
+                Answer::from_key(key),
+                Answer::Abort,
+                "`{key:?}` was not treated as an abort"
+            );
+            assert!(!Answer::from_key(key).starts(), "`{key:?}` started the env");
+        }
+    }
+
+    #[test]
+    fn the_accept_key_is_case_insensitive() {
+        // A user with caps lock on means the same thing, and refusing them
+        // at a security gate is pedantry — they would press it again.
+        assert_eq!(Answer::from_key('A'), Answer::AcceptAll);
+        assert_eq!(Answer::from_key('L'), Answer::ShowAll);
+    }
+
+    #[test]
+    fn only_accepting_starts_the_environment() {
+        // `ShowAll` must not start: it prints the list and asks again. A
+        // version that started after showing would mean pressing `l` to read
+        // the grants silently accepted them.
+        assert!(Answer::AcceptAll.starts());
+        assert!(!Answer::ShowAll.starts());
+        assert!(!Answer::Abort.starts());
+    }
+
+    #[test]
+    fn a_pipe_is_never_prompted() {
+        // `00` §3.10c: "CI needs a flag … RACHNA_ACCEPT=1 or --accept in the
+        // pipeline." A pipeline blocked forever on a keypress nobody can
+        // send is worse than one that refuses.
+        assert!(!can_prompt(false));
+        assert!(can_prompt(true));
+    }
+
+    #[test]
     fn the_prompt_tells_the_user_how_to_accept_and_how_to_choose() {
         // The gap this closes: "accept all, or choose: 1,2,3,4,6" told a
         // user NEITHER. `00` §3.3's rules apply to this prompt as to a
         // denial — a message naming no command is not actionable.
-        let prompt = review_prompt(&realistic());
-        assert!(prompt.contains("rachna start --accept"), "{prompt}");
-        assert!(prompt.contains("rachna revoke"), "{prompt}");
+        // Non-interactive: names the flag, because CI cannot press a key.
+        let piped = review_prompt(&realistic(), false);
+        assert!(piped.contains("rachna start --accept"), "{piped}");
+        assert!(piped.contains("rachna revoke"), "{piped}");
+
+        // Interactive: offers the keypress, and does NOT tell a user at a
+        // terminal to retype a command they can answer in one character.
+        let tty = review_prompt(&realistic(), true);
+        assert!(tty.contains("[a] accept all"), "{tty}");
+        assert!(tty.contains("[q] quit"), "{tty}");
+        assert!(
+            !tty.contains("start --accept"),
+            "a terminal user was told to retype the command: {tty}"
+        );
+        // The edit path is still offered, since that is how a subset works.
+        assert!(tty.contains("rachna revoke"), "{tty}");
     }
 
     #[test]
@@ -709,26 +860,28 @@ mod tests {
         // exception — they are a form to fill in, not a command to run — so
         // they are substituted with a real target first.
         for summary in [realistic(), long_summary()] {
-            for line in review_prompt(&summary).lines() {
-                let text = line.split('#').next().unwrap_or("").trim();
-                let Some(start) = text.find("rachna ") else {
-                    continue;
-                };
-                let command = text[start..]
-                    .replace("<category>", "network")
-                    .replace("<target>", "a.test:443");
-                // Drop a trailing parenthetical like "(47 grants)".
-                let command = command.split('(').next().unwrap_or(&command).trim();
-                let argv: Vec<std::ffi::OsString> = command
-                    .split_whitespace()
-                    .map(std::ffi::OsString::from)
-                    .collect();
-                let parsed = crate::cli::Invocation::from_argv(&argv);
-                assert!(
-                    parsed.is_ok(),
-                    "the prompt offers `{command}`, which the parser rejects: {:?}",
-                    parsed.err()
-                );
+            for interactive in [true, false] {
+                for line in review_prompt(&summary, interactive).lines() {
+                    let text = line.split('#').next().unwrap_or("").trim();
+                    let Some(start) = text.find("rachna ") else {
+                        continue;
+                    };
+                    let command = text[start..]
+                        .replace("<category>", "network")
+                        .replace("<target>", "a.test:443");
+                    // Drop a trailing parenthetical like "(47 grants)".
+                    let command = command.split('(').next().unwrap_or(&command).trim();
+                    let argv: Vec<std::ffi::OsString> = command
+                        .split_whitespace()
+                        .map(std::ffi::OsString::from)
+                        .collect();
+                    let parsed = crate::cli::Invocation::from_argv(&argv);
+                    assert!(
+                        parsed.is_ok(),
+                        "the prompt offers `{command}`, which the parser rejects: {:?}",
+                        parsed.err()
+                    );
+                }
             }
         }
     }
@@ -773,9 +926,13 @@ mod tests {
 
         // And the prompt changes shape: it points at `config inspect`
         // rather than implying the user should read 40 numbered lines.
-        let prompt = review_prompt(&long);
+        let prompt = review_prompt(&long, false);
         assert!(prompt.contains("config inspect"), "{prompt}");
         assert!(prompt.contains("40 grants"), "{prompt}");
+        // Interactively, the same case offers `l` rather than a command —
+        // the entries were rolled up, so there has to be a way to see them.
+        let tty = review_prompt(&long, true);
+        assert!(tty.contains("[l] list all 40 grants"), "{tty}");
     }
 
     #[test]
@@ -809,9 +966,12 @@ mod tests {
         // is information" — but offering accept-or-decline for an empty set
         // is noise.
         let sealed = AccessSummary::new(Tier::None, Profile::Sealed, &[]);
-        let prompt = review_prompt(&sealed);
-        assert!(prompt.contains("grants nothing"), "{prompt}");
-        assert!(!prompt.contains("--accept"), "{prompt}");
+        for interactive in [true, false] {
+            let prompt = review_prompt(&sealed, interactive);
+            assert!(prompt.contains("grants nothing"), "{prompt}");
+            assert!(!prompt.contains("--accept"), "{prompt}");
+            assert!(!prompt.contains("[a]"), "{prompt}");
+        }
     }
 
     // ---- property 1: completeness ----------------------------------------
