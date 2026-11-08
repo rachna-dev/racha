@@ -36,6 +36,7 @@ repository = "https://github.com/shriyans/rachna"
 publish = false
 
 [dependencies]
+codespan-reporting = "0.13.1"
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 # DELIBERATELY EMPTY until step 2 needs something and the alternatives have
 # been compared (AGENTS.md, "Evaluate alternatives before adding a
