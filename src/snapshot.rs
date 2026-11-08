@@ -315,9 +315,171 @@ impl Metadata {
     }
 }
 
+/// What a user must be told before a snapshot is written.
+///
+/// `09` §4 is the most serious finding in that document, and it was measured
+/// rather than inferred: Cloud Hypervisor writes guest memory to a plain
+/// file, and a planted marker was recovered from it verbatim. So **anything
+/// in guest RAM at snapshot time is on disk in plaintext** — tokens, SSH
+/// material, decrypted database pages, environment secrets — protected only
+/// by file mode `0600`.
+///
+/// Encryption is the fix and is not built yet. This type is §4's *fifth*
+/// requirement, which can ship now and is the honest default: *"Until
+/// encryption lands, `rachna snapshot create` on Linux should state that the
+/// snapshot contains unencrypted guest memory. An unstated weakness is worse
+/// than a stated one."*
+///
+/// # Why a type rather than a log line
+///
+/// The same reason [`Decision`](crate::decision::Decision) is an event rather
+/// than a bool: a warning that lives in a `println!` at one call site is one
+/// refactor away from being lost, and nothing would fail. Here the only way
+/// to get a [`Confidentiality`] is to ask, the warning text is derived from a
+/// measured [`Capabilities`], and a test asserts the Linux answer is not
+/// silent. If encryption lands, this starts returning
+/// [`Confidentiality::Encrypted`] and the warning disappears on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confidentiality {
+    /// Guest memory is encrypted at rest by the platform.
+    ///
+    /// macOS, with a host-tied key (`02` §4, `12` §1) — which is also why
+    /// such a snapshot is not portable, handled by
+    /// [`Incompatible::DifferentMachine`].
+    Encrypted,
+    /// Guest memory is written in plaintext.
+    ///
+    /// Linux today (`09` §4). Carries the path so the message can name the
+    /// file a user would have to protect or delete.
+    Plaintext,
+}
+
+impl Confidentiality {
+    /// What the platform actually does, from measured capabilities.
+    ///
+    /// Takes [`Capabilities`] rather than reading `cfg!(target_os)` so the
+    /// answer comes from what a backend *measured* — the same reason
+    /// `measured_capabilities` takes `save_restore_supported` instead of
+    /// assuming it.
+    #[must_use]
+    pub const fn of(capabilities: Capabilities) -> Self {
+        if capabilities.encrypted_snapshots {
+            Self::Encrypted
+        } else {
+            Self::Plaintext
+        }
+    }
+
+    /// Whether a user must be warned before this snapshot is written.
+    #[must_use]
+    pub const fn needs_warning(&self) -> bool {
+        matches!(*self, Self::Plaintext)
+    }
+
+    /// The warning to print, or `None` when there is nothing to warn about.
+    ///
+    /// Deliberately specific about all four things `09` §4 says a user needs:
+    /// that memory is in the clear, what kinds of secret that includes, that
+    /// mode `0600` is the only protection, and that deleting the file does not
+    /// erase it. A vague "snapshots may contain sensitive data" would satisfy
+    /// a checklist and not a user.
+    #[must_use]
+    pub fn warning(&self) -> Option<String> {
+        match *self {
+            Self::Encrypted => None,
+            Self::Plaintext => Some(
+                "this snapshot will contain UNENCRYPTED guest memory: any                  token, key, or decrypted data in RAM is written to disk in                  plaintext (09 §4, measured). The file is mode 0600 and that                  is the only protection. Deleting it later does not erase the                  contents. Credential placeholders keep real secrets out of                  guest memory entirely (00 §3.6)"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- snapshot confidentiality (09 §4, the open tier-1 item) ----------
+
+    // The measured platform shapes come from `Capabilities` itself —
+    // `measured_macos()` and `measured_linux()` — rather than being copied
+    // here. A local copy would keep passing after someone closed the Linux
+    // gap, which is exactly the regression these tests exist to notice.
+
+    #[test]
+    fn a_linux_snapshot_is_never_written_silently() {
+        // 09 §4's fifth requirement, which is the one that can ship before
+        // encryption: "An unstated weakness is worse than a stated one."
+        //
+        // First, assert the thing under attack EXISTS: that the Linux
+        // capability shape really is the unencrypted one. Without this the
+        // rest passes just as well against a platform that encrypts, which
+        // would make the whole test vacuous.
+        assert!(
+            !Capabilities::measured_linux().encrypted_snapshots,
+            "09 §4 measured Linux snapshots as plaintext; if this is now              false the gap is closed and this test should be rewritten"
+        );
+
+        let linux = Confidentiality::of(Capabilities::measured_linux());
+        assert_eq!(linux, Confidentiality::Plaintext);
+        assert!(linux.needs_warning());
+        let warning = linux.warning().expect("a plaintext snapshot warns");
+
+        // The four things 09 §4 says a user needs, each checked, because a
+        // vague warning satisfies a checklist rather than a user.
+        assert!(
+            warning.contains("UNENCRYPTED"),
+            "the warning must be unmissable: {warning}"
+        );
+        assert!(warning.contains("plaintext"), "{warning}");
+        assert!(warning.contains("0600"), "{warning}");
+        assert!(
+            warning.contains("does not erase"),
+            "09 §4 requires saying that deletion is not erasure: {warning}"
+        );
+        // And the mitigation that actually works today, so the warning is
+        // actionable rather than only alarming.
+        assert!(warning.contains("placeholder"), "{warning}");
+    }
+
+    #[test]
+    fn an_encrypted_snapshot_does_not_warn_about_nothing() {
+        // The other half, and not a formality: a tool that warns on every
+        // platform teaches users to ignore the warning, which costs the Linux
+        // case its force.
+        assert!(
+            Capabilities::measured_macos().encrypted_snapshots,
+            "02 §4 measured macOS save files as encrypted"
+        );
+        let macos = Confidentiality::of(Capabilities::measured_macos());
+        assert_eq!(macos, Confidentiality::Encrypted);
+        assert!(!macos.needs_warning());
+        assert_eq!(macos.warning(), None);
+    }
+
+    #[test]
+    fn confidentiality_follows_the_measurement_not_the_platform() {
+        // `of` reads the capability rather than `cfg!(target_os)`, so if a
+        // future Linux backend encrypts, the warning disappears by itself
+        // instead of needing someone to remember this file. Proven by
+        // flipping only that field.
+        let encrypting_linux = Capabilities {
+            encrypted_snapshots: true,
+            ..Capabilities::measured_linux()
+        };
+        assert_eq!(
+            Confidentiality::of(encrypting_linux),
+            Confidentiality::Encrypted,
+            "the warning must be driven by the measurement, not by the OS"
+        );
+        // And the converse: a macOS configuration that somehow did not
+        // encrypt would warn, rather than being trusted for being macOS.
+        let plain_macos = Capabilities {
+            encrypted_snapshots: false,
+            ..Capabilities::measured_macos()
+        };
+        assert!(Confidentiality::of(plain_macos).needs_warning());
+    }
 
     fn shape() -> DeviceShape {
         DeviceShape {
