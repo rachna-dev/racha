@@ -170,6 +170,7 @@ pub mod decide;
 pub mod decision;
 pub mod exclusion;
 pub mod grant;
+pub mod lifecycle;
 pub mod policy;
 pub mod summary;
 pub mod synthesize;
