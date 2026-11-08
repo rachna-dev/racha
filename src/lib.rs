@@ -173,3 +173,26 @@ pub mod grant;
 pub mod policy;
 pub mod summary;
 pub mod synthesize;
+
+#[cfg(test)]
+mod json_limits {
+    /// A hostile `rachna.nix` can make `nix eval --json` emit arbitrarily
+    /// nested output, so the parser must refuse rather than overflow the
+    /// stack. `17` §2 claims serde_json's default recursion limit does this;
+    /// verified here rather than trusted, because a stack overflow in the
+    /// host-side evaluator is a crash at full privilege.
+    #[test]
+    fn deeply_nested_json_is_refused_rather_than_crashing() {
+        let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
+        let parsed = serde_json::from_str::<serde_json::Value>(&deep);
+        assert!(parsed.is_err(), "100k-deep input must be rejected");
+    }
+
+    /// And the limit does not reject anything a real config produces.
+    #[test]
+    fn realistically_nested_json_still_parses() {
+        let nested = format!("{}1{}", "[".repeat(100), "]".repeat(100));
+        assert!(serde_json::from_str::<serde_json::Value>(&nested).is_ok());
+    }
+}
+pub mod eval;

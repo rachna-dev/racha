@@ -17,7 +17,20 @@ gate() {
   step "clippy"
   cargo clippy --workspace --all-targets -- -D warnings
   step "tests"
-  cargo nextest run --workspace
+  # The sandbox tests spawn real `nix eval` and take ~110s, which is too slow
+  # for a gate meant to run before and after every task. They are a separate
+  # target so the fast gate stays fast — and they run in CI and via
+  # `gate.sh all`, never silently skipped.
+  cargo nextest run --workspace -E 'not binary(eval_sandbox)'
+}
+
+# Real `nix eval` against real attacks. Slow and worth it: the unit tests
+# assert the restriction FLAGS are present, which is not the same claim as
+# the attacks failing. Four of this project's bugs came from exactly that
+# gap (11 §7, 13 §2, 21 §5, 23 §1.1).
+sandbox() {
+  step "eval sandbox (real nix, ~2 min)"
+  cargo nextest run --workspace -E 'binary(eval_sandbox)'
 }
 
 # Mutation testing is THE bar for this project, not coverage: for a security
@@ -59,13 +72,15 @@ case "${1:-all}" in
   gate) gate ;;
   mutants) mutants ;;
   deps) deps ;;
+  sandbox) sandbox ;;
   all)
     gate
+    sandbox
     mutants
     deps
     ;;
   *)
-    echo "usage: $0 [gate|mutants|deps|all]" >&2
+    echo "usage: $0 [gate|sandbox|mutants|deps|all]" >&2
     exit 2
     ;;
 esac
