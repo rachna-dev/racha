@@ -97,6 +97,23 @@
                 fi
 
                 cp ${guest.config.system.build.initialRamdisk}/initrd $out/initrd
+
+                # The closure as a read-only squashfs — `00` §7 Layer C: the
+                # project closure is a SEPARATE disk attached to a generic
+                # base, so changing a package swaps one disk rather than
+                # rebuilding an OS image.
+                #
+                # Needed because the guest's `fileSystems."/"` must have
+                # something to switch into. Measured without it: the initrd
+                # reaches 15 targets, fails "Find NixOS closure", and drops
+                # to emergency mode — switch-root with no root.
+                mkdir -p $out/closure
+                echo "${guest.config.system.build.toplevel}" > $out/closure/system
+                ${pkgs.squashfsTools}/bin/mksquashfs \
+                  $(cat ${pkgs.writeClosure [ guest.config.system.build.toplevel ]}) \
+                  $out/closure.squashfs \
+                  -no-hardlinks -keep-as-directory -all-root -b 1048576 \
+                  -comp zstd -Xcompression-level 6 -no-progress >/dev/null
                 cp ${guest.config.system.build.toplevel}/init $out/init 2>/dev/null || true
                 ln -s ${guest.config.system.build.toplevel} $out/system
 

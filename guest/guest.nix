@@ -43,9 +43,27 @@
 
   # ---- the mounts ---------------------------------------------------------
 
+  # The root is the closure squashfs, read-only, attached as the FIRST disk.
+  #
+  # `00` §7 Layer C: the project closure is a separate read-only disk on a
+  # generic base, so changing a package swaps one disk instead of rebuilding
+  # an OS image — and store paths dedupe naturally.
+  #
+  # Measured: without a root to switch into, the initrd reaches 15 targets,
+  # fails "Find NixOS closure" and drops to emergency mode.
   fileSystems."/" = {
     device = "/dev/vda";
-    fsType = "ext4";
+    fsType = "squashfs";
+    options = [ "ro" ];
+  };
+
+  # Everything writable is a tmpfs overlay or the state disk. A read-only
+  # root is not a limitation here: it is what makes the guest reproducible
+  # and what lets the closure be shared across projects (`08` §4.1.1).
+  fileSystems."/tmp" = {
+    device = "tmpfs";
+    fsType = "tmpfs";
+    options = [ "mode=1777" ];
   };
 
   # §4.1, the bug that cost real time: mounting the host's state share on
