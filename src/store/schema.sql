@@ -17,11 +17,26 @@
 -- exfiltration channel survives `revoke --unused`, or forges silence so real
 -- grants look revocable.
 
--- One row per `rachna` invocation.
+-- One row per distinct EFFECTIVE GRANT SET this project has been asked to run.
+--
+-- `id` is `AccessSummary::fingerprint()`, NOT a hash of the file's bytes, and
+-- the difference is the whole point of the table. `00` §3.10c:
+--
+--   Keyed on the effective grant set, not the file's hash. Reformatting, a
+--   comment, or a reordered list must not re-prompt, or the acknowledgement
+--   becomes noise people learn to bypass.
+--
+-- This column's comment previously said "content hash of rachna.nix", which
+-- would have re-prompted on a comment change — the exact noise the spec
+-- forbids, and the kind of thing that teaches users to alias `--accept`.
+--
+-- `approved` carries both `00` §3.10c's first-run acknowledgement and
+-- §3.11a's reload gate: a widening change produces an unseen fingerprint,
+-- and `Reload::may_apply_now()` keeps it inert until a row here says 1.
 CREATE TABLE IF NOT EXISTS config_revisions (
-    id                TEXT PRIMARY KEY,   -- content hash of rachna.nix
+    id                TEXT PRIMARY KEY,   -- AccessSummary::fingerprint()
     ts                INTEGER NOT NULL,
-    approved          INTEGER NOT NULL,   -- the first-run ack, `00` §3.10c
+    approved          INTEGER NOT NULL,   -- `00` §3.10c ack + §3.11a gate
     CHECK (approved IN (0, 1))
 ) STRICT;
 
