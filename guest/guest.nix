@@ -60,24 +60,26 @@
 
   # ---- the mounts ---------------------------------------------------------
 
-  # The root is an OVERLAY: read-only closure squashfs below, tmpfs above.
+  # The root is a tmpfs; the STORE is the overlay. This is how NixOS's own ISO
+  # image does it, and it is the right shape rather than merely the supported
+  # one: `00` §7 Layer C's closure *is* a store, so overlaying the store says
+  # what we actually mean.
   #
-  # `00` §7 Layer C and its writable half. Measured, in this order — each fix
-  # produced a MORE SPECIFIC failure, which is how the gap surfaced:
+  # FOUR attempts got here, each rejected more informatively than the last:
   #
-  #   no root at all        -> "Failed to start Find NixOS closure", emergency
-  #   squashfs, no module   -> /dev/vda found and UNMOUNTABLE, emergency
-  #   squashfs, read-only   -> "Mounted /sysroot" then "Failed to mount
-  #                            /sysroot/run" — present, and nothing writable
+  #   no root at all            -> "Failed to start Find NixOS closure"
+  #   squashfs root, no module  -> /dev/vda found and UNMOUNTABLE
+  #   squashfs root, read-only  -> "Mounted /sysroot", then "Failed to mount
+  #                                /sysroot/run" — present, nothing writable
+  #   overlay root with layers
+  #     declared as fileSystems -> rejected AT EVAL: "can't be topologically
+  #                                sorted: / -> /closure loops to /", which
+  #                                is correct and unarguable — a layer
+  #                                mounted UNDER the root cannot be a
+  #                                prerequisite of that root
   #
-  # The overlay gives both halves: the closure stays immutable and shareable
-  # across projects (`08` §4.1.1 — 493 MB once rather than per project), and
-  # the guest gets a writable root that dies on stop.
-  #
-  # Three constraints this imposes, all recorded in `00` §7: overlay writes
-  # consume guest RAM, they land in every snapshot (plaintext on Linux,
-  # `09` §4), and overlayfs semantics leak (EXDEV, copy-up, fsync). All three
-  # are why DURABLE DATA BELONGS ON THE STATE VOLUME, not the root.
+  # Overlaying the store has no such loop: /nix/store sits inside a root that
+  # is already mounted.
   boot.initrd.systemd.enable = true;
   boot.initrd.supportedFilesystems = [
     "squashfs"
@@ -85,43 +87,44 @@
   ];
 
   fileSystems."/" = {
-    fsType = "overlay";
-    device = "overlay";
-    options = [
-      "lowerdir=/closure"
-      "upperdir=/rw/upper"
-      "workdir=/rw/work"
-    ];
-    depends = [
-      "/closure"
-      "/rw"
-    ];
+    device = "tmpfs";
+    fsType = "tmpfs";
+    options = [ "mode=0755" ];
   };
 
-  # The immutable half: the project's closure, read-only, first disk.
-  fileSystems."/closure" = {
+  # The immutable half: this project's closure, read-only, first disk.
+  # Shared across projects (`08` §4.1.1) — 493 MB once rather than per
+  # project, which a writable image could not do.
+  fileSystems."/nix/.ro-store" = {
     device = "/dev/vda";
     fsType = "squashfs";
-    options = [ "ro" ];
+    options = [
+      "ro"
+      "loop"
+    ];
     neededForBoot = true;
   };
 
-  # The writable half, in RAM. `mode=0755` because overlayfs refuses a
-  # workdir it cannot own.
-  fileSystems."/rw" = {
+  # The writable half, in RAM. `00` §7 records what this costs: writes eat
+  # the memory budget, land in every snapshot (plaintext on Linux, `09` §4),
+  # and carry overlayfs semantics. All three are why DURABLE DATA BELONGS ON
+  # THE STATE VOLUME rather than here.
+  fileSystems."/nix/.rw-store" = {
     device = "tmpfs";
     fsType = "tmpfs";
     options = [ "mode=0755" ];
     neededForBoot = true;
   };
 
-  # Everything writable is a tmpfs overlay or the state disk. A read-only
-  # root is not a limitation here: it is what makes the guest reproducible
-  # and what lets the closure be shared across projects (`08` §4.1.1).
-  fileSystems."/tmp" = {
-    device = "tmpfs";
-    fsType = "tmpfs";
-    options = [ "mode=1777" ];
+  # NixOS's first-class overlay option, not hand-rolled mount units — `19` §3
+  # warns against fighting the module system, and the hand-rolled attempt is
+  # what produced the topological loop above.
+  fileSystems."/nix/store" = {
+    overlay = {
+      lowerdir = [ "/nix/.ro-store" ];
+      upperdir = "/nix/.rw-store/store";
+      workdir = "/nix/.rw-store/work";
+    };
   };
 
   # §4.1, the bug that cost real time: mounting the host's state share on
