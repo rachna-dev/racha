@@ -37,10 +37,8 @@ publish = false
 
 [dependencies]
 codespan-reporting = "0.13.1"
-jiff = "0.2.40"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
-ulid = "3.0.0"
 # DELIBERATELY EMPTY until step 2 needs something and the alternatives have
 # been compared (AGENTS.md, "Evaluate alternatives before adding a
 # dependency"). An earlier version of this file listed camino, serde,
