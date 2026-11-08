@@ -60,18 +60,59 @@
 
   # ---- the mounts ---------------------------------------------------------
 
-  # The root is the closure squashfs, read-only, attached as the FIRST disk.
+  # The root is an OVERLAY: read-only closure squashfs below, tmpfs above.
   #
-  # `00` §7 Layer C: the project closure is a separate read-only disk on a
-  # generic base, so changing a package swaps one disk instead of rebuilding
-  # an OS image — and store paths dedupe naturally.
+  # `00` §7 Layer C and its writable half. Measured, in this order — each fix
+  # produced a MORE SPECIFIC failure, which is how the gap surfaced:
   #
-  # Measured: without a root to switch into, the initrd reaches 15 targets,
-  # fails "Find NixOS closure" and drops to emergency mode.
+  #   no root at all        -> "Failed to start Find NixOS closure", emergency
+  #   squashfs, no module   -> /dev/vda found and UNMOUNTABLE, emergency
+  #   squashfs, read-only   -> "Mounted /sysroot" then "Failed to mount
+  #                            /sysroot/run" — present, and nothing writable
+  #
+  # The overlay gives both halves: the closure stays immutable and shareable
+  # across projects (`08` §4.1.1 — 493 MB once rather than per project), and
+  # the guest gets a writable root that dies on stop.
+  #
+  # Three constraints this imposes, all recorded in `00` §7: overlay writes
+  # consume guest RAM, they land in every snapshot (plaintext on Linux,
+  # `09` §4), and overlayfs semantics leak (EXDEV, copy-up, fsync). All three
+  # are why DURABLE DATA BELONGS ON THE STATE VOLUME, not the root.
+  boot.initrd.systemd.enable = true;
+  boot.initrd.supportedFilesystems = [
+    "squashfs"
+    "overlay"
+  ];
+
   fileSystems."/" = {
+    fsType = "overlay";
+    device = "overlay";
+    options = [
+      "lowerdir=/closure"
+      "upperdir=/rw/upper"
+      "workdir=/rw/work"
+    ];
+    depends = [
+      "/closure"
+      "/rw"
+    ];
+  };
+
+  # The immutable half: the project's closure, read-only, first disk.
+  fileSystems."/closure" = {
     device = "/dev/vda";
     fsType = "squashfs";
     options = [ "ro" ];
+    neededForBoot = true;
+  };
+
+  # The writable half, in RAM. `mode=0755` because overlayfs refuses a
+  # workdir it cannot own.
+  fileSystems."/rw" = {
+    device = "tmpfs";
+    fsType = "tmpfs";
+    options = [ "mode=0755" ];
+    neededForBoot = true;
   };
 
   # Everything writable is a tmpfs overlay or the state disk. A read-only
