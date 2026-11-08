@@ -115,6 +115,130 @@ impl Check {
     }
 }
 
+/// How a [`Check`] is carried out in the guest.
+///
+/// A command plus the rule for reading its result, kept together because
+/// separating them is how a probe ends up inverted. `15` §3.2's process limit
+/// and this module's own first pids probe both reported success while the
+/// mechanism was absent, and in each case the command was right and the
+/// *interpretation* was wrong.
+///
+/// # Why the expectation is a type and not a comment
+///
+/// Every probe here expects its command to **fail**. Writing that as
+/// [`Expect::NonZeroExit`] rather than as `// should fail` means
+/// [`Probe::read`] cannot be written the other way round by accident, and a
+/// test can assert the direction for every check at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// The check this carries out.
+    pub check: Check,
+    /// Where this check is carried out, and how to read the answer.
+    pub how: How,
+}
+
+/// Where a check runs.
+///
+/// Not every boundary can be probed from the guest, and pretending otherwise
+/// is what produced the first draft of this type: `GuestConfinement` had an
+/// empty command string and an expectation that meant nothing, which is the
+/// "declared and does nothing" shape this project has now found five times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum How {
+    /// Run a command in the guest; the boundary held if it exits non-zero.
+    ///
+    /// A shell line rather than an argv, because that is what
+    /// [`Kind::Exec`](crate::protocol::Kind::Exec) carries and because these
+    /// need a redirection to be meaningful.
+    GuestCommandMustFail { command: &'static str },
+    /// Run a command in the guest and compare its output to a number the
+    /// host knows.
+    ///
+    /// Exists for the process limit, because `15` §3.2's lesson is that
+    /// "some limit exists" is not the question: the guest-side probe measured
+    /// a kernel ceiling of 2325 and reported success with every Rachna limit
+    /// removed. So the host holds the declared figure and compares.
+    GuestOutputMustEqual {
+        command: &'static str,
+        /// The declared value, as the guest would print it.
+        expected: u32,
+    },
+    /// Answered by the host about itself, with no guest involvement.
+    ///
+    /// `GuestConfinement` asks whether the *hypervisor process* is still
+    /// confined as Rachna started it. A guest cannot answer that about its
+    /// own host, and a guest-side probe that appeared to would be worse than
+    /// none — so this names the gap instead of faking a command.
+    HostSideOnly,
+}
+
+impl Probe {
+    /// Every probe, one per [`Check`].
+    ///
+    /// The commands are deliberately boring: `coreutils` and a shell builtin,
+    /// nothing that needs a package in the guest. A probe that cannot run
+    /// yields [`Outcome::Inconclusive`], which blocks enforcement — so a
+    /// missing tool would make every environment unenforced.
+    #[must_use]
+    pub fn all(declared_processes: u32) -> Vec<Self> {
+        vec![
+            Self {
+                check: Check::GuestConfinement,
+                how: How::HostSideOnly,
+            },
+            Self {
+                check: Check::NetworkEgress,
+                how: How::GuestCommandMustFail {
+                    // A literal address, so DNS is not in the path: a probe
+                    // that failed because resolution failed would report the
+                    // network boundary as holding when it was never tested —
+                    // the false-negative shape of `11` §7. 1.1.1.1:443 is
+                    // reachable from any unfiltered network, which is exactly
+                    // the property being denied.
+                    //
+                    // `timeout` because a DROP rule makes a connect hang
+                    // rather than refuse, and a probe that blocks forever is
+                    // an inconclusive result dressed as a pending one.
+                    //
+                    // `bash` explicitly, NOT `sh`: `/dev/tcp` is a bash
+                    // feature. Measured that the guest's `/bin/sh` currently
+                    // IS bash (`environment.binsh` resolves to
+                    // bash-interactive), so `sh` would work today — and that
+                    // is precisely the problem. A guest config change would
+                    // make the probe error out, which reports `Inconclusive`
+                    // and blocks every start, for a reason no message would
+                    // name. Depending on the shell by name makes the
+                    // requirement visible.
+                    command: "timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443'",
+                },
+            },
+            Self {
+                check: Check::ProcessLimit,
+                // Reports the limit rather than attempting a fork bomb. The
+                // guest-side spike showed why: forking past the limit kills
+                // the reporter, and the one run that survived did so at the
+                // KERNEL's ceiling of 2325 rather than ours.
+                how: How::GuestOutputMustEqual {
+                    command: "ulimit -u",
+                    expected: declared_processes,
+                },
+            },
+            Self {
+                check: Check::PolicyFileUnreachable,
+                how: How::GuestCommandMustFail {
+                    // `00` §3.11 excludes rachna.nix from the workspace
+                    // mount. `13` §2 and `15` §3.4 measured a hardlink and a
+                    // case variant defeating a name-based check, so a passing
+                    // probe here is necessary and NOT sufficient — the inode
+                    // check in `exclusion.rs` is the real defence. Recorded
+                    // so this is not mistaken for the whole of it.
+                    command: "cat /workspace/rachna.nix",
+                },
+            },
+        ]
+    }
+}
+
 /// What happened when a [`Check`] was attempted.
 ///
 /// Three outcomes, not two. `Inconclusive` exists because this project has
@@ -396,6 +520,124 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), Check::ALL.len());
+    }
+
+    // ---- the probes (how each check is actually carried out) -------------
+
+    #[test]
+    fn there_is_exactly_one_probe_per_check() {
+        // A check with no probe is a boundary nobody tests, and a report
+        // built from an incomplete probe set would be refused by
+        // `Report::new` at runtime rather than caught here.
+        let probes = Probe::all(512);
+        assert_eq!(probes.len(), Check::ALL.len());
+        for check in Check::ALL {
+            let matching: Vec<&Probe> = probes.iter().filter(|p| p.check == check).collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "{} has {} probes, want exactly 1",
+                check.as_str(),
+                matching.len()
+            );
+        }
+    }
+
+    #[test]
+    fn no_probe_runs_an_empty_command() {
+        // The first draft of `Probe` gave `GuestConfinement` an empty command
+        // string and an expectation that meant nothing — the "declared and
+        // does nothing" shape this project has found five times. The gap is
+        // now named by `How::HostSideOnly` instead of faked, and this test
+        // is what stops the fake coming back.
+        for probe in Probe::all(512) {
+            match probe.how {
+                How::GuestCommandMustFail { command }
+                | How::GuestOutputMustEqual { command, .. } => {
+                    assert!(
+                        !command.trim().is_empty(),
+                        "{} has an empty command",
+                        probe.check.as_str()
+                    );
+                }
+                // Allowed, and the point: a boundary the guest cannot answer
+                // about says so rather than shipping a command that proves
+                // nothing.
+                How::HostSideOnly => {}
+            }
+        }
+    }
+
+    #[test]
+    fn the_process_limit_probe_carries_the_declared_number() {
+        // `15` §3.2's lesson, as a type: "some limit exists" is not the
+        // question. The guest probe measured a KERNEL ceiling of 2325 and
+        // reported success with every Rachna limit removed, so the declared
+        // figure has to reach the comparison.
+        for declared in [512_u32, 1, 4096] {
+            let probe = Probe::all(declared)
+                .into_iter()
+                .find(|p| p.check == Check::ProcessLimit)
+                .expect("a process-limit probe exists");
+            let How::GuestOutputMustEqual { expected, .. } = probe.how else {
+                panic!("the process limit must be compared, not merely attempted")
+            };
+            assert_eq!(
+                expected, declared,
+                "the probe compares against {expected}, not the declared {declared}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_network_probe_uses_a_literal_address_and_a_timeout() {
+        let probe = Probe::all(512)
+            .into_iter()
+            .find(|p| p.check == Check::NetworkEgress)
+            .expect("a network probe exists");
+        let How::GuestCommandMustFail { command } = probe.how else {
+            panic!("egress must be an attempt that fails")
+        };
+        // No DNS in the path: a probe that failed because resolution failed
+        // would report the boundary as holding when it was never tested —
+        // the false-negative shape `11` §7 records three times.
+        assert!(
+            command.contains("1.1.1.1"),
+            "the egress probe must not depend on DNS: {command}"
+        );
+        assert!(
+            !command.contains("example.com") && !command.contains("google"),
+            "a hostname puts DNS in the path: {command}"
+        );
+        // And it must not be able to hang: a DROP rule makes connect() block
+        // rather than refuse, and a probe that blocks forever is an
+        // inconclusive result dressed up as a pending one.
+        assert!(
+            command.contains("timeout"),
+            "the egress probe can hang without a timeout: {command}"
+        );
+        // `/dev/tcp` is a BASH feature, so the shell is named rather than
+        // inherited. Measured: the guest's /bin/sh is currently bash, which
+        // means `sh` would work today and break silently on a guest config
+        // change — reporting Inconclusive and blocking every start for a
+        // reason no message would name.
+        assert!(
+            command.contains("bash"),
+            "/dev/tcp needs bash, not whatever sh happens to be: {command}"
+        );
+    }
+
+    #[test]
+    fn only_the_confinement_check_is_answered_host_side() {
+        // The asymmetry is deliberate and worth pinning: if a second check
+        // quietly became HostSideOnly, it would stop being probed in the
+        // guest with nothing failing.
+        let host_side: Vec<Check> = Probe::all(512)
+            .into_iter()
+            .filter(|p| p.how == How::HostSideOnly)
+            .map(|p| p.check)
+            .collect();
+        assert_eq!(host_side, vec![Check::GuestConfinement]);
     }
 
     #[test]
