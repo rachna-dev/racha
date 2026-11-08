@@ -1,0 +1,14 @@
+# cargo-mutants configuration.
+
+# Mutation testing runs the suite once per mutant, so a slow test is paid
+# ~160 times over. The eval-sandbox tests spawn real `nix eval` and take ~100s
+# together, which made the unmutated baseline alone 95s and pushed the
+# auto-chosen per-mutant timeout to 476s.
+#
+# They are excluded here rather than from the gate: they prove the RESTRICTION
+# blocks real attacks, which is a property of the nix invocation, not of the
+# Rust logic a mutant changes. Nothing a mutant does to `src/` can make
+# `--restrict-eval` stop working. `ci/gate.sh sandbox` and a dedicated CI job
+# run them for real.
+test_tool = "nextest"
+additional_cargo_test_args = ["-E", "not binary(eval_sandbox)"]

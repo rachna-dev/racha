@@ -11,7 +11,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use rachna::config;
+use rachna::decide::Capabilities;
+use rachna::decision::Category;
 use rachna::eval::{ImportSet, Invocation};
+use rachna::grant::Grant;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -280,4 +284,70 @@ fn the_module_system_still_works_against_our_pin() {
     let (ok, stdout, stderr) = fixture.evaluate(&config, None);
     assert!(ok, "evalModules must work under restriction: {stderr}");
     assert!(stdout.contains("allowlist"), "{stdout}");
+}
+
+#[test]
+fn a_real_evaluation_parses_into_a_policy() {
+    // The end-to-end claim of step 5: a rachna.nix on disk becomes a Policy,
+    // through the real restricted evaluator and the real parser. The unit
+    // tests in src/config.rs use JSON captured from an evaluation; this
+    // proves the capture still matches what Nix emits today, so a Nix change
+    // to key ordering or number formatting is caught here rather than in
+    // production.
+    let fixture = fixture_or_skip!("parse");
+    let config = fixture.write(
+        "rachna.nix",
+        r#"{
+             tier = "allowlist";
+             profile = "development";
+             network.allow = [ "registry.npmjs.org:443" "github.com:443" ];
+             filesystem.mounts = [
+               { source = "/tmp/proj"; target = "/workspace";
+                 access = "read-write"; }
+             ];
+             ports = [ { guest = 3000; host = 3000; } ];
+             tools.expose = [
+               { name = "rust-analyzer"; kind = "lsp"; network = false; }
+             ];
+             secrets = [ "aws" ];
+           }"#,
+    );
+
+    let (ok, stdout, stderr) = fixture.evaluate(&config, None);
+    assert!(ok, "fixture must evaluate: {stderr}");
+
+    let policy = config::parse(&stdout, Capabilities::all())
+        .unwrap_or_else(|e| panic!("real nix output must parse:\n{e}\njson: {stdout}"));
+
+    let mut categories: Vec<Category> = policy.grants.iter().map(Grant::category).collect();
+    categories.sort_unstable();
+    categories.dedup();
+    assert_eq!(
+        categories,
+        Category::ALL.to_vec(),
+        "every category should round-trip from real nix output"
+    );
+}
+
+#[test]
+fn a_config_with_an_unknown_option_is_refused_end_to_end() {
+    // A misspelled key must not reach the parser as "no grants". Here the
+    // typo is well-formed Nix, so this is the second line of defence the
+    // parser exists to be (`22` §2.2 covers the module-system line).
+    let fixture = fixture_or_skip!("typo");
+    let config = fixture.write(
+        "rachna.nix",
+        r#"{ tier = "allowlist"; profile = "development";
+             netwrk.allow = [ "a:1" ]; }"#,
+    );
+
+    let (ok, stdout, stderr) = fixture.evaluate(&config, None);
+    assert!(
+        ok,
+        "the typo is valid Nix, so evaluation succeeds: {stderr}"
+    );
+    assert!(
+        config::parse(&stdout, Capabilities::all()).is_err(),
+        "a misspelled option must be refused, not read as no grants: {stdout}"
+    );
 }

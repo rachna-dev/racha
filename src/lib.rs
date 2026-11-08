@@ -195,4 +195,5 @@ mod json_limits {
         assert!(serde_json::from_str::<serde_json::Value>(&nested).is_ok());
     }
 }
+pub mod config;
 pub mod eval;
