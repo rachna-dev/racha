@@ -172,6 +172,7 @@ pub mod denial;
 pub mod enforcement;
 pub mod exclusion;
 pub mod grant;
+pub mod layout;
 pub mod lifecycle;
 pub mod policy;
 pub mod summary;
