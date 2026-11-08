@@ -912,6 +912,38 @@ mod tests {
     }
 
     #[test]
+    fn the_threshold_is_inclusive_at_its_limit() {
+        // A mutation survivor: `>` and `>=` were indistinguishable because
+        // no test sat exactly at the limit. Off by one here is not cosmetic
+        // — it decides whether a 12-grant config gets the itemised list it
+        // is sized for, so the boundary is pinned on both sides.
+        let at_limit: Vec<Grant> = (0..PER_ITEM_REVIEW_LIMIT)
+            .map(|n| Grant::Network {
+                endpoint: endpoint(&format!("h{n}.test"), 443),
+            })
+            .collect();
+        let summary = AccessSummary::new(Tier::Allowlist, Profile::Online, &at_limit);
+        assert_eq!(summary.reviewable().len(), PER_ITEM_REVIEW_LIMIT);
+        assert!(
+            !summary.too_long_to_itemise(),
+            "exactly {PER_ITEM_REVIEW_LIMIT} grants should still be itemised"
+        );
+
+        let one_over: Vec<Grant> = (0..=PER_ITEM_REVIEW_LIMIT)
+            .map(|n| Grant::Network {
+                endpoint: endpoint(&format!("h{n}.test"), 443),
+            })
+            .collect();
+        let summary = AccessSummary::new(Tier::Allowlist, Profile::Online, &one_over);
+        assert_eq!(summary.reviewable().len(), PER_ITEM_REVIEW_LIMIT + 1);
+        assert!(
+            summary.too_long_to_itemise(),
+            "{} grants should roll up",
+            PER_ITEM_REVIEW_LIMIT + 1
+        );
+    }
+
+    #[test]
     fn a_very_long_list_is_not_offered_item_by_item() {
         // The case `00` §3.10c cares about most: a CLONED config, which is
         // exactly where a 40-host allowlist appears. A numbered list that

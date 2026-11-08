@@ -125,8 +125,17 @@ impl Launch {
             // attached — inverting what the documentation implied.
             "--memory".into(),
             format!("size={}M,shared=on", self.memory_mib).into(),
+            // `core_scheduling=vm` keeps the guest's vCPUs off hyperthread
+            // siblings shared with host work, which closes the SMT
+            // side-channel class. `11` §2 measured it **free** —
+            // 8347/8346/9414 ms against a baseline of 10098/8590/8468 — and
+            // `15` §3.6 is explicit: "both it and core_scheduling=vm should
+            // be on by default; neither costs anything measurable."
+            //
+            // So it is not configurable. A free mitigation behind a flag is
+            // a mitigation most users never get.
             "--cpus".into(),
-            format!("boot={}", self.cpus).into(),
+            format!("boot={},core_scheduling=vm", self.cpus).into(),
             // `--serial file=` with `console=ttyS0` in the cmdline. The
             // `--console file=` / hvc0 variant produces ZERO output and ZERO
             // errors (`04` §4.2) — a guest that looks like it booted
@@ -177,6 +186,98 @@ impl Launch {
             }
         }
 
+        // Landlock last, because its ruleset is derived from every path
+        // above. `15` §3.6: defence against a **compromised VMM** — the one
+        // attack a VM boundary cannot stop, and `idea.md` §19's first listed
+        // risk. Measured free, so it is on by default rather than offered.
+        args.extend(self.landlock_args());
+
+        args
+    }
+
+    /// The Landlock flags, derived from the paths this launch already uses.
+    ///
+    /// Derived rather than configured, for the reason `exclusion.rs` exists:
+    /// a hand-written allowlist beside a hand-written device list is two
+    /// lists that drift, and the failure is a VM that cannot open its own
+    /// disk. Every path the VMM legitimately touches is already a field on
+    /// [`Launch`], so the ruleset is a projection of it.
+    ///
+    /// # What this actually restricts, measured
+    ///
+    /// Landlock applies **after** the VMM has opened its disks, so denying
+    /// the disk images proves nothing — a probe doing that booted fine and
+    /// looked like a decorative flag. The discriminating test is a file
+    /// opened *later*: with a snapshot directory inside the rules,
+    /// `ch-remote snapshot` wrote 204 MB; with the same directory outside
+    /// them, it was **refused**. So the restriction is real, and what it
+    /// buys is that a compromised VMM cannot write outside these paths.
+    ///
+    /// `/dev/kvm` is included because the VMM needs it and a ruleset without
+    /// it would be a VM that cannot start — the kind of "secure" default
+    /// that gets switched off.
+    ///
+    /// # A path CH will CREATE must be named by its directory
+    ///
+    /// Measured, and this would have broken every VM. **CH validates that
+    /// every rule path exists at startup**, and the console log, API socket
+    /// and virtiofs sockets do not exist yet — CH and virtiofsd create them.
+    /// Naming them directly is a fatal
+    /// `Validation(LandlockPathDoesNotExist("…/console.log"))` before the
+    /// guest starts at all.
+    ///
+    /// So those get a rule on their **containing directory**, `rw`. That is
+    /// looser than naming the file and it is the only thing that works; the
+    /// directory is per-project runtime state (`layout.rs`), so the widening
+    /// is bounded to paths Rachna owns rather than to anything useful to an
+    /// attacker.
+    ///
+    /// Found by running the invocation this function generates rather than
+    /// by reading it. The argument list looked correct and every unit test
+    /// passed.
+    fn landlock_args(&self) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec!["--landlock".into()];
+        let mut rules: Vec<OsString> = Vec::new();
+
+        let mut rule = |path: &Path, access: &str| {
+            let mut spec = OsString::from("path=");
+            spec.push(path);
+            spec.push(format!(",access={access}"));
+            rules.push(spec);
+        };
+
+        rule(Path::new("/dev/kvm"), "rw");
+        // These exist before CH runs: the boot bundle and the disk images.
+        rule(&self.kernel, "r");
+        rule(&self.initrd, "r");
+        for disk in &self.disks {
+            rule(&disk.path, if disk.read_only { "r" } else { "rw" });
+        }
+
+        // These do NOT exist yet, so the rule names the directory. Collected
+        // and deduplicated because the console log, the API socket and every
+        // share socket normally share one runtime directory, and repeating
+        // it would make the argument list grow with the share count for no
+        // additional access.
+        let will_be_created = core::iter::once(self.console_log.as_path())
+            .chain(core::iter::once(self.api_socket.as_path()))
+            .chain(self.shares.iter().map(|share| share.socket.as_path()));
+        let mut runtime_dirs: Vec<&Path> = Vec::new();
+        for path in will_be_created {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() && !runtime_dirs.contains(&parent) {
+                    runtime_dirs.push(parent);
+                }
+            }
+        }
+        for dir in runtime_dirs {
+            rule(dir, "rw");
+        }
+
+        if !rules.is_empty() {
+            args.push("--landlock-rules".into());
+            args.extend(rules);
+        }
         args
     }
 }
@@ -343,13 +444,175 @@ mod tests {
         // it. The VM does not start at all, so this is not a nicety — and
         // `04` §7 recommended targeting v54, which is where the requirement
         // arrived.
-        for arg in rendered(&launch()) {
-            if arg.starts_with("path=") {
-                assert!(
-                    arg.contains("image_type="),
-                    "{arg} would make CH refuse to start"
-                );
-            }
+        // Scoped to the arguments that FOLLOW `--disk`, not to every
+        // `path=` in the list. The proxy "starts with path=" was correct
+        // until Landlock arrived, whose rules are also `path=…` — and the
+        // test then failed on `path=/dev/kvm,access=rw`, demanding an
+        // image_type for a device that is not a disk. A test keyed on a
+        // coincidence of syntax rather than on the thing it means.
+        let args = rendered(&launch());
+        let start = args.iter().position(|a| a == "--disk").expect("--disk");
+        let disks: Vec<&String> = args[start + 1..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .collect();
+        assert!(!disks.is_empty(), "no disk arguments to check");
+        for arg in disks {
+            assert!(
+                arg.contains("image_type="),
+                "{arg} would make CH refuse to start"
+            );
+        }
+    }
+
+    #[test]
+    fn core_scheduling_is_always_on_because_it_is_free() {
+        // `11` §2 measured it free — 8347/8346/9414 ms against a baseline of
+        // 10098/8590/8468 — and `15` §3.6 says "neither costs anything
+        // measurable". A free mitigation behind a flag is one most users
+        // never get, so it is not configurable.
+        let args = rendered(&launch());
+        let cpus = args
+            .iter()
+            .position(|a| a == "--cpus")
+            .map(|i| args[i + 1].clone())
+            .expect("--cpus");
+        assert!(
+            cpus.contains("core_scheduling=vm"),
+            "the SMT side-channel mitigation is off: {cpus}"
+        );
+        // And the vCPU count survives, since both live in one argument.
+        assert!(cpus.contains("boot="), "{cpus}");
+    }
+
+    #[test]
+    fn landlock_is_enabled_and_its_rules_cover_every_path_the_vmm_uses() {
+        // `15` §3.6: defence against a COMPROMISED VMM — the one attack a VM
+        // boundary cannot stop. A ruleset missing a path the VMM needs is a
+        // VM that will not start, which is the kind of "secure" default
+        // people switch off, so the rules are derived from `Launch` rather
+        // than written beside it.
+        let launch = launch();
+        let args = rendered(&launch);
+        assert!(args.contains(&"--landlock".to_owned()));
+
+        let start = args
+            .iter()
+            .position(|a| a == "--landlock-rules")
+            .expect("--landlock-rules");
+        let rules: Vec<&String> = args[start + 1..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .collect();
+
+        // Paths that EXIST before CH runs are named directly.
+        for required in [
+            "/dev/kvm",
+            launch.kernel.to_str().expect("utf8"),
+            launch.initrd.to_str().expect("utf8"),
+        ] {
+            assert!(
+                rules.iter().any(|rule| rule.contains(required)),
+                "no Landlock rule covers {required}: {rules:?}"
+            );
+        }
+
+        // Paths CH CREATES are covered by their directory, not by name.
+        // Measured: naming them is a fatal
+        // `Validation(LandlockPathDoesNotExist("…/console.log"))` before the
+        // guest starts, because CH checks every rule path exists. An earlier
+        // version of this test demanded the file by name and so asserted
+        // the one shape that cannot work — it passed while the real
+        // invocation refused to boot.
+        for created in [&launch.console_log, &launch.api_socket] {
+            let parent = created.parent().expect("a parent").to_str().expect("utf8");
+            assert!(
+                rules
+                    .iter()
+                    .any(|rule| **rule == format!("path={parent},access=rw")),
+                "no Landlock rule covers the directory of {}: {rules:?}",
+                created.display()
+            );
+            assert!(
+                !rules
+                    .iter()
+                    .any(|rule| rule.contains(created.to_str().expect("utf8"))),
+                "{} is named directly, which CH refuses as nonexistent",
+                created.display()
+            );
+        }
+        for disk in &launch.disks {
+            let path = disk.path.to_str().expect("utf8");
+            assert!(
+                rules.iter().any(|rule| rule.contains(path)),
+                "no Landlock rule covers the disk {path}"
+            );
+        }
+        // Same for share sockets: virtiofsd creates them, so the rule is on
+        // the directory.
+        for share in &launch.shares {
+            let parent = share
+                .socket
+                .parent()
+                .expect("a parent")
+                .to_str()
+                .expect("utf8");
+            assert!(
+                rules
+                    .iter()
+                    .any(|rule| **rule == format!("path={parent},access=rw")),
+                "no Landlock rule covers the directory of {}",
+                share.socket.display()
+            );
+        }
+
+        // And one directory appears ONCE however many files live in it.
+        // The console log, API socket and share sockets normally share a
+        // runtime directory (`layout.rs`), and repeating it would grow the
+        // argument list with the share count for no additional access.
+        let mut dirs: Vec<&String> = rules
+            .iter()
+            .filter(|rule| rule.ends_with(",access=rw"))
+            .copied()
+            .collect();
+        let total = dirs.len();
+        dirs.sort();
+        dirs.dedup();
+        assert_eq!(total, dirs.len(), "a Landlock rule is repeated: {rules:?}");
+    }
+
+    #[test]
+    fn a_read_only_disk_gets_a_read_only_landlock_rule() {
+        // The access level is carried through rather than blanket `rw`:
+        // granting write to the shared closure image would let a
+        // compromised VMM corrupt a disk every project on this host boots
+        // from (`08` §4.1.1 — the closure is THE shared thing).
+        let args = rendered(&launch());
+        let start = args
+            .iter()
+            .position(|a| a == "--landlock-rules")
+            .expect("--landlock-rules");
+        let rules: Vec<&String> = args[start + 1..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .collect();
+
+        for disk in &launch().disks {
+            let path = disk.path.to_str().expect("utf8");
+            let rule = rules
+                .iter()
+                .find(|rule| rule.contains(path))
+                .unwrap_or_else(|| panic!("no rule for {path}"));
+            let expected = if disk.read_only {
+                "access=r"
+            } else {
+                "access=rw"
+            };
+            assert!(
+                rule.ends_with(expected),
+                "{path} is read_only={} but its rule is {rule}",
+                disk.read_only
+            );
         }
     }
 
