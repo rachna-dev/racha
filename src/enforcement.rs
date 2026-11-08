@@ -970,16 +970,49 @@ mod tests {
         );
         assert!(bypassed.contains("bypassed"), "{bypassed}");
         assert!(unknown.contains("unverified"), "{unknown}");
-        // And the ATTEMPT line differs too, not just the label. "tried to X
-        // — and it did not fail" is false when the attempt could not be
-        // made; an earlier version printed it for both and the test passed,
-        // because it only checked the label.
-        assert!(bypassed.contains("tried to"), "{bypassed}");
-        assert!(bypassed.contains("did not fail"), "{bypassed}");
-        assert!(unknown.contains("could not"), "{unknown}");
+
+        // The ATTEMPT line, asserted on the LINE and not on the whole block.
+        //
+        // This is the second vacuity trap in this one test, and a mutation
+        // survivor found it: `contains("could not")` over the whole report
+        // is satisfied by the HEADER — "✗ UNENFORCED — n of m boundaries
+        // could not be verified" — so deleting the `could not` arm from the
+        // frame match changed the finding line and every assertion still
+        // passed. 23 tests green with the mutant applied.
+        //
+        // So each assertion now names the line it is about. `contains` over
+        // a multi-line report is almost always too weak: some other line
+        // says the word.
+        // Selected by INDENTATION, not by content. My first attempt matched
+        // on `contains("could not ")` and picked up the header — "boundaries
+        // could not be verified" — which is the very trap this helper exists
+        // to avoid, one level down. Finding lines are indented; the header
+        // is not, and that is a structural property rather than a wording
+        // one.
+        let attempt_line = |text: &str| -> String {
+            text.lines()
+                .filter(|line| line.starts_with("  "))
+                .find(|line| line.contains("tried to") || line.contains("could not"))
+                .unwrap_or("")
+                .to_owned()
+        };
+        let bypassed_line = attempt_line(&bypassed);
+        let unknown_line = attempt_line(&unknown);
         assert!(
-            !unknown.contains("did not fail"),
-            "an inconclusive check must not claim the bypass succeeded: {unknown}"
+            bypassed_line.contains("tried to") && bypassed_line.contains("did not fail"),
+            "a proven bypass must say what was tried and that it worked: {bypassed_line:?}"
+        );
+        assert!(
+            unknown_line.contains("could not"),
+            "an inconclusive check must say the attempt could not be made: {unknown_line:?}"
+        );
+        assert!(
+            !unknown_line.contains("tried to"),
+            "an inconclusive check must not claim an attempt was made: {unknown_line:?}"
+        );
+        assert!(
+            !unknown_line.contains("did not fail"),
+            "an inconclusive check must not claim the bypass succeeded: {unknown_line:?}"
         );
         assert_ne!(bypassed, unknown);
         // Both are still UNENFORCED: the difference is in the explanation,
