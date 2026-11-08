@@ -340,13 +340,15 @@ fn mount_grants(root: &Object, grants: &mut Vec<Grant>, errors: &mut Vec<ConfigE
             };
             let source = string_field(mount, at, "source", errors);
             let access = match mount.get("access").and_then(|v| v.as_str()) {
-                Some("read-only") => Some(Access::ReadOnly),
-                Some("read-write") => Some(Access::ReadWrite),
+                // Through `Access::parse`, not a match here: these two words
+                // had four separate spellings in this file, which is the
+                // shape that let `ToolKind` drift from the spec.
+                Some(word) if Access::parse(word).is_some() => Access::parse(word),
                 Some(other) => {
                     errors.push(ConfigError::NotOneOf {
                         at: format!("{at}.access"),
                         found: other.to_owned(),
-                        allowed: &["read-only", "read-write"],
+                        allowed: &Access::ALLOWED_WORDS,
                     });
                     None
                 }
@@ -724,7 +726,7 @@ mod tests {
             [ConfigError::NotOneOf {
                 at: "filesystem.mounts[0].access".to_owned(),
                 found: "rw".to_owned(),
-                allowed: &["read-only", "read-write"],
+                allowed: &Access::ALLOWED_WORDS,
             }]
         );
     }
@@ -778,6 +780,49 @@ mod tests {
                 network: false,
             }]
         );
+    }
+
+    #[test]
+    fn every_enumerated_option_accepts_exactly_the_words_the_spec_documents() {
+        // The general version of the `kind = "command"` bug: four options in
+        // `rachna.nix` take a word from a fixed set, and each set exists in
+        // two places — the document and the code. `ToolKind` drifted; these
+        // pin the other three before they do.
+        //
+        // The literals come from `19` §2.1 and §2.2's own comments:
+        //
+        //   tier    = "allowlist";   # open | internet | allowlist | none
+        //   profile = "development"; # sealed | development | online
+        //   access  = "read-write";  # read-only | read-write
+        //   kind    = "lsp";         # lsp | formatter | debugger | command
+        //
+        // Deliberately NOT derived from `Tier::ALL` and friends: a test
+        // driven by the code's own enumeration only checks the code against
+        // itself, which is exactly why the first version of the tool-kind
+        // test passed while the bug was present.
+        let documented: [(&str, &[&str]); 4] = [
+            ("tier", &["open", "internet", "allowlist", "none"]),
+            ("profile", &["sealed", "development", "online"]),
+            ("access", &["read-only", "read-write"]),
+            ("kind", &["lsp", "formatter", "debugger", "command"]),
+        ];
+        for (option, words) in documented {
+            let accepted: Vec<&str> = match option {
+                "tier" => Tier::ALL.iter().map(|t| t.as_str()).collect(),
+                "profile" => Profile::ALL.iter().map(|p| p.as_str()).collect(),
+                "access" => Access::ALL.iter().map(|a| a.as_str()).collect(),
+                "kind" => ToolKind::ALL.iter().map(|k| k.as_str()).collect(),
+                other => panic!("unhandled option `{other}`"),
+            };
+            let mut expected: Vec<&str> = words.to_vec();
+            expected.sort_unstable();
+            let mut actual = accepted;
+            actual.sort_unstable();
+            assert_eq!(
+                actual, expected,
+                "`{option}` accepts {actual:?} but the spec documents {expected:?}"
+            );
+        }
     }
 
     #[test]

@@ -93,6 +93,35 @@ pub enum Access {
 }
 
 impl Access {
+    /// Every level, for exhaustive tests.
+    pub const ALL: [Self; 2] = [Self::ReadOnly, Self::ReadWrite];
+
+    /// The word used in `rachna.nix` and on the CLI.
+    ///
+    /// Added because there was no single definition of these two words:
+    /// `config.rs` spelled them in a parse match, in an error's `allowed`
+    /// list, and in its module docs — four places for two words. That is the
+    /// shape that let `ToolKind` drift from the spec, so the words now live
+    /// beside the type (`AGENTS.md`, "extend the owner").
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::ReadWrite => "read-write",
+        }
+    }
+
+    /// The level a user wrote, or `None`.
+    ///
+    /// Derived from [`Self::ALL`], so a new level is parseable at once.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|access| access.as_str() == word)
+    }
+
+    /// The words a user may write, for an error message.
+    pub const ALLOWED_WORDS: [&'static str; Self::ALL.len()] = ["read-only", "read-write"];
+
     /// Whether a grant at `self` is enough for a request wanting `wanted`.
     ///
     /// `ReadWrite` subsumes `ReadOnly`; the reverse is the
