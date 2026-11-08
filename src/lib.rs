@@ -174,6 +174,7 @@ pub mod lifecycle;
 pub mod policy;
 pub mod summary;
 pub mod synthesize;
+pub mod untrusted;
 
 #[cfg(test)]
 mod json_limits {
@@ -199,5 +200,6 @@ mod json_limits {
 pub mod backend;
 pub mod config;
 pub mod eval;
+pub mod protocol;
 pub mod render;
 pub mod store;
