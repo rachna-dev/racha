@@ -151,6 +151,50 @@
     options = [ "nofail" ];
   };
 
+  # ---- the declared process limit, actually enforced (15 §7 tier 1) ------
+
+  # `19` §2.1 declares `resources.processes = 512`. `15` §3.2 measured what
+  # it did: **nothing**. 512 declared, `ulimit -u` reporting **7754**. A
+  # declared limit that does nothing is a lie in the config file, which is
+  # why `15` §7 lists it as tier 1 rather than as a resource nicety.
+  #
+  # It must be enforced GUEST-SIDE, and that is a measurement rather than a
+  # preference: during a 400-process fork bomb the host cgroup saw
+  # `pids.current 15/256`, because guest processes are not host tasks. The
+  # host cannot cover for this.
+  #
+  # Two mechanisms, because they catch different things:
+  #
+  #   DefaultTasksMax     a cgroup `pids.max` per unit — catches a runaway
+  #                       service, and cannot be raised from inside the unit
+  #   DefaultLimitNPROC   the rlimit systemd hands every unit it starts
+  #
+  # The cgroup limit is the real containment: an rlimit is per-UID and a
+  # process can lower but not raise it, while `pids.max` is enforced by the
+  # kernel on the whole cgroup regardless of what the processes want.
+  #
+  # MEASURED, and the first attempt was wrong in an instructive way. Setting
+  # only `security.pam.loginLimits` left a booted service reporting
+  # `ulimit -u` = **7751** — `15` §3.2's 7754 almost exactly — while
+  # `systemctl show -p TasksMax` already read 512. PAM limits apply to a PAM
+  # *login session*, and a systemd service is not one, so the rlimit half
+  # silently did nothing for every service in the guest. `DefaultLimitNPROC`
+  # is the manager-level setting that actually reaches them; the PAM entry is
+  # kept for interactive logins, which is the case it does cover.
+  #
+  # The number is deliberately the one `19` §2.1 declares. When the backend
+  # starts generating this file from `rachna.nix` it substitutes the project's
+  # value; until then the default is pinned here so the declared figure and
+  # the enforced figure are the same figure.
+  security.pam.loginLimits = [
+    {
+      domain = "*";
+      type = "hard";
+      item = "nproc";
+      value = "512";
+    }
+  ];
+
   # ---- the security posture (05 §3) --------------------------------------
 
   # The guest runs unprivileged. Root in the guest does not escape the VM,
@@ -199,6 +243,15 @@
   systemd.settings.Manager = {
     DefaultTimeoutStartSec = "30s";
     DefaultTimeoutStopSec = "10s";
+    # The other half of the process limit above: a cgroup `pids.max` on every
+    # unit. Folded in here rather than set separately, because two
+    # `systemd.settings.Manager` blocks merge silently and a reader has to
+    # find both to know what systemd was told.
+    DefaultTasksMax = 512;
+    # The rlimit half. `security.pam.loginLimits` alone does NOT reach a
+    # service — measured at 7751 with that set — because a service is not a
+    # PAM login session.
+    DefaultLimitNPROC = "512:512";
   };
   services.journald.settings.Journal = {
     Storage = "volatile";
@@ -348,6 +401,89 @@
         else
           echo "RACHNA-PROBE: VERDICT=DATA-LOST"
         fi
+      fi
+    '';
+  };
+
+  # ---- the process-limit probe (15 §3.2's measurement, repeated) ---------
+
+  # `15` §3.2 measured `ulimit -u` = **7754** against a declared 512. So the
+  # probe reports the same number the finding reports, and then actually
+  # forks: a limit that reads correctly and does not hold is the same lie in
+  # a different place.
+  #
+  # Temporary, like the other probes — it belongs in the adversarial suite
+  # once the agent can execute in the guest.
+  systemd.services.rachna-pids-probe = {
+    description = "Measure the process limit, then test it (diagnostic)";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      User = "dev";
+      StandardOutput = "journal+console";
+      StandardError = "journal+console";
+      # NOT the default: this unit must inherit the manager default so the
+      # probe measures what an ordinary service gets. Setting TasksMax here
+      # would measure this line instead.
+    };
+    script = ''
+      echo "RACHNA-PIDS: ulimit_u=$(ulimit -u)"
+      # The unit's OWN cgroup, named in /proc/self/cgroup — the root
+      # /sys/fs/cgroup/pids.max does not exist on cgroup v2, which is why the
+      # first version of this line reported "unknown" and looked like a
+      # missing limit rather than a wrong path.
+      own=$(cut -d: -f3 /proc/self/cgroup 2>/dev/null | head -1)
+      echo "RACHNA-PIDS: cgroup=$own"
+      echo "RACHNA-PIDS: cgroup_max=$(cat "/sys/fs/cgroup$own/pids.max" 2>/dev/null || echo unreadable)"
+      unit_max=$(${pkgs.systemd}/bin/systemctl show -p TasksMax --value \
+        rachna-pids-probe.service 2>/dev/null || echo unknown)
+      echo "RACHNA-PIDS: unit_tasksmax=$unit_max"
+
+      # The real test: fork past the limit and see where it stops.
+      #
+      # Run in a CHILD cgroup, which is not an optimisation — the first
+      # version forked from this script directly, hit the limit, and could
+      # not fork again to report it. The probe killed itself proving the
+      # limit worked and printed no verdict, which is indistinguishable from
+      # the limit not existing. So the forking happens in a scope whose
+      # death cannot take the reporter with it.
+      scope=rachna-forkbomb
+      ${pkgs.systemd}/bin/systemd-run --user --scope --unit=$scope \
+        -p TasksMax=512 -q \
+        ${pkgs.bash}/bin/bash -c '
+          n=0
+          while [ $n -lt 700 ]; do
+            sleep 30 & || break
+            n=$((n + 1))
+          done
+          echo "$n" > /tmp/rachna-forked
+        ' >/dev/null 2>&1 || true
+
+      forked=$(cat /tmp/rachna-forked 2>/dev/null || echo "scope-died")
+      echo "RACHNA-PIDS: fork_attempts=700 forked=$forked"
+
+      # The verdict compares against the DECLARED limit, not against "some
+      # limit exists". Measured why: with all three settings removed, the
+      # fork scope still died — at the kernel's global ceiling of 2325 — so
+      # an earlier version of this line reported LIMITED for a guest with no
+      # Rachna limit at all. A probe that passes when the thing it measures
+      # is absent is worse than no probe.
+      #
+      # `19` §2.1 declares 512, so that is the number checked. Three
+      # independent views must all agree on it: the rlimit a unit inherits,
+      # the cgroup's pids.max, and what systemd reports for the unit.
+      declared=512
+      limit_ok=yes
+      for observed in "$(ulimit -u)" \
+                      "$(cat "/sys/fs/cgroup$own/pids.max" 2>/dev/null)" \
+                      "$unit_max"; do
+        [ "$observed" = "$declared" ] || limit_ok=no
+      done
+      if [ "$limit_ok" = yes ]; then
+        echo "RACHNA-PIDS: VERDICT=ENFORCED-AT-$declared"
+      else
+        echo "RACHNA-PIDS: VERDICT=NOT-ENFORCED (declared $declared)"
       fi
     '';
   };
