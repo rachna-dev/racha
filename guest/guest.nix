@@ -241,9 +241,48 @@
     '';
   };
 
-  # The data directory must exist on the state volume before Postgres starts,
-  # and the state volume is mounted by then (`nofail` + the fileSystems
-  # dependency), so this is ordering rather than creation-on-demand.
+  # Two things the module does not do for us, both found by measurement.
+  #
+  # 1. ORDERING. The state volume must be mounted before Postgres starts.
+  #
+  # 2. CREATION. `dataDir` must already EXIST, and on a freshly-`mkfs.ext4`
+  #    state volume it does not. The default `/var/lib/postgresql` is created
+  #    for you; a `dataDir` pointed anywhere else is not, and the module ships
+  #    no tmpfiles rule for it — verified by evaluating
+  #    `systemd.tmpfiles.rules`, which mentions neither postgres nor rachna.
+  #
+  #    The failure this produces is *not* "directory missing". The unit sets
+  #    `ProtectSystem = "strict"` with `ReadWritePaths = [ dataDir ]`, so
+  #    systemd tries to build a mount namespace around a path that is not
+  #    there and the unit dies in namespace setup — BEFORE `ExecStartPre`,
+  #    which is the script that would have run `initdb`. Hence a console
+  #    reading "Failed to start PostgreSQL Server" and "Dependency failed for
+  #    PostgreSQL Setup Scripts" with no cause named, and hence four
+  #    identical restart failures: `Restart = "always"` retrying something
+  #    that cannot succeed.
+  #
+  #    So the directory is created by a unit ordered after the mount and
+  #    before Postgres. Not `systemd.tmpfiles.rules`: those run at
+  #    `systemd-tmpfiles-setup`, which is ordered BEFORE local filesystems
+  #    are all mounted, so the rule would land on the tmpfs root and then be
+  #    hidden by the real mount.
+  systemd.services.rachna-postgres-datadir = {
+    description = "Create the Postgres data directory on the state volume";
+    after = [ "var-lib-rachna.mount" ];
+    requires = [ "var-lib-rachna.mount" ];
+    before = [ "postgresql.service" ];
+    requiredBy = [ "postgresql.service" ];
+    unitConfig.DefaultDependencies = false;
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    script = ''
+      install -d -o postgres -g postgres -m 0700 \
+        "${config.services.postgresql.dataDir}"
+    '';
+  };
+
   systemd.services.postgresql = {
     after = [ "var-lib-rachna.mount" ];
     requires = [ "var-lib-rachna.mount" ];
