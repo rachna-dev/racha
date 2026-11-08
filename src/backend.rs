@@ -21,6 +21,8 @@
 //! does it.
 
 use crate::lifecycle::{Action, Refused, State};
+
+pub mod macos;
 use core::fmt;
 
 /// What a backend can actually do.

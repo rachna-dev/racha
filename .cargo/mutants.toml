@@ -30,4 +30,18 @@ additional_cargo_test_args = ["-E", "not binary(eval_sandbox)"]
 # which was documented as benign and then DELETED on review — that one was
 # untested dead code, this one is tested code with a provably equivalent
 # mutant. The distinction is whether a test could exist, not whether one does.
-exclude_re = ["replace > with >= in days_between"]
+
+# The non-macOS stubs cannot be killed from a macOS host.
+#
+# `cargo-mutants` mutates source that `cfg` excludes from the host build, so
+# `binary_has_entitlement`'s `cfg(not(target_os = "macos"))` arm is reported
+# as surviving on a Mac — no macOS test can reach code that is not compiled.
+# Its Linux counterpart IS tested (`off_macos_nothing_is_ever_entitled`), and
+# the Linux CI job kills it there. The platform matrix (01 §4.2) exists for
+# exactly this kind of per-platform behaviour.
+#
+# Excluded by NAME rather than by file, so every other function in the macOS
+# backend stays under mutation.
+
+# Both exclusions, merged — TOML permits one key per table.
+exclude_re = ["replace > with >= in days_between", "replace binary_has_entitlement -> bool with true"]
