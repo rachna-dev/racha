@@ -21,6 +21,8 @@
 use rusqlite::Connection;
 use std::path::Path;
 
+pub mod write;
+
 /// The schema, compiled in.
 ///
 /// Embedded rather than read from disk: a store that could not find its own
@@ -59,7 +61,7 @@ impl From<rusqlite::Error> for StoreError {
 
 /// An open audit store.
 pub struct Store {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 /// Written by hand because `rusqlite::Connection` is not `Debug`, and because
