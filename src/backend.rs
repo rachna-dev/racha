@@ -22,6 +22,7 @@
 
 use crate::lifecycle::{Action, Refused, State};
 
+pub mod linux;
 pub mod macos;
 use core::fmt;
 
