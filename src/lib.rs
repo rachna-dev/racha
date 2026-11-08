@@ -200,6 +200,7 @@ mod json_limits {
     }
 }
 pub mod backend;
+pub mod cli;
 pub mod config;
 pub mod eval;
 pub mod protocol;

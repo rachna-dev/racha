@@ -22,6 +22,14 @@ gate() {
   # target so the fast gate stays fast — and they run in CI and via
   # `gate.sh all`, never silently skipped.
   cargo nextest run --workspace -E 'not binary(eval_sandbox)'
+
+  # Sign on macOS. NOT a packaging step: 02 §4 measured that without the
+  # virtualization entitlement, VZVirtualMachine.init THROWS rather than
+  # returning an error, so an unsigned binary crashes on first use. A no-op
+  # elsewhere, so the gate calls it unconditionally.
+  step "sign (macOS)"
+  cargo build --quiet
+  ./ci/sign-macos.sh target/debug/rachna
 }
 
 # Real `nix eval` against real attacks. Slow and worth it: the unit tests

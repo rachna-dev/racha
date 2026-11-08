@@ -273,14 +273,19 @@ fn nearest_option(typo: &str) -> Option<&'static str> {
     // word, and a fixed cap alone accepts 3 edits on a 4-letter word.
     KNOWN
         .iter()
-        .map(|known| (*known, distance(typo, known)))
+        .map(|known| (*known, edit_distance(typo, known)))
         .filter(|(known, d)| *d <= 3 && *d * 3 <= typo.len().max(known.len()))
         .min_by_key(|(_, d)| *d)
         .map(|(known, _)| known)
 }
 
 /// Levenshtein distance.
-fn distance(a: &str, b: &str) -> usize {
+///
+/// `pub(crate)` because the CLI needs the same nearest-match cutoff for
+/// subcommands, and a second implementation would be a place the two could
+/// disagree about what counts as a near miss (`AGENTS.md`, "extend the
+/// owner").
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut previous: Vec<usize> = (0..=b.len()).collect();
@@ -599,16 +604,19 @@ mod tests {
 
     #[test]
     fn the_distance_function_is_a_metric_on_the_cases_that_matter() {
-        assert_eq!(distance("", ""), 0);
-        assert_eq!(distance("tier", "tier"), 0);
-        assert_eq!(distance("", "tier"), 4);
-        assert_eq!(distance("tier", ""), 4);
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("tier", "tier"), 0);
+        assert_eq!(edit_distance("", "tier"), 4);
+        assert_eq!(edit_distance("tier", ""), 4);
         // One of each edit kind.
-        assert_eq!(distance("tier", "tiers"), 1, "insertion");
-        assert_eq!(distance("tiers", "tier"), 1, "deletion");
-        assert_eq!(distance("tier", "tien"), 1, "substitution");
+        assert_eq!(edit_distance("tier", "tiers"), 1, "insertion");
+        assert_eq!(edit_distance("tiers", "tier"), 1, "deletion");
+        assert_eq!(edit_distance("tier", "tien"), 1, "substitution");
         // Symmetric.
-        assert_eq!(distance("netwrk", "network"), distance("network", "netwrk"));
+        assert_eq!(
+            edit_distance("netwrk", "network"),
+            edit_distance("network", "netwrk")
+        );
     }
 
     // ---- batching ---------------------------------------------------------
