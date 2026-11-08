@@ -104,11 +104,56 @@ impl Reload {
     ///
     /// The invariant step 9 exists to prove: `false` for every rejection, and
     /// for an accepted change that turns out to be a no-op.
+    ///
+    /// **Does not consider acknowledgement.** A widening change *should*
+    /// change the environment — once approved. [`Self::may_apply_now`] is the
+    /// gate; this reports whether there is anything to apply at all.
     #[must_use]
     pub const fn changes_anything(&self) -> bool {
         match self {
             Self::Accepted { disruption, .. } => !matches!(disruption, Disruption::None),
             // A broken config provably cannot disturb a running env.
+            Self::Rejected { .. } => false,
+        }
+    }
+
+    /// Whether this change may be applied **without asking first**.
+    ///
+    /// The gate that makes a guest-writable `rachna.nix` safe, and the reason
+    /// it is a separate method rather than a tightening of
+    /// [`Self::changes_anything`]: "is there work to do" and "may I do it
+    /// yet" are different questions, and merging them would make an
+    /// unapproved change indistinguishable from a no-op.
+    ///
+    /// # Why this exists
+    ///
+    /// `needs_acknowledgement` was a field **nothing read**. It was computed
+    /// correctly and tested, and `changes_anything()` returned `true` for a
+    /// widening change regardless — so a reload would have proceeded
+    /// unapproved. A flag with no gate is the "declared and never enforced"
+    /// defect `01` §3b forbids, and it was sitting in the one place that
+    /// decides whether a policy change takes effect.
+    ///
+    /// # What this enables
+    ///
+    /// `00` §3.11 excludes `rachna.nix` from the workspace mount because the
+    /// guest could otherwise append a grant and §3.5's hot reload would apply
+    /// it *"immediately and silently"*. **The write was never the privilege —
+    /// the silent reload was.** With this gate, a change that widens access
+    /// is inert until a human approves it, so a guest that edits the file has
+    /// written a *proposal* rather than granted itself anything.
+    ///
+    /// A narrowing change applies immediately: nothing new is granted, and
+    /// requiring approval to tighten a policy would train people to approve
+    /// reflexively — `00` §3.10c's own warning about acknowledgement becoming
+    /// noise.
+    #[must_use]
+    pub const fn may_apply_now(&self) -> bool {
+        match self {
+            Self::Accepted {
+                needs_acknowledgement,
+                ..
+            } => !*needs_acknowledgement,
             Self::Rejected { .. } => false,
         }
     }
@@ -596,6 +641,85 @@ mod tests {
                 ..
             } => assert!(needs_acknowledgement, "opening the network went unreviewed"),
             Reload::Rejected { .. } => panic!("rejected"),
+        }
+    }
+
+    // ---- the approval gate (what makes a guest-writable file safe) -------
+
+    #[test]
+    fn a_widening_change_may_not_apply_until_approved() {
+        // THE gate. `00` §3.11 excludes rachna.nix from the mount because a
+        // guest could append a grant and §3.5's hot reload would apply it
+        // "immediately and silently". The write was never the privilege —
+        // the SILENT RELOAD was. This is what makes the difference.
+        //
+        // First assert the thing under attack exists: there IS a change to
+        // apply, so `may_apply_now` returning false means "not yet" rather
+        // than "nothing to do".
+        let mut wider = policy(vec![]);
+        wider.tier = Tier::Open;
+        let reload = classify(&policy(vec![]), &wider);
+        assert!(
+            reload.changes_anything(),
+            "fixture produced no change, so the gate below proves nothing"
+        );
+        assert!(
+            !reload.may_apply_now(),
+            "opening the network applied without approval"
+        );
+    }
+
+    #[test]
+    fn a_narrowing_change_applies_without_asking() {
+        // The other half, and not a formality: requiring approval to TIGHTEN
+        // a policy would train people to approve reflexively, which is
+        // `00` §3.10c's own warning about acknowledgement becoming noise.
+        let mut open = policy(vec![]);
+        open.tier = Tier::Open;
+        let reload = classify(&open, &policy(vec![]));
+        assert!(reload.changes_anything(), "sealing must be a change");
+        assert!(
+            reload.may_apply_now(),
+            "tightening a policy should not need approval"
+        );
+    }
+
+    #[test]
+    fn a_broken_config_may_never_apply() {
+        // Belt to `changes_anything`'s braces: a rejection must fail BOTH
+        // questions, so neither path can let a broken config through.
+        // Real errors from a real parse, matching the pattern the existing
+        // rejection test uses — a hand-built error set could drift from what
+        // the parser actually produces.
+        let errors =
+            config::parse(r#"{ "tier": "nope" }"#, Capabilities::all()).expect_err("invalid");
+        let reload = reject(errors);
+        assert!(!reload.changes_anything());
+        assert!(!reload.may_apply_now());
+    }
+
+    #[test]
+    fn the_gate_tracks_acknowledgement_rather_than_disruption() {
+        // These are different axes and must not be conflated. A change can
+        // be disruptive without widening (swapping a package rebuilds the
+        // guest and grants nothing), and widening without being disruptive
+        // (adding a network host is a live change). Asserting the pairing
+        // keeps a future refactor from deriving one from the other.
+        for (before, after) in [
+            // Widening, applied live: needs approval anyway.
+            (policy(vec![]), policy(vec![network("new.test")])),
+            // Widening the axis: needs approval.
+            (policy(vec![]), {
+                let mut wider = policy(vec![]);
+                wider.tier = Tier::Open;
+                wider
+            }),
+        ] {
+            let reload = classify(&before, &after);
+            assert!(
+                !reload.may_apply_now(),
+                "a widening change applied unapproved: {reload:?}"
+            );
         }
     }
 
