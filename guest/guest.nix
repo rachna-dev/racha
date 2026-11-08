@@ -249,6 +249,36 @@
     requires = [ "var-lib-rachna.mount" ];
   };
 
+  # Report why a service failed, on the console, where the harness can read
+  # it. Without this a failure is "[FAILED] Failed to start PostgreSQL
+  # Server. See 'systemctl status' for details" — and there is no way to run
+  # systemctl, because the root account is locked and the agent does not
+  # exist yet (build order step 8 built the transport; nothing drives it).
+  #
+  # Temporary: it belongs in the agent once that lands. Recorded as such so
+  # it is removed rather than inherited.
+  systemd.services.rachna-report-failures = {
+    description = "Report failed units on the console (diagnostic)";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      StandardOutput = "journal+console";
+      StandardError = "journal+console";
+    };
+    script = ''
+      echo "RACHNA-DIAG: failed units:"
+      ${pkgs.systemd}/bin/systemctl --failed --no-legend --plain || true
+      for unit in postgresql.service; do
+        echo "RACHNA-DIAG: $unit ----"
+        ${pkgs.systemd}/bin/systemctl status "$unit" --no-pager -l -n 30 2>&1 \
+          | head -40 || true
+      done
+      echo "RACHNA-DIAG: state volume:"
+      ls -lan /var/lib/rachna 2>&1 | head -5 || true
+    '';
+  };
+
   # The toolchain a development environment needs. Everything else arrives on
   # the project's closure disk (`00` §7 Layer C), so this stays small.
   environment.systemPackages = with pkgs; [
