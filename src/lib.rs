@@ -206,4 +206,5 @@ pub mod eval;
 pub mod protocol;
 pub mod reload;
 pub mod render;
+pub mod snapshot;
 pub mod store;
