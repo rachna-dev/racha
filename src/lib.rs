@@ -198,3 +198,4 @@ mod json_limits {
 pub mod config;
 pub mod eval;
 pub mod render;
+pub mod store;
