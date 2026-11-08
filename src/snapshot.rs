@@ -261,9 +261,120 @@ pub struct Metadata {
     /// When populated, [`Metadata::check_restorable`] verifies completeness
     /// first (`24` §6).
     pub present_files: Vec<String>,
+    /// The effective grant set the guest was running under when saved.
+    ///
+    /// [`AccessSummary::fingerprint`](crate::summary::AccessSummary::fingerprint),
+    /// so it is comment- and order-insensitive exactly as `00` §3.10c
+    /// requires of the approval record it is compared against.
+    ///
+    /// # Why a snapshot must carry this
+    ///
+    /// **Resume had no policy gate at all.** `lifecycle.rs` went
+    /// `Suspended → Resuming → Running` without consulting a policy, and
+    /// nothing recorded what the snapshot had been permitted — so a guest
+    /// suspended under one grant set resumed under it unchecked, however
+    /// long ago and whatever `rachna.nix` says now.
+    ///
+    /// That is not an attack, which is what makes it worse: `git pull`,
+    /// `rachna resume`, and yesterday's permissions are live again with no
+    /// summary, which is precisely the gap `00` §3.10c was written to close
+    /// for `start` and never covered for `resume`.
+    ///
+    /// Empty means "not recorded" — a snapshot from a build before this
+    /// field existed. Treated as *needing approval* rather than as matching,
+    /// because the safe direction for an unknown grant set is to ask.
+    pub grant_fingerprint: String,
+}
+
+/// Whether a resume may proceed without asking the user first.
+///
+/// **Deliberately not an [`Incompatible`] variant**, and the distinction is
+/// the whole design: a changed grant set does not make a snapshot
+/// *unrestorable*. The memory image is fine, the devices match, the guest
+/// would come back perfectly — the question is whether it *should*, under
+/// permissions nobody has reviewed. Folding this into `Incompatible` would
+/// make "your policy changed" read as "your snapshot is broken" and send the
+/// user to delete it.
+///
+/// # Why resume needs this at all
+///
+/// `00` §3.10c gates `start` on a first-run summary, and nothing gated
+/// `resume`. `lifecycle.rs` went `Suspended → Resuming → Running` without
+/// consulting a policy, and [`Metadata`] did not record what the snapshot had
+/// been permitted. So: `git pull`, `rachna resume`, and yesterday's
+/// permissions are live again with no summary. Not an attack — which is what
+/// makes it worse than the forged-approval case `08` §3.4a describes, because
+/// it needs nobody to do anything wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeApproval {
+    /// The grant set is unchanged and already approved. Resume silently.
+    Unchanged,
+    /// The grant set differs from the snapshot's, or was never approved.
+    ///
+    /// Carries both fingerprints so a caller can render the diff rather than
+    /// only announce that something changed — `00` §3.3's rule applies here
+    /// as everywhere: a user told "permissions changed" cannot act.
+    NeedsApproval {
+        /// What the snapshot was running under.
+        taken_with: String,
+        /// What `rachna.nix` says now.
+        running: String,
+    },
+    /// The snapshot predates grant recording, so nothing can be compared.
+    ///
+    /// Its own variant rather than folded into `NeedsApproval`, because the
+    /// honest message differs: there is no diff to show, and the reason is
+    /// our own format change rather than anything the user did.
+    Unrecorded,
+}
+
+impl ResumeApproval {
+    /// Whether the resume may proceed without asking.
+    ///
+    /// An explicit match, so adding a variant is a compile error here rather
+    /// than silently counting as permitted.
+    #[must_use]
+    pub const fn may_resume_silently(&self) -> bool {
+        match *self {
+            Self::Unchanged => true,
+            Self::NeedsApproval { .. } | Self::Unrecorded => false,
+        }
+    }
 }
 
 impl Metadata {
+    /// Whether resuming this snapshot needs the user to approve first.
+    ///
+    /// Separate from [`Self::check_restorable`] because the two answer
+    /// different questions and a caller needs both: *can* this restore, and
+    /// *may* it. A snapshot can be perfectly restorable and still carry
+    /// permissions nobody has reviewed.
+    ///
+    /// `approved` is the store's answer for the *current* grant set
+    /// (`store::approval`), supplied rather than looked up here so this stays
+    /// pure and so there is one approval authority.
+    #[must_use]
+    pub fn check_resume_approval(
+        &self,
+        running_fingerprint: &str,
+        approved: bool,
+    ) -> ResumeApproval {
+        if self.grant_fingerprint.is_empty() {
+            return ResumeApproval::Unrecorded;
+        }
+        // Both conditions, and both are necessary. An unchanged grant set
+        // that was never approved must still ask — otherwise suspending
+        // before approving and resuming afterwards would launder an
+        // unapproved policy through the snapshot.
+        if self.grant_fingerprint == running_fingerprint && approved {
+            return ResumeApproval::Unchanged;
+        }
+        ResumeApproval::NeedsApproval {
+            taken_with: self.grant_fingerprint.clone(),
+            running: running_fingerprint.to_owned(),
+        }
+    }
+
     /// Whether this snapshot can be restored into `running`.
     ///
     /// # Errors
@@ -499,7 +610,112 @@ mod tests {
             machine_id: "machine-a".to_owned(),
             devices: shape(),
             present_files: REQUIRED_FILES.iter().map(|f| (*f).to_owned()).collect(),
+            grant_fingerprint: "tier=allowlist\nprofile=development\n".to_owned(),
         }
+    }
+
+    // ---- resume must not restore unreviewed permissions ------------------
+
+    const FINGERPRINT: &str = "tier=allowlist\nprofile=development\n";
+
+    #[test]
+    fn an_unchanged_and_approved_grant_set_resumes_silently() {
+        // The common case, and it must stay silent: a prompt on every resume
+        // is the noise `00` §3.10c warns teaches people to bypass the gate.
+        let snapshot = metadata();
+        let verdict = snapshot.check_resume_approval(FINGERPRINT, true);
+        assert_eq!(verdict, ResumeApproval::Unchanged);
+        assert!(verdict.may_resume_silently());
+    }
+
+    #[test]
+    fn a_changed_grant_set_needs_approval_and_names_both_sides() {
+        // THE gap this closes. `lifecycle.rs` went Suspended -> Resuming ->
+        // Running with no policy consulted, and `Metadata` recorded no grant
+        // set — so `git pull`, `rachna resume`, and yesterday's permissions
+        // were live again with no summary.
+        let snapshot = metadata();
+        let widened = "tier=open\nprofile=development\n";
+        let verdict = snapshot.check_resume_approval(widened, true);
+        assert!(!verdict.may_resume_silently());
+        let ResumeApproval::NeedsApproval {
+            taken_with,
+            running,
+        } = &verdict
+        else {
+            panic!("a changed grant set resumed unreviewed: {verdict:?}")
+        };
+        // BOTH sides, so a caller can render the diff rather than only
+        // announce that something changed (`00` §3.3).
+        assert_eq!(taken_with, FINGERPRINT);
+        assert_eq!(running, widened);
+    }
+
+    #[test]
+    fn an_unapproved_grant_set_cannot_be_laundered_through_a_snapshot() {
+        // The subtle one, and the reason the check needs BOTH conditions.
+        // Suspend while a grant set is still unapproved, then resume: the
+        // fingerprints match, so a comparison alone would say "unchanged"
+        // and wave through a policy no human ever reviewed.
+        let snapshot = metadata();
+        let verdict = snapshot.check_resume_approval(FINGERPRINT, false);
+        assert!(
+            !verdict.may_resume_silently(),
+            "an unapproved policy was laundered through a suspend/resume cycle"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_with_no_recorded_grant_set_asks_rather_than_assumes() {
+        // A snapshot from a build before this field existed. "Not recorded"
+        // must mean ASK, not match: the safe direction for an unknown grant
+        // set is the summary, and the message differs from a changed-policy
+        // one because there is no diff to show.
+        let mut old = metadata();
+        old.grant_fingerprint = String::new();
+        let verdict = old.check_resume_approval(FINGERPRINT, true);
+        assert_eq!(verdict, ResumeApproval::Unrecorded);
+        assert!(!verdict.may_resume_silently());
+    }
+
+    #[test]
+    fn a_changed_policy_is_not_reported_as_a_broken_snapshot() {
+        // The distinction that keeps a user from deleting a perfectly good
+        // snapshot. A changed grant set must leave `check_restorable`
+        // untouched — the memory image is fine, the devices match, and only
+        // the permissions need review.
+        let mut snapshot = metadata();
+        snapshot.grant_fingerprint = "tier=none\nprofile=sealed\n".to_owned();
+        assert_eq!(
+            snapshot.check_restorable(&metadata(), Capabilities::all()),
+            Ok(()),
+            "a policy change was reported as an incompatible snapshot"
+        );
+        // And the resume check still catches it, so this is a separation of
+        // concerns rather than a hole.
+        assert!(!snapshot
+            .check_resume_approval(FINGERPRINT, true)
+            .may_resume_silently());
+    }
+
+    #[test]
+    fn narrowing_the_policy_also_asks() {
+        // Deliberate, and a departure from `reload.rs`, which applies a
+        // narrowing change immediately. The difference is what the user is
+        // about to get: a *reload* under a tighter policy gives them less
+        // than they had, which needs no review — but a *resume* hands back a
+        // guest whose live processes were started under the WIDER set. Those
+        // processes already hold whatever they opened. So the honest question
+        // on resume is "do you want this guest back", not "is the new policy
+        // narrower", and the answer is not derivable from the diff direction.
+        let snapshot = metadata();
+        let narrowed = "tier=none\nprofile=sealed\n";
+        assert!(
+            !snapshot
+                .check_resume_approval(narrowed, true)
+                .may_resume_silently(),
+            "a resume under a different policy went unreviewed"
+        );
     }
 
     // ---- the happy path --------------------------------------------------
