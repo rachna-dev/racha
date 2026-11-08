@@ -80,6 +80,38 @@ pub enum Command {
     Help,
 }
 
+impl Command {
+    /// The verb a user typed to get here.
+    ///
+    /// Lives on the type rather than in `main.rs`, which is where it started.
+    /// Mutation testing is why it moved: `main` is not tested without a
+    /// process, so the only caller could not observe the return value and
+    /// every mutant replacing it with a constant survived. Here the
+    /// round-trip against [`Invocation::from_argv`] kills them — the same
+    /// shape as [`ConfigAction::as_str`], and the same conclusion as the
+    /// wrappers deleted for being indistinguishable from constants.
+    #[must_use]
+    pub const fn verb(&self) -> &'static str {
+        match self {
+            Self::Init { .. } => "init",
+            Self::Start { .. } => "start",
+            Self::Stop => "stop",
+            Self::Status => "status",
+            Self::Doctor => "doctor",
+            Self::Config { action } => match action {
+                ConfigAction::Inspect => "config inspect",
+                ConfigAction::Diff => "config diff",
+                ConfigAction::Validate => "config validate",
+            },
+            Self::Audit { .. } => "audit",
+            Self::Explain { .. } => "explain",
+            Self::Allow { .. } => "allow",
+            Self::Version => "--version",
+            Self::Help => "--help",
+        }
+    }
+}
+
 /// What `rachna config` was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigAction {
@@ -470,6 +502,60 @@ fn nearest_command(given: &str) -> Option<&'static str> {
         .map(|(known, _)| known)
 }
 
+/// The hand-written help text.
+///
+/// `17` §1 accepted "no generated help" as the cost of `lexopt`, and `21`
+/// §2.4 recorded the gap. The mitigation it named is a test asserting every
+/// parsed verb appears here.
+///
+/// That mitigation did not exist. This function lived in `main.rs`, which no
+/// test runs — so the claim "cheap to keep correct because a test asserts
+/// every parsed verb appears here" described a test that had never been
+/// written, and a verb could have been added to the parser and omitted from
+/// help with nothing to catch it. Found while moving [`Command::verb`] for
+/// the same reason (AGENTS.md, "Unfalsifiable code"): `main.rs` is untested
+/// by design, so nothing with observable behaviour belongs in it.
+#[must_use]
+pub fn help() -> String {
+    format!(
+        "\
+rachna {version} — a declarative, isolated development environment
+
+USAGE
+  rachna <command> [options]
+
+ENVIRONMENT
+  init [--template <url>]   write a starting rachna.nix
+  start [--accept]          start or resume; --accept acknowledges the
+                            first-run access summary
+  stop                      stop the environment
+  status                    what is running, and what it is allowed
+  doctor                    check this host, and verify enforcement
+
+CONFIG
+  config inspect            the effective config, with defaults visible
+  config diff               live runtime versus the file
+  config validate           check without applying
+  allow <category> <target>...
+                            add a grant. category is one of:
+                            network, fs, port, secret, tool
+                            fs takes --read-only or --read-write
+
+AUDIT
+  audit [--narrow] [--ci]   find unused and over-broad grants
+  explain <run-id>          every decision in one run
+
+  --version                 print the version
+  --help                    this text
+
+rachna.nix is the only authority. Every command above that changes
+permissions edits that file; nothing grants anything that is not written
+down.
+",
+        version = crate::version()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,6 +657,176 @@ mod tests {
     }
 
     // ---- the verbs --------------------------------------------------------
+
+    // ---- help: the mitigation 17 §1 promised -----------------------------
+
+    #[test]
+    fn every_verb_the_parser_accepts_appears_in_help() {
+        // THE test `17` §1 named as the price of hand-written help, and which
+        // did not exist until now — `help()` lived in `main.rs`, where no test
+        // could call it, while its own doc comment claimed this test did.
+        //
+        // First: assert the thing under attack exists, per AGENTS.md. A
+        // `help()` returning "" would make every `contains` below vacuous.
+        let text = help();
+        assert!(
+            text.contains("USAGE"),
+            "help does not look like help: {text}"
+        );
+        assert!(text.len() > 400, "help is suspiciously short");
+
+        // Every verb, via the SAME `verb()` the error messages use, so adding
+        // a command to the parser and forgetting help is a test failure.
+        for command in [
+            Command::Init { template: None },
+            Command::Start { accept: false },
+            Command::Stop,
+            Command::Status,
+            Command::Doctor,
+            Command::Audit {
+                narrow: false,
+                ci: false,
+            },
+            Command::Explain {
+                run_id: "r".to_owned(),
+            },
+            Command::Allow {
+                category: "c".to_owned(),
+                targets: vec![],
+                read_only: false,
+                read_write: false,
+            },
+            Command::Version,
+            Command::Help,
+        ] {
+            let verb = command.verb();
+            assert!(
+                text.contains(verb),
+                "`{verb}` parses but is undocumented in help"
+            );
+        }
+
+        // `config` is listed with its three actions rather than bare, so it
+        // is checked through the actions the parser accepts.
+        for action in ConfigAction::ALL {
+            let phrase = format!("config {}", action.as_str());
+            assert!(
+                text.contains(&phrase),
+                "`{phrase}` parses but is undocumented in help"
+            );
+        }
+
+        // And the flags that change behaviour, which are as easy to forget as
+        // a verb and more confusing to omit.
+        for flag in ["--template", "--accept", "--narrow", "--ci", "--read-only"] {
+            assert!(
+                text.contains(flag),
+                "`{flag}` is accepted but undocumented in help"
+            );
+        }
+    }
+
+    #[test]
+    fn help_states_where_authority_lives() {
+        // `00` §3.1: rachna.nix is the only authority. The help text is where
+        // most users meet that claim, so it is pinned rather than left to
+        // drift — this is a product promise, not prose.
+        let text = help();
+        assert!(text.contains("rachna.nix is the only authority"), "{text}");
+        assert!(text.contains("nothing grants anything"), "{text}");
+    }
+
+    #[test]
+    fn a_verb_name_round_trips_through_the_parser() {
+        // First: assert the thing under attack EXISTS, per AGENTS.md — a
+        // `verb()` that returned nothing useful would make the rest vacuous.
+        assert_eq!(Command::Stop.verb(), "stop");
+
+        // Every command's `verb()`, typed back in, must parse to a command
+        // reporting that same verb. This is the property `main.rs` could not
+        // test: `verb()` lived there with one caller inside an untested
+        // `main`, so nothing observed its result and every mutant replacing
+        // it with a constant survived. A constant cannot satisfy TWELVE
+        // distinct round-trips.
+        let commands = [
+            Command::Init { template: None },
+            Command::Start { accept: false },
+            Command::Stop,
+            Command::Status,
+            Command::Doctor,
+            Command::Config {
+                action: ConfigAction::Inspect,
+            },
+            Command::Config {
+                action: ConfigAction::Diff,
+            },
+            Command::Config {
+                action: ConfigAction::Validate,
+            },
+            Command::Version,
+            Command::Help,
+        ];
+        for original in commands {
+            let verb = original.verb();
+            // `config inspect` is two words, and a verb has to be typeable.
+            let typed: Vec<&str> = core::iter::once("rachna").chain(verb.split(' ')).collect();
+            let reparsed = command(&typed);
+            assert_eq!(
+                reparsed.verb(),
+                verb,
+                "`{verb}` did not round-trip: parsed back as {reparsed:?}"
+            );
+        }
+
+        // The two verbs that need an argument, checked separately because
+        // they cannot round-trip from the verb alone.
+        assert_eq!(command(&["rachna", "explain", "run/x"]).verb(), "explain");
+        assert_eq!(
+            command(&["rachna", "allow", "network", "crates.io"]).verb(),
+            "allow"
+        );
+
+        // And no two commands share a name, which is what makes the verb
+        // usable in a message at all.
+        let mut names: Vec<&str> = [
+            Command::Init { template: None },
+            Command::Start { accept: false },
+            Command::Stop,
+            Command::Status,
+            Command::Doctor,
+            Command::Config {
+                action: ConfigAction::Inspect,
+            },
+            Command::Config {
+                action: ConfigAction::Diff,
+            },
+            Command::Config {
+                action: ConfigAction::Validate,
+            },
+            Command::Audit {
+                narrow: false,
+                ci: false,
+            },
+            Command::Explain {
+                run_id: "r".to_owned(),
+            },
+            Command::Allow {
+                category: "c".to_owned(),
+                targets: vec![],
+                read_only: false,
+                read_write: false,
+            },
+            Command::Version,
+            Command::Help,
+        ]
+        .iter()
+        .map(Command::verb)
+        .collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "two commands report the same verb");
+    }
 
     #[test]
     fn every_verb_parses() {
