@@ -168,6 +168,7 @@ mod tests {
 
 pub mod decide;
 pub mod decision;
+pub mod denial;
 pub mod exclusion;
 pub mod grant;
 pub mod lifecycle;
