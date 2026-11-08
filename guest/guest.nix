@@ -228,12 +228,13 @@
     enable = true;
     dataDir = "/var/lib/rachna/postgresql/${config.services.postgresql.package.psqlSchema}";
     package = pkgs.postgresql_16;
-    settings = {
-      listen_addresses = "127.0.0.1";
-      # The host enforces network policy; the guest firewall is off
-      # (`00` §3.9), so binding loopback keeps this guest-local.
-      port = 5432;
-    };
+    # `listen_addresses` is left at the module's default of `localhost`,
+    # which is already what we want: the host enforces network policy
+    # (`00` §3.9) and the guest firewall is off, so a guest-local bind is the
+    # correct posture. Overriding it to `127.0.0.1` was a redundant
+    # definition that failed evaluation outright — the module system catching
+    # a change that said nothing.
+    settings.port = 5432;
     authentication = lib.mkForce ''
       local all all trust
       host all all 127.0.0.1/32 trust
