@@ -147,6 +147,17 @@ mod tests {
     }
 
     #[test]
+    fn only_an_approved_set_permits_applying() {
+        // The whole decision, stated once against the type rather than
+        // inferred from store round-trips. Written as a table over every
+        // variant so adding one without deciding its answer is a visible
+        // omission here rather than a silent `false`.
+        assert!(Approval::Approved.permits_apply());
+        assert!(!Approval::Pending.permits_apply());
+        assert!(!Approval::Unseen.permits_apply());
+    }
+
+    #[test]
     fn an_unseen_grant_set_is_not_approved() {
         // The default must be "ask", not "allow". A store that answered
         // `Approved` for a set it had never seen would make the whole gate
@@ -168,6 +179,16 @@ mod tests {
         assert_eq!(
             store.approval_of(&approved).expect("read"),
             Approval::Approved
+        );
+        // And it PERMITS. A mutation survivor found this missing: every
+        // `permits_apply` assertion in this module was negative, so
+        // `permits_apply -> false` was indistinguishable from the real
+        // thing. A gate that always refuses looks safe and blocks every
+        // approved start — the failure mode a user reports as "rachna will
+        // not start", with nothing in the output to explain it.
+        assert!(
+            store.approval_of(&approved).expect("read").permits_apply(),
+            "an approved grant set did not permit a start"
         );
         // The other set is NOT approved by association — the thing a
         // fingerprint keyed on the file's bytes would have got wrong if two
