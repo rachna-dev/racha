@@ -55,27 +55,56 @@
           kernel = guest.config.boot.kernelPackages.kernel;
         in
         {
-          boot-bundle = pkgs.runCommand "rachna-boot-bundle" { } ''
-            mkdir -p $out
+          boot-bundle =
+            pkgs.runCommand "rachna-boot-bundle"
+              {
+                nativeBuildInputs = with pkgs; [
+                  bash
+                  gzip
+                  xz
+                  bzip2
+                  lz4
+                  zstd
+                ];
+              }
+              ''
+                mkdir -p $out
 
-            # Cloud Hypervisor needs a PVH ELF image, and nixpkgs ships only
-            # a bzImage. The kernel's own script does the extraction; doing it
-            # here means a caller never has to know (§4.4).
-            ${pkgs.bash}/bin/bash ${kernel.dev}/lib/modules/${kernel.modDirVersion}/source/scripts/extract-vmlinux \
-              ${kernel}/${pkgs.stdenv.hostPlatform.linux-kernel.target} \
-              > $out/vmlinux || cp ${kernel}/vmlinux $out/vmlinux
+                # Cloud Hypervisor needs a PVH-capable ELF image, and nixpkgs
+                # ships ONLY a bzImage — verified on this nixpkgs rev: the kernel
+                # output contains exactly `System.map` and `bzImage`, no
+                # `vmlinux`. So extraction is required, not optional (§4.4).
+                #
+                # `scripts/extract-vmlinux` needs the decompressors on PATH: a
+                # bzImage is a self-extracting wrapper around a compressed
+                # vmlinux, and the script tries each format in turn. Without them
+                # it silently finds nothing.
+                bash ${kernel.dev}/lib/modules/${kernel.modDirVersion}/source/scripts/extract-vmlinux \
+                  ${kernel}/bzImage > $out/vmlinux
 
-            cp ${guest.config.system.build.initialRamdisk}/initrd $out/initrd
-            cp ${guest.config.system.build.toplevel}/init $out/init 2>/dev/null || true
-            ln -s ${guest.config.system.build.toplevel} $out/system
+                # Verified rather than assumed: the script exits 0 having written
+                # nothing when no decompressor matches, and a 0-byte vmlinux is
+                # the silent failure 05 §4.4 warns about. An ELF starts \x7fELF.
+                if [ ! -s $out/vmlinux ]; then
+                  echo "extract-vmlinux produced an empty image" >&2
+                  exit 1
+                fi
+                if [ "$(head -c 4 $out/vmlinux | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]; then
+                  echo "extracted image is not an ELF — CH needs PVH ELF" >&2
+                  exit 1
+                fi
 
-            # The cmdline, written here so the backend does not reconstruct
-            # it. `console=ttyS0` is §4.3's measured requirement: the hvc0
-            # variant produces zero output AND zero errors.
-            cat > $out/cmdline <<EOF
-            init=${guest.config.system.build.toplevel}/init console=ttyS0 8250.nr_uarts=1 panic=1 nomodeset loglevel=4
-            EOF
-          '';
+                cp ${guest.config.system.build.initialRamdisk}/initrd $out/initrd
+                cp ${guest.config.system.build.toplevel}/init $out/init 2>/dev/null || true
+                ln -s ${guest.config.system.build.toplevel} $out/system
+
+                # The cmdline, written here so the backend does not reconstruct
+                # it. `console=ttyS0` is §4.3's measured requirement: the hvc0
+                # variant produces zero output AND zero errors.
+                cat > $out/cmdline <<EOF
+                init=${guest.config.system.build.toplevel}/init console=ttyS0 8250.nr_uarts=1 panic=1 nomodeset loglevel=4
+                EOF
+              '';
 
           default = self.packages.${system}.boot-bundle;
         }
