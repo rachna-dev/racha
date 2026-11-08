@@ -49,6 +49,15 @@ serde_json = { version = "1.0.154", features = ["raw_value"] }
 # The comparison lives in design-docs/17-DEPENDENCIES.md; each dependency is
 # added in the commit that first uses it.
 
+# macOS only: Virtualization.framework is an Objective-C API, and a Linux
+# build must not pull an Apple binding it can never use. The whole lifecycle
+# surface is SAFE Rust, which is why this is a crate rather than a shim —
+# `Cargo.toml` denies unsafe_code, and a binding needing unsafe per call
+# would mean weakening that in the most security-sensitive module
+# (design-docs/17-DEPENDENCIES.md, "macOS VZ binding").
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-virtualization = "0.3.2"
+
 [dev-dependencies]
 proptest = { version = "1.12.0", default-features = false, features = ["std", "bit-set"] }
 # Also pending the comparison — property testing lands with the path
