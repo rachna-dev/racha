@@ -95,35 +95,23 @@ impl Check {
 
     /// What this check attempts, phrased as the bypass it tries.
     ///
-    /// Used in `doctor` output: a user reading "attempted to reach
-    /// 1.1.1.1:443 from the guest" can tell what was actually tested, where
-    /// "network check" tells them nothing and cannot be audited.
+    /// Short enough for one terminal line in a `status` block. A user reading
+    /// "tried to reach an address no policy allows" can tell what was
+    /// actually tested, where "network check" tells them nothing and cannot
+    /// be audited.
+    ///
+    /// Measured rather than guessed: the first version of these ran to ~115
+    /// characters and wrapped in the middle of a sentence, which a test
+    /// asserting only `contains("require")` happily passed. Printing the
+    /// block is what found it.
     #[must_use]
     pub const fn attempts(self) -> &'static str {
         match self {
-            Self::GuestConfinement => {
-                "read the hypervisor process's own confinement, and require it \
-                 to still be the one rachna applied"
-            }
-            Self::NetworkEgress => {
-                "open a connection from inside the guest to an address no \
-                 policy allows, and require it to fail"
-            }
-            Self::ProcessLimit => {
-                "fork past the declared process limit, and require the kernel \
-                 to refuse"
-            }
-            Self::PolicyFileUnreachable => {
-                "open rachna.nix from inside the guest, by name and by inode, \
-                 and require both to fail"
-            }
+            Self::GuestConfinement => "read the hypervisor's own confinement",
+            Self::NetworkEgress => "connect to an address no policy allows",
+            Self::ProcessLimit => "fork past the declared process limit",
+            Self::PolicyFileUnreachable => "open rachna.nix from inside the guest",
         }
-    }
-}
-
-impl fmt::Display for Check {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -262,6 +250,86 @@ impl Report {
         } else {
             Action::EnforcementFailed
         }
+    }
+}
+
+impl fmt::Display for Report {
+    /// The `rachna status` enforcement block (`00` §3.7).
+    ///
+    /// Follows `denial.rs`'s shape — `✓`/`✗` markers, one line per item, the
+    /// remedy directly under the line it concerns — because a user should not
+    /// have to learn two report formats. `00` §3.3 rule 5 is the same rule.
+    ///
+    /// The enforced case is **one line**, deliberately. A tool that prints
+    /// four reassuring ticks every start trains people to skip the block, and
+    /// then the one time it says `✗` they skip that too.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.fully_enforced() {
+            return writeln!(
+                f,
+                "✓ enforcement verified — {} boundaries checked",
+                Check::ALL.len()
+            );
+        }
+
+        let unverified = self.unverified();
+        writeln!(
+            f,
+            "✗ UNENFORCED — {} of {} boundaries could not be verified",
+            unverified.len(),
+            Check::ALL.len()
+        )?;
+        writeln!(f)?;
+        for finding in unverified {
+            match &finding.outcome {
+                // Named differently on purpose. "bypassed" means we proved
+                // the boundary is absent; "unverified" means we could not
+                // tell. Printing both as "failed" would merge a known hole
+                // with an unknown one, and they need different responses.
+                Outcome::Bypassed { observed } => {
+                    writeln!(f, "  {:<24} ✗ bypassed: {observed}", finding.check.as_str())?;
+                }
+                Outcome::Inconclusive { why } => {
+                    writeln!(f, "  {:<24} ? unverified: {why}", finding.check.as_str())?;
+                }
+                // Unreachable via `unverified()`, and written out rather than
+                // left to a wildcard so adding an Outcome is a compile error
+                // here instead of silently printing nothing.
+                Outcome::Held => {}
+            }
+            // The frame carries the REQUIREMENT, so each description can be
+            // a plain attempt. Two frames, because one does not fit both
+            // outcomes: "tried to X — and it did not fail" is simply FALSE
+            // for an inconclusive check, where the attempt could not be made
+            // at all. Printing the block is what caught that; the test
+            // asserting `contains("did not fail")` had passed it.
+            let frame = match finding.outcome {
+                Outcome::Inconclusive { .. } => "could not",
+                _ => "tried to",
+            };
+            let outcome = match finding.outcome {
+                Outcome::Inconclusive { .. } => "",
+                _ => " — and it did not fail",
+            };
+            writeln!(
+                f,
+                "  {:<24}   {frame} {}{outcome}",
+                "",
+                finding.check.attempts()
+            )?;
+        }
+        writeln!(f)?;
+        // `00` §3.7 requires the OFFER, not just the warning: "with an offer
+        // to restart confined. Never a silent degradation."
+        //
+        // Both commands are ones the parser ACTUALLY accepts. A first draft
+        // offered `rachna start --verify-enforcement`, a flag that appears in
+        // neither `00` §5.2 nor `cli.rs` — an offer pointing at a command
+        // that does not work is worse than no offer, and a test asserting
+        // `contains("rachna start")` passed it. There is now a test that
+        // parses every command this block prints.
+        writeln!(f, "  rachna stop && rachna start   # restart confined")?;
+        writeln!(f, "  rachna doctor                 # why this host cannot")
     }
 }
 
@@ -410,7 +478,8 @@ mod tests {
             let report = Report::new(findings).expect("complete");
             assert!(
                 !report.fully_enforced(),
-                "{failing} was bypassed and the report still claimed enforcement"
+                "{} was bypassed and the report still claimed enforcement",
+                failing.as_str()
             );
             assert_eq!(report.unverified().len(), 1);
             assert_eq!(report.unverified()[0].check, failing);
@@ -480,13 +549,225 @@ mod tests {
             let text = check.attempts();
             assert!(
                 text.len() > 30,
-                "{check}'s description is too terse to audit: {text}"
+                "{}'s description is too terse to audit: {text}",
+                check.as_str()
+            );
+            // Each description is a plain ATTEMPT — a verb phrase naming
+            // what was tried. The requirement ("and it did not fail") lives
+            // in the sentence frame that prints it, asserted separately
+            // below, because an earlier version put "require" in every
+            // description and printed "tried to require … to fail".
+            let first = text.split(' ').next().unwrap_or("");
+            assert!(
+                !first.is_empty() && first.chars().all(|c| c.is_ascii_lowercase()),
+                "{}'s description should start with a verb: {text}",
+                check.as_str()
             );
             assert!(
-                text.contains("require") || text.contains("refuse"),
-                "{check} does not describe a bypass that must FAIL: {text}"
+                !text.contains("require"),
+                "the requirement belongs in the frame, not the description: {text}"
+            );
+            // And it must fit a terminal. The first version ran to ~115
+            // characters and wrapped mid-sentence; this test passed it,
+            // because it only checked for the word "require". Printing the
+            // block is what caught it, so the width is now asserted.
+            assert!(
+                text.len() <= 56,
+                "{}'s description is {} chars and will wrap: {text}",
+                check.as_str(),
+                text.len()
             );
         }
+    }
+
+    // ---- the status block (00 §3.7's "surfaced", not just computed) ------
+
+    #[test]
+    fn the_enforced_case_is_one_quiet_line() {
+        // A tool that prints four reassuring ticks on every start trains
+        // people to skip the block — and then the one time it says ✗ they
+        // skip that too. So success is terse by design, and that is asserted
+        // rather than left to drift.
+        let text = Report::new(all_held()).expect("complete").to_string();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.starts_with('✓'), "{text}");
+        assert!(text.contains("verified"), "{text}");
+        // And it must NOT look like a warning.
+        assert!(!text.contains('✗'), "{text}");
+    }
+
+    #[test]
+    fn an_unenforced_report_names_the_boundary_the_attempt_and_the_offer() {
+        // 00 §3.7: surfaced in `rachna status`, "with an offer to restart
+        // confined. Never a silent degradation."
+        let findings: Vec<Finding> = Check::ALL
+            .into_iter()
+            .map(|check| Finding {
+                check,
+                outcome: if check == Check::NetworkEgress {
+                    Outcome::Bypassed {
+                        observed: "connected to 1.1.1.1:443 in 12 ms".to_owned(),
+                    }
+                } else {
+                    Outcome::Held
+                },
+            })
+            .collect();
+        let text = Report::new(findings).expect("complete").to_string();
+
+        assert!(text.contains("UNENFORCED"), "{text}");
+        assert!(text.contains("network-egress"), "{text}");
+        // What was actually observed, per 00 §3.3: "network enforcement
+        // failed" is unactionable where this is not.
+        assert!(text.contains("1.1.1.1:443"), "{text}");
+        // What was attempted, so the claim is auditable — AND the required
+        // outcome, which is what makes the line mean "this is a problem"
+        // rather than "here is a thing we did".
+        assert!(text.contains("tried to"), "{text}");
+        assert!(text.contains("did not fail"), "{text}");
+        // The offer.
+        assert!(text.contains("rachna start"), "{text}");
+        assert!(text.contains("rachna doctor"), "{text}");
+        // Only the failing boundary is listed: the three that held must not
+        // add noise to the one that did not.
+        for held in [
+            Check::GuestConfinement,
+            Check::ProcessLimit,
+            Check::PolicyFileUnreachable,
+        ] {
+            assert!(
+                !text.contains(held.as_str()),
+                "a boundary that HELD was listed as a problem: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_command_this_block_offers_actually_parses() {
+        // The test that was missing. A first draft offered
+        // `rachna start --verify-enforcement` — a flag in neither `00` §5.2
+        // nor `cli.rs` — and the assertion `contains("rachna start")` passed
+        // it happily. An offer pointing at a command that does not work is
+        // worse than no offer, because the user now believes they tried.
+        //
+        // So every `rachna …` command printed here is fed through the real
+        // parser, the same way `denial.rs` suggestions are.
+        let findings: Vec<Finding> = Check::ALL
+            .into_iter()
+            .map(|check| Finding {
+                check,
+                outcome: Outcome::Bypassed {
+                    observed: "x".to_owned(),
+                },
+            })
+            .collect();
+        let text = Report::new(findings).expect("complete").to_string();
+
+        let mut checked = 0;
+        for line in text.lines() {
+            // Strip a trailing `# comment`, which is prose rather than args.
+            let command = line.split('#').next().unwrap_or("").trim();
+            for part in command.split("&&") {
+                let part = part.trim();
+                if !part.starts_with("rachna ") {
+                    continue;
+                }
+                let argv: Vec<std::ffi::OsString> = part
+                    .split_whitespace()
+                    .map(std::ffi::OsString::from)
+                    .collect();
+                let parsed = crate::cli::Invocation::from_argv(&argv);
+                assert!(
+                    parsed.is_ok(),
+                    "the status block offers `{part}`, which the parser rejects: {:?}",
+                    parsed.err()
+                );
+                checked += 1;
+            }
+        }
+        // And the loop must have found something: a block that printed no
+        // commands at all would pass every assertion above.
+        assert!(
+            checked >= 2,
+            "only {checked} commands were checked — is the offer still printed?"
+        );
+    }
+
+    #[test]
+    fn a_proven_hole_reads_differently_from_an_unknown_one() {
+        // The distinction that matters operationally: "we proved the boundary
+        // is absent" and "we could not tell" need different responses, so
+        // printing both as "failed" would merge a known hole with an unknown
+        // one.
+        let one = |check: Check, outcome: Outcome| -> String {
+            let findings: Vec<Finding> = Check::ALL
+                .into_iter()
+                .map(|c| Finding {
+                    check: c,
+                    outcome: if c == check {
+                        outcome.clone()
+                    } else {
+                        Outcome::Held
+                    },
+                })
+                .collect();
+            Report::new(findings).expect("complete").to_string()
+        };
+
+        let bypassed = one(
+            Check::NetworkEgress,
+            Outcome::Bypassed {
+                observed: "reached the internet".to_owned(),
+            },
+        );
+        let unknown = one(
+            Check::NetworkEgress,
+            Outcome::Inconclusive {
+                why: "the guest agent did not answer".to_owned(),
+            },
+        );
+        assert!(bypassed.contains("bypassed"), "{bypassed}");
+        assert!(unknown.contains("unverified"), "{unknown}");
+        // And the ATTEMPT line differs too, not just the label. "tried to X
+        // — and it did not fail" is false when the attempt could not be
+        // made; an earlier version printed it for both and the test passed,
+        // because it only checked the label.
+        assert!(bypassed.contains("tried to"), "{bypassed}");
+        assert!(bypassed.contains("did not fail"), "{bypassed}");
+        assert!(unknown.contains("could not"), "{unknown}");
+        assert!(
+            !unknown.contains("did not fail"),
+            "an inconclusive check must not claim the bypass succeeded: {unknown}"
+        );
+        assert_ne!(bypassed, unknown);
+        // Both are still UNENFORCED: the difference is in the explanation,
+        // never in the verdict.
+        assert!(bypassed.contains("UNENFORCED"));
+        assert!(unknown.contains("UNENFORCED"));
+    }
+
+    #[test]
+    fn every_failing_boundary_appears_when_several_fail() {
+        // A report that showed only the first problem would send a user round
+        // the loop once per boundary.
+        let findings: Vec<Finding> = Check::ALL
+            .into_iter()
+            .map(|check| Finding {
+                check,
+                outcome: Outcome::Bypassed {
+                    observed: format!("{} was bypassed", check.as_str()),
+                },
+            })
+            .collect();
+        let text = Report::new(findings).expect("complete").to_string();
+        for check in Check::ALL {
+            assert!(
+                text.contains(check.as_str()),
+                "{} is missing: {text}",
+                check.as_str()
+            );
+        }
+        assert!(text.contains("4 of 4"), "{text}");
     }
 
     #[test]
