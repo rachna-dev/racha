@@ -288,12 +288,8 @@ mod tests {
     use super::*;
     use crate::decide::{decide, Capabilities, Policy};
     use crate::decision::Category;
-    use crate::grant::ToolKind;
+    use crate::grant::{endpoint, ToolKind};
     use crate::policy::{Profile, Tier};
-
-    fn endpoint(host: &str, port: u16) -> Endpoint {
-        Endpoint::new(host, port).expect("test endpoints are non-empty")
-    }
 
     /// Evidence that clears the default threshold.
     const AMPLE: Evidence = Evidence {

@@ -70,6 +70,18 @@ impl Endpoint {
     }
 }
 
+/// Builds an endpoint, panicking on an empty host.
+///
+/// For tests only. Lives beside [`Endpoint`] rather than being rewritten per
+/// test module: it was duplicated verbatim in four of them, which is exactly
+/// the "extend the owner" rule in `AGENTS.md`. `cfg(test)` keeps it out of
+/// the shipped binary, where [`Endpoint::new`]'s `Result` is the only way in.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn endpoint(host: &str, port: u16) -> Endpoint {
+    Endpoint::new(host, port).expect("a test endpoint must name a host")
+}
+
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.host, self.port)
@@ -245,10 +257,6 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn endpoint(host: &str, port: u16) -> Endpoint {
-        Endpoint::new(host, port).expect("test endpoints are non-empty")
-    }
 
     /// One grant of every variant, so adding a variant fails to compile here.
     fn every_grant() -> Vec<Grant> {

@@ -271,12 +271,8 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grant::{Endpoint, ToolKind};
+    use crate::grant::{endpoint, ToolKind};
     use std::path::PathBuf;
-
-    fn endpoint(host: &str, port: u16) -> Endpoint {
-        Endpoint::new(host, port).expect("test endpoints are non-empty")
-    }
 
     /// A policy that permits the category under test and nothing else.
     fn permissive() -> Policy {
