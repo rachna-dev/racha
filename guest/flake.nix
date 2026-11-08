@@ -64,7 +64,9 @@
                   xz
                   bzip2
                   lz4
+                  lzop
                   zstd
+                  binutils
                 ];
               }
               ''
