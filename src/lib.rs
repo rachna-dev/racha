@@ -202,5 +202,6 @@ pub mod backend;
 pub mod config;
 pub mod eval;
 pub mod protocol;
+pub mod reload;
 pub mod render;
 pub mod store;
