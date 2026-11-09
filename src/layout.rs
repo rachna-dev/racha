@@ -248,6 +248,20 @@ impl ProjectPaths {
     }
 }
 
+/// The guest system this build is paired with.
+///
+/// `08` §4.1.1: the guest version is **ours**, bumped deliberately, and it
+/// is part of the `rachna` version — `0.4.0+26.11` reads as "Rachna 0.4.0,
+/// built against NixOS 26.11". The short nixpkgs rev is included because
+/// the release alone is not an identity: two builds against `26.11` at
+/// different revs are different guests, and a snapshot taken under one
+/// cannot be restored into the other.
+///
+/// Must match `guest/flake.nix`'s pinned `nixpkgs` input. A mismatch means
+/// the directory name claims a guest the image is not, which `08` §4.1.1's
+/// whole versioning scheme exists to prevent.
+pub const GUEST_VERSION: &str = "26.11-3181085";
+
 /// The shared guest directory for one guest version and architecture.
 ///
 /// `08` §4.1.1 calls this **the only shared thing**, and `24` §3 measured why
@@ -449,6 +463,32 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("one path component"), "{text}");
         assert!(text.contains(".."), "{text}");
+    }
+
+    #[test]
+    fn the_guest_version_matches_the_flake_it_claims() {
+        // `GUEST_VERSION` names the directory the image lands in, and the
+        // image is built from `guest/flake.nix`'s pinned nixpkgs. If the
+        // two drift, the directory claims a guest the image is not — and
+        // `08` §4.1.1's versioning exists precisely so a snapshot cannot
+        // be restored into a different guest. A silent mismatch defeats it.
+        //
+        // Read from the FLAKE rather than restated here: a constant
+        // compared against another constant tests nothing.
+        let flake = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("guest/flake.nix"),
+        )
+        .expect("guest/flake.nix is part of the repo");
+
+        let rev = GUEST_VERSION
+            .split('-')
+            .next_back()
+            .expect("the version carries a rev");
+        assert!(
+            flake.contains(rev),
+            "GUEST_VERSION names rev `{rev}`, which guest/flake.nix does not \
+             pin. One of the two was bumped without the other."
+        );
     }
 
     #[test]

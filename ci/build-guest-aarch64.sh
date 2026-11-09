@@ -11,7 +11,11 @@
 # Linux builder exists.
 set -euo pipefail
 
-OUT="${1:-$HOME/.rachna/guests/aarch64}"
+# Must match `layout::GUEST_VERSION`: `08` §4.1.1 names the guest by
+# version AND arch so an upgrade cannot overwrite an image that existing
+# snapshots still reference.
+GUEST_VERSION="${GUEST_VERSION:-26.11-3181085}"
+OUT="${1:-$HOME/.rachna/guests/$GUEST_VERSION-aarch64}"
 PINNED="nixpkgs/3181085bfd08663b6b9e60bc7a8395c2aaa741bd"
 # Node comes from a different pin DELIBERATELY: at the pinned rev, nodejs_22
 # needs building and nodejs_20 fails an end-of-life assertion (02 §6.9).

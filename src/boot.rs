@@ -99,7 +99,13 @@ impl Image {
     /// [`BootError::NoImage`] when the directory is absent, or
     /// [`BootError::Incomplete`] naming the first missing file.
     pub fn find(rachna_root: &Path) -> Result<Self, BootError> {
-        let dir = rachna_root.join("guests").join(host_arch());
+        // THROUGH `layout::guest_dir`, which names the guest VERSION as
+        // well as the arch. This used to be `guests/<arch>` with no
+        // version — and `08` §4.1.1 is explicit that the versioning is
+        // what stops a guest upgrade from overwriting an image existing
+        // snapshots still reference. An unversioned path makes that
+        // overwrite silent.
+        let dir = crate::layout::guest_dir(rachna_root, crate::layout::GUEST_VERSION, host_arch());
         if !dir.is_dir() {
             return Err(BootError::NoImage { looked_in: dir });
         }
@@ -407,7 +413,7 @@ mod tests {
         // at all. A partial guest image is the same trap one layer up, so
         // each file is checked and named.
         let root = scratch("partial");
-        let dir = root.join("guests").join(host_arch());
+        let dir = crate::layout::guest_dir(&root, crate::layout::GUEST_VERSION, host_arch());
         std::fs::create_dir_all(&dir).expect("dirs");
         std::fs::write(dir.join("Image"), b"kernel").expect("kernel");
         std::fs::write(dir.join("initramfs.gz"), b"initrd").expect("initrd");
@@ -427,7 +433,7 @@ mod tests {
     fn a_complete_image_is_found() {
         // The positive case, so the two refusals above are not vacuous.
         let root = scratch("complete");
-        let dir = root.join("guests").join(host_arch());
+        let dir = crate::layout::guest_dir(&root, crate::layout::GUEST_VERSION, host_arch());
         std::fs::create_dir_all(&dir).expect("dirs");
         for name in ["Image", "initramfs.gz", "root.img"] {
             std::fs::write(dir.join(name), b"x").expect("file");
@@ -443,7 +449,7 @@ mod tests {
         // The point of this module: `19` §2.1's declared limits must reach
         // the hypervisor, or they are documentation.
         let root = scratch("launch");
-        let dir = root.join("guests").join(host_arch());
+        let dir = crate::layout::guest_dir(&root, crate::layout::GUEST_VERSION, host_arch());
         std::fs::create_dir_all(&dir).expect("dirs");
         for name in ["Image", "initramfs.gz", "root.img"] {
             std::fs::write(dir.join(name), b"x").expect("file");
@@ -521,7 +527,7 @@ mod tests {
         // the console across a stop/start cycle: two boots, two initdbs,
         // "persistent" todos that were actually recreated each time.
         let root_dir = scratch("state");
-        let dir = root_dir.join("guests").join(host_arch());
+        let dir = crate::layout::guest_dir(&root_dir, crate::layout::GUEST_VERSION, host_arch());
         std::fs::create_dir_all(&dir).expect("dirs");
         for name in ["Image", "initramfs.gz", "root.img"] {
             std::fs::write(dir.join(name), b"x").expect("file");
@@ -567,7 +573,7 @@ mod tests {
         // audited and not applied is worse than one that is absent: the
         // user believes they have it.
         let root_dir = scratch("mounts");
-        let dir = root_dir.join("guests").join(host_arch());
+        let dir = crate::layout::guest_dir(&root_dir, crate::layout::GUEST_VERSION, host_arch());
         std::fs::create_dir_all(&dir).expect("dirs");
         for name in ["Image", "initramfs.gz", "root.img"] {
             std::fs::write(dir.join(name), b"x").expect("file");
@@ -635,7 +641,7 @@ mod tests {
         // workspace is already that directory — two shares of one path is
         // something VZ accepts and the guest then sees twice.
         let root_dir = scratch("dupe");
-        let dir = root_dir.join("guests").join(host_arch());
+        let dir = crate::layout::guest_dir(&root_dir, crate::layout::GUEST_VERSION, host_arch());
         std::fs::create_dir_all(&dir).expect("dirs");
         for name in ["Image", "initramfs.gz", "root.img"] {
             std::fs::write(dir.join(name), b"x").expect("file");
@@ -675,7 +681,7 @@ mod tests {
         // Postgres data directory. Copying is the correctness-first choice
         // (`01` §3b); copy-on-write is a step-14 concern.
         let root = scratch("provision");
-        let dir = root.join("guests").join(host_arch());
+        let dir = crate::layout::guest_dir(&root, crate::layout::GUEST_VERSION, host_arch());
         std::fs::create_dir_all(&dir).expect("dirs");
         std::fs::write(dir.join("Image"), b"k").expect("k");
         std::fs::write(dir.join("initramfs.gz"), b"i").expect("i");
