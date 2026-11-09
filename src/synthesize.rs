@@ -605,6 +605,7 @@ mod tests {
         let policy = Policy {
             tier: Tier::Allowlist,
             profile: Profile::Online,
+            resources: crate::resources::Resources::default(),
             capabilities: Capabilities::all(),
             grants: synthesized(observed.clone()),
         };
@@ -629,6 +630,7 @@ mod tests {
         let policy = Policy {
             tier: Tier::Allowlist,
             profile: Profile::Online,
+            resources: crate::resources::Resources::default(),
             capabilities: Capabilities::all(),
             grants: synthesized(vec![net("storage.googleapis.com", 443)]),
         };

@@ -38,6 +38,7 @@ use crate::decide::{Capabilities, Policy};
 use crate::decision::Access;
 use crate::grant::{Endpoint, Grant, ToolKind};
 use crate::policy::{Profile, Tier};
+use crate::resources::Resources;
 use core::fmt;
 use std::path::PathBuf;
 
@@ -135,6 +136,10 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "ports",
     "tools",
     "secrets",
+    // `19` §2.1 documents this and the parser rejected it: a rachna.nix
+    // copied from the document failed with `resources: no such option`.
+    // Same defect as `kind = "command"` (`21` §2.5).
+    "resources",
 ];
 
 /// Parses evaluated config JSON into a [`Policy`].
@@ -170,6 +175,7 @@ pub fn parse(json: &str, capabilities: Capabilities) -> Result<Policy, ConfigErr
 
     let tier = enum_field(root, "tier", TIERS, &mut errors).unwrap_or(Tier::None);
     let profile = enum_field(root, "profile", PROFILES, &mut errors).unwrap_or(Profile::Sealed);
+    let resources = resources(root, &mut errors);
 
     let mut grants = Vec::new();
     network_grants(root, &mut grants, &mut errors);
@@ -183,6 +189,7 @@ pub fn parse(json: &str, capabilities: Capabilities) -> Result<Policy, ConfigErr
             tier,
             profile,
             grants,
+            resources,
             capabilities,
         })
     } else {
@@ -439,6 +446,103 @@ fn tool_grants(root: &Object, grants: &mut Vec<Grant>, errors: &mut Vec<ConfigEr
             }
         },
     );
+}
+
+/// `resources = { cpus = 4; memory = "2GB"; disk = "20GB"; processes = 512; }`
+///
+/// Every field defaults, because `19` §4.5's property is that an empty
+/// `rachna.nix` is valid — the Nix module supplies these before this parser
+/// runs, so a missing field here means a caller passed partial JSON rather
+/// than a user omitting something.
+///
+/// A **present but wrong** field is an error rather than a fallback to the
+/// default. `00` §5.3 rule 4's reasoning applies: a value that silently means
+/// something other than what it says is the same failure class as a limit
+/// that is declared and never enforced.
+fn resources(root: &Object, errors: &mut Vec<ConfigError>) -> Resources {
+    let defaults = Resources::default();
+    let Some(value) = root.get("resources") else {
+        return defaults;
+    };
+    let Some(table) = value.as_object() else {
+        errors.push(ConfigError::WrongType {
+            at: "resources".to_owned(),
+            expected: "an attribute set",
+            found: type_of(value),
+        });
+        return defaults;
+    };
+
+    Resources {
+        cpus: count_field(table, "resources.cpus", defaults.cpus, errors),
+        memory_mib: size_field(table, "resources.memory", defaults.memory_mib, errors),
+        disk_mib: size_field(table, "resources.disk", defaults.disk_mib, errors),
+        processes: count_field(table, "resources.processes", defaults.processes, errors),
+    }
+}
+
+/// A positive count, or `fallback` with an error recorded.
+fn count_field(table: &Object, at: &str, fallback: u32, errors: &mut Vec<ConfigError>) -> u32 {
+    let key = at.rsplit('.').next().unwrap_or(at);
+    let Some(value) = table.get(key) else {
+        return fallback;
+    };
+    match value.as_u64() {
+        // Zero is refused for the same reason a zero size is: a VM with no
+        // vCPUs does not start, and the failure would name neither.
+        Some(0) | None => {
+            errors.push(ConfigError::WrongType {
+                at: at.to_owned(),
+                expected: "a positive whole number",
+                found: type_of(value),
+            });
+            fallback
+        }
+        Some(count) => u32::try_from(count).unwrap_or(u32::MAX),
+    }
+}
+
+/// A size string like `"2GB"`, or `fallback` with an error recorded.
+fn size_field(table: &Object, at: &str, fallback: u64, errors: &mut Vec<ConfigError>) -> u64 {
+    let key = at.rsplit('.').next().unwrap_or(at);
+    let Some(value) = table.get(key) else {
+        return fallback;
+    };
+    // A bare number is accepted as mebibytes, matching Cloud Hypervisor's
+    // own `size=2048M`, so `memory = 2048` is not a type error.
+    if let Some(number) = value.as_u64() {
+        if number == 0 {
+            errors.push(ConfigError::NotOneOf {
+                at: at.to_owned(),
+                found: "0".to_owned(),
+                allowed: &["a size such as 2GB"],
+            });
+            return fallback;
+        }
+        return number;
+    }
+    let Some(text) = value.as_str() else {
+        errors.push(ConfigError::WrongType {
+            at: at.to_owned(),
+            expected: "a size such as \"2GB\"",
+            found: type_of(value),
+        });
+        return fallback;
+    };
+    match crate::resources::parse_size(text) {
+        Ok(mib) => mib,
+        Err(error) => {
+            // The size parser's own message, so the user sees what shape
+            // works rather than a generic type complaint.
+            errors.push(ConfigError::NotOneOf {
+                at: at.to_owned(),
+                found: text.to_owned(),
+                allowed: &["MB", "MiB", "GB", "GiB"],
+            });
+            let _ = error;
+            fallback
+        }
+    }
 }
 
 fn secret_grants(root: &Object, grants: &mut Vec<Grant>, errors: &mut Vec<ConfigError>) {
@@ -823,6 +927,100 @@ mod tests {
                 "`{option}` accepts {actual:?} but the spec documents {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_resources_block_19_section_2_1_documents_parses() {
+        // THE bug this closes. `19` §2.1 documents
+        //   resources = { cpus = 4; memory = "2GB"; disk = "20GB";
+        //                 processes = 512; };
+        // and the parser rejected the whole config with `resources: no such
+        // option` — a documented option the code refuses, exactly the
+        // `kind = "command"` defect (`21` §2.5).
+        let policy = parsed(
+            r#"{ "tier": "allowlist", "profile": "development",
+                 "resources": { "cpus": 8, "memory": "4GB",
+                                "disk": "40GB", "processes": 1024 } }"#,
+        );
+        assert_eq!(policy.resources.cpus, 8);
+        assert_eq!(policy.resources.memory_mib, 4096);
+        assert_eq!(policy.resources.disk_mib, 40960);
+        assert_eq!(policy.resources.processes, 1024);
+        // And the quota comes with the count, per `15` §3.2.
+        assert_eq!(policy.resources.host_cpu_quota_percent(), 800);
+    }
+
+    #[test]
+    fn an_omitted_resources_block_gets_the_declared_defaults() {
+        // What happens when a user writes no limits — `19` §4.5's property
+        // that an empty config is valid. The Nix module supplies these
+        // before this parser runs, so a missing block here means partial
+        // JSON rather than a user omission; either way the answer must be
+        // the documented defaults, not zeroes.
+        let policy = parsed(r#"{ "tier": "allowlist", "profile": "development" }"#);
+        assert_eq!(policy.resources, Resources::default());
+        assert_eq!(policy.resources.cpus, 4);
+        assert_eq!(policy.resources.memory_mib, 2048);
+    }
+
+    #[test]
+    fn a_partial_resources_block_defaults_only_what_is_missing() {
+        // A user tuning one field must not silently lose the others.
+        let policy = parsed(
+            r#"{ "tier": "allowlist", "profile": "development",
+                 "resources": { "memory": "8GB" } }"#,
+        );
+        assert_eq!(policy.resources.memory_mib, 8192);
+        assert_eq!(policy.resources.cpus, Resources::default().cpus);
+        assert_eq!(policy.resources.disk_mib, Resources::default().disk_mib);
+    }
+
+    #[test]
+    fn a_present_but_wrong_resource_is_an_error_not_a_silent_default() {
+        // `00` §5.3 rule 4's reasoning: a value that silently means
+        // something other than what it says is the same failure class as a
+        // limit declared and never enforced. Falling back to the default
+        // here would give a user 2 GB when they asked for "lots" and told
+        // them nothing.
+        for (json, at) in [
+            (r#"{"cpus": 0}"#, "resources.cpus"),
+            (r#"{"cpus": "four"}"#, "resources.cpus"),
+            (r#"{"memory": "lots"}"#, "resources.memory"),
+            (r#"{"memory": 0}"#, "resources.memory"),
+            (r#"{"disk": "20TB"}"#, "resources.disk"),
+            (r#"{"processes": 0}"#, "resources.processes"),
+        ] {
+            let config = format!(
+                r#"{{ "tier": "allowlist", "profile": "development",
+                      "resources": {json} }}"#
+            );
+            let found = errors(&config);
+            assert!(
+                found.iter().any(|error| error.to_string().contains(at)),
+                "{json} did not produce an error naming {at}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resources_value_that_is_not_an_attribute_set_says_so() {
+        let found = errors(r#"{ "tier": "allowlist", "profile": "development", "resources": 4 }"#);
+        assert!(found.contains(&ConfigError::WrongType {
+            at: "resources".to_owned(),
+            expected: "an attribute set",
+            found: "a number",
+        }));
+    }
+
+    #[test]
+    fn a_bare_number_is_mebibytes_matching_cloud_hypervisor() {
+        // CH's own `--memory size=2048M`, so `memory = 2048` is not a type
+        // error — it is the same unit the hypervisor uses.
+        let policy = parsed(
+            r#"{ "tier": "allowlist", "profile": "development",
+                 "resources": { "memory": 2048 } }"#,
+        );
+        assert_eq!(policy.resources.memory_mib, 2048);
     }
 
     #[test]

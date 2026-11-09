@@ -290,6 +290,7 @@ mod tests {
             tier: Tier::Allowlist,
             profile: Profile::Online,
             grants,
+            resources: crate::resources::Resources::default(),
             capabilities: Capabilities::all(),
         }
     }

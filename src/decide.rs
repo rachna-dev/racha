@@ -26,6 +26,7 @@
 use crate::decision::{Access, Category, Decision, DenyReason, Scope};
 use crate::grant::{Grant, Request};
 use crate::policy::{Profile, Tier};
+use crate::resources::Resources;
 
 /// What the backend can actually enforce.
 ///
@@ -80,6 +81,14 @@ pub struct Policy {
     pub profile: Profile,
     /// What `rachna.nix` declares.
     pub grants: Vec<Grant>,
+    /// What the project may consume (`19` §2.1).
+    ///
+    /// On the policy rather than beside it, because `15` §3.2 concluded
+    /// exactly that: *"Resource limits belong in the policy model, not
+    /// `ExecSpec`: exceeding one should produce a `Decision` and land in the
+    /// audit trail, so `rachna audit` can report a project hitting its
+    /// ceiling for a week."*
+    pub resources: Resources,
     /// What the backend can enforce.
     pub capabilities: Capabilities,
 }
@@ -94,6 +103,10 @@ impl Policy {
             tier: Tier::None,
             profile: Profile::Sealed,
             grants: Vec::new(),
+            // The declared defaults, not zeroes: `deny_all` is about
+            // PERMISSIONS, and a policy with no memory is not stricter — it
+            // is unbootable.
+            resources: Resources::default(),
             capabilities: Capabilities::all(),
         }
     }
@@ -280,6 +293,7 @@ mod tests {
             tier: Tier::Allowlist,
             profile: Profile::Online,
             grants: Vec::new(),
+            resources: Resources::default(),
             capabilities: Capabilities::all(),
         }
     }
@@ -638,6 +652,7 @@ mod tests {
         // unenforceable category with no grant would report NoMatchingGrant
         // and suggest a `rachna allow` that changes nothing.
         let policy = Policy {
+            resources: Resources::default(),
             capabilities: Capabilities::lacking([Category::Port]),
             ..permissive()
         };
@@ -659,6 +674,7 @@ mod tests {
         // The sharp case: a rule the backend cannot enforce must not behave
         // like one that is present and working, or the config file lies.
         let policy = Policy {
+            resources: Resources::default(),
             capabilities: Capabilities::lacking([Category::Port]),
             grants: vec![Grant::Port {
                 guest: 3000,
@@ -717,6 +733,7 @@ mod tests {
         let policy = Policy {
             tier: Tier::Allowlist,
             profile: Profile::Online,
+            resources: Resources::default(),
             capabilities: Capabilities::all(),
             grants: vec![
                 Grant::Network {

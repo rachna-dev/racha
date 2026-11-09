@@ -34,6 +34,7 @@
 //! (`/dev/kvm` access, `CAP_NET_ADMIN` for a tap) are checked.
 
 use crate::backend::Capabilities;
+use crate::resources::Resources;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -293,6 +294,69 @@ pub fn args_support_snapshot(args: &[OsString]) -> bool {
         .any(|arg| arg.to_string_lossy().contains("shared=on"))
 }
 
+/// The `systemd-run` wrapper that applies the host-side resource limits.
+///
+/// **Why the VMM is wrapped rather than configured.** `10` §3 measured that a
+/// four-vCPU guest on sixteen cores could consume 400 % CPU, and that a
+/// cgroup held it near its 200 % quota with `nr_throttled 119` over a
+/// cumulative 20.1 s. Cloud Hypervisor has no CPU-quota flag of its own, so
+/// the limit lives in the cgroup the VMM runs inside — which is also where
+/// `MemoryMax` backstops the guest kernel's own OOM behaviour (`10` §2:
+/// 2066 MiB peak against a 3072 MiB ceiling, with the VMM alive throughout).
+///
+/// `--user --scope` rather than a system unit: the broker is unprivileged
+/// (`06` §7 keeps `CAP_NET_ADMIN` in `rachna-netd` alone), and `10` §1
+/// measured this host with `cpu io memory pids` delegated to the user, which
+/// is what makes a user scope able to set these at all.
+///
+/// # The memory ceiling is deliberately above the guest's
+///
+/// A `MemoryMax` equal to the guest's memory would have the host kill the
+/// VMM at the same moment the guest kernel starts reclaiming — so a guest
+/// using its own memory as designed would die. `10` §2's measurement is the
+/// shape to keep: the guest kernel OOM-kills inside its own limit, and the
+/// host cgroup is a **backstop** for the VMM's own overhead rather than a
+/// second copy of the same limit.
+#[must_use]
+pub fn resource_scope_args(resources: &Resources, scope_name: &str) -> Vec<OsString> {
+    vec![
+        "--user".into(),
+        "--scope".into(),
+        format!("--unit={scope_name}").into(),
+        "-p".into(),
+        format!("CPUQuota={}%", resources.host_cpu_quota_percent()).into(),
+        // The backstop, not a duplicate of the guest's own ceiling. The
+        // margin covers the VMM's own allocations — device state, virtiofs
+        // buffers — which are outside the guest's memory and would otherwise
+        // make a guest at its limit kill the process running it.
+        "-p".into(),
+        format!("MemoryMax={}M", resources.memory_mib + VMM_OVERHEAD_MIB).into(),
+        // `15` §3.2 measured that a host TasksMax CANNOT contain a guest fork
+        // bomb — during a 400-process fork the host saw `pids.current
+        // 15/256`, because guest processes are not host tasks. So this
+        // bounds the VMM's OWN threads and the real limit is guest-side
+        // (`guest.nix`'s DefaultTasksMax). Set low deliberately: a VMM
+        // spawning hundreds of threads is a bug, not a workload.
+        "-p".into(),
+        format!("TasksMax={HOST_VMM_TASKS_MAX}").into(),
+    ]
+}
+
+/// Headroom above the guest's memory for the VMM's own allocations.
+///
+/// `10` §2 measured a 2 GiB guest's cgroup peaking at 2066 MiB — 18 MiB over
+/// the guest's own figure. 512 MiB is generous against that, and the
+/// direction matters: too small kills a working guest, too large only weakens
+/// a backstop whose real enforcement is the guest kernel's.
+pub const VMM_OVERHEAD_MIB: u64 = 512;
+
+/// The VMM's own thread ceiling.
+///
+/// Not the guest's process limit, which `15` §3.2 proved a host cgroup cannot
+/// enforce. This bounds Cloud Hypervisor's own threads: a few per vCPU plus
+/// device workers.
+pub const HOST_VMM_TASKS_MAX: u32 = 256;
+
 /// The `virtiofsd` arguments for one share.
 ///
 /// `16` §5.2 found **four per guest**, fully independent — so they are
@@ -463,6 +527,106 @@ mod tests {
                 "{arg} would make CH refuse to start"
             );
         }
+    }
+
+    fn rendered_os(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_declared_cpu_count_reaches_the_cgroup_as_a_quota() {
+        // `15` §3.2's conclusion, wired: "declaring cpus = 4 must produce
+        // BOTH a vCPU count and a host CPU quota, or the limit is cosmetic."
+        // `--cpus boot=` is the count; this is the quota.
+        let resources = Resources {
+            cpus: 4,
+            ..Resources::default()
+        };
+        let args = rendered_os(&resource_scope_args(&resources, "rachna-app"));
+        assert!(
+            args.contains(&"CPUQuota=400%".to_owned()),
+            "the declared vCPU count did not become a quota: {args:?}"
+        );
+        // A user scope, because the broker is unprivileged (`06` §7).
+        assert!(args.contains(&"--user".to_owned()));
+        assert!(args.contains(&"--scope".to_owned()));
+    }
+
+    #[test]
+    fn the_memory_backstop_is_above_the_guest_s_own_ceiling() {
+        // `10` §2 measured a 2 GiB guest peaking at 2066 MiB host-side — 18
+        // MiB over. A MemoryMax equal to the guest's would have the host
+        // kill the VMM exactly when the guest kernel starts reclaiming, so a
+        // guest using its memory as designed would die.
+        let resources = Resources {
+            memory_mib: 2048,
+            ..Resources::default()
+        };
+        let args = rendered_os(&resource_scope_args(&resources, "rachna-app"));
+        let memory = args
+            .iter()
+            .find(|arg| arg.starts_with("MemoryMax="))
+            .expect("a memory ceiling");
+        assert_eq!(memory, "MemoryMax=2560M");
+        // Above the guest's own figure, and by more than the 18 MiB measured.
+        let ceiling: u64 = memory
+            .trim_start_matches("MemoryMax=")
+            .trim_end_matches('M')
+            .parse()
+            .expect("a number");
+        assert!(
+            ceiling > 2048,
+            "the backstop is at or below the guest's limit"
+        );
+        assert!(
+            ceiling - 2048 >= 64,
+            "only {} MiB of headroom",
+            ceiling - 2048
+        );
+    }
+
+    #[test]
+    fn the_host_task_limit_is_not_the_guest_s_process_limit() {
+        // `15` §3.2 measured that a host TasksMax CANNOT contain a guest fork
+        // bomb: during a 400-process fork the host saw pids.current 15/256,
+        // because guest processes are not host tasks. So this number bounds
+        // the VMM's own threads, and must NOT track `resources.processes` —
+        // doing so would look like enforcement and be none.
+        let small = Resources {
+            processes: 8,
+            ..Resources::default()
+        };
+        let large = Resources {
+            processes: 4096,
+            ..Resources::default()
+        };
+        let tasks = |r: &Resources| -> String {
+            rendered_os(&resource_scope_args(r, "s"))
+                .into_iter()
+                .find(|arg| arg.starts_with("TasksMax="))
+                .expect("a task limit")
+        };
+        assert_eq!(
+            tasks(&small),
+            tasks(&large),
+            "the host task limit tracked the GUEST process limit, which a \
+             host cgroup cannot enforce"
+        );
+        assert_eq!(tasks(&small), format!("TasksMax={HOST_VMM_TASKS_MAX}"));
+    }
+
+    #[test]
+    fn the_scope_is_named_so_a_leaked_one_is_identifiable() {
+        // `24` §6a: an ad-hoc probe left a VM running for hours. A named
+        // scope makes `systemctl --user list-units` say which project it
+        // belonged to.
+        let args = rendered_os(&resource_scope_args(
+            &Resources::default(),
+            "rachna-orders-api-a3f2",
+        ));
+        assert!(args.contains(&"--unit=rachna-orders-api-a3f2".to_owned()));
     }
 
     #[test]

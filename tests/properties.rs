@@ -118,7 +118,7 @@ proptest! {
         profile in profile(),
         grants in prop::collection::vec(grant(), 0..6),
     ) {
-        let policy = Policy { tier, profile, grants, capabilities: Capabilities::all() };
+        let policy = Policy { tier, profile, grants, resources: rachna::resources::Resources::default(), capabilities: Capabilities::all() };
         if let Decision::Allow { scope } = decide(&policy, &request) {
             prop_assert!(!scope.as_str().is_empty());
         }
@@ -136,7 +136,7 @@ proptest! {
         profile in profile(),
         grants in prop::collection::vec(grant(), 0..4),
     ) {
-        let policy = Policy { tier, profile, grants, capabilities: Capabilities::all() };
+        let policy = Policy { tier, profile, grants, resources: rachna::resources::Resources::default(), capabilities: Capabilities::all() };
         prop_assert_eq!(decide(&policy, &request), decide(&policy, &request));
     }
 
@@ -156,6 +156,7 @@ proptest! {
                 Grant::Filesystem { path: PathBuf::from("/"), access: Access::ReadWrite },
                 Grant::Port { guest: 0, host: 0 },
             ],
+            resources: rachna::resources::Resources::default(),
             capabilities: Capabilities::lacking([category]),
         };
         prop_assert!(!decide(&policy, &request).is_allowed());
@@ -177,6 +178,7 @@ proptest! {
             tier: Tier::Allowlist,
             profile: Profile::Online,
             grants,
+            resources: rachna::resources::Resources::default(),
             capabilities: Capabilities::all(),
         };
         for request in &observed {
@@ -307,6 +309,7 @@ proptest! {
             tier,
             profile,
             grants: grants.clone(),
+            resources: rachna::resources::Resources::default(),
             capabilities: Capabilities::all(),
         };
 
