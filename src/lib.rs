@@ -177,6 +177,7 @@ pub mod layout;
 pub mod lifecycle;
 pub mod policy;
 pub mod summary;
+pub mod supervise;
 pub mod synthesize;
 pub mod tap;
 pub mod transport;

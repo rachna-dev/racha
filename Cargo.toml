@@ -55,6 +55,24 @@ serde_json = { version = "1.0.154", features = ["raw_value"] }
 # `Cargo.toml` denies unsafe_code, and a binding needing unsafe per call
 # would mean weakening that in the most security-sensitive module
 # (design-docs/17-DEPENDENCIES.md, "macOS VZ binding").
+# Signalling a process we did not spawn. `std` cannot: `Child::kill` needs
+# the `Child`, and `stop` runs in a *different process* from `start` — so the
+# PID comes from a file, not a handle. Measured the alternatives:
+#
+#   `libc::kill`      rejected — needs `unsafe`, and this file DENIES it. The
+#                     VZ binding was chosen specifically to avoid weakening
+#                     that in a security-sensitive module (see below), so
+#                     weakening it here for a signal would be worse.
+#   spawn `/bin/kill` works (verified: exit 0 vs 256 distinguishes the
+#                     cases) and rejected anyway — a subprocess per signal,
+#                     in the path that must reliably tear a VM down.
+#   `rustix`          CHOSEN — safe `kill_process`/`test_kill_process`,
+#                     compiles under `unsafe_code = "deny"` (verified), and
+#                     adds `bitflags`/`errno`/`libc`, all three already in
+#                     the tree via rusqlite.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-virtualization = "0.3.2"
 
