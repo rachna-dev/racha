@@ -462,6 +462,34 @@ mod tests {
     // ---- rendering ------------------------------------------------------
 
     #[test]
+    fn a_held_snapshot_is_reported_even_with_no_running_processes() {
+        // What `rachna status` needs, and the reason it was wrong: a
+        // suspended project has NO running guest, so a status that keys off
+        // process count alone prints "stopped" for an environment whose
+        // memory is parked on disk.
+        //
+        // `00` §5.2 makes `status` the command you type when you are not
+        // sure what is going on, and a forgotten suspended environment is
+        // exactly that case — it costs disk and surprises you later.
+        let (paths, root) = paths("held-marker");
+        write(&paths, "parked", 16);
+        std::fs::create_dir_all(paths.runtime_dir()).expect("runtime dir");
+        std::fs::write(crate::supervise::held_marker(&paths), b"parked\n").expect("marker");
+
+        let held = held_by_supervisor(&paths).expect("the marker names what is held");
+        assert_eq!(held.as_str(), "parked");
+
+        // And a marker naming something we would refuse is not honoured:
+        // the name came off disk, and `resume` acts on what this returns.
+        std::fs::write(crate::supervise::held_marker(&paths), b"../escape\n").expect("marker");
+        assert!(
+            held_by_supervisor(&paths).is_none(),
+            "an unusable name from the marker file was accepted"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn the_listing_marks_which_snapshot_can_actually_be_resumed() {
         // `02` §6.11: only the process that saved a snapshot can restore
         // it, so at most one is resumable. Marked rather than hidden — a

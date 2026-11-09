@@ -65,10 +65,18 @@ WORK=$(mktemp -d)
 # read-only permissions, and `rm -rf` then fails on every single path.
 # Found by running this script — the image built and the cleanup failed,
 # which would have left ~400 MiB in TMPDIR on every invocation.
-# The trap PRESERVES the exit status. A trap ending in `rm -rf` hands the
-# script `rm`'s status instead of the failure that triggered it — measured:
-# a build died on a syntax error partway through and still reported exit 0,
-# so a caller saw success and a half-written image.
+# The trap PRESERVES the exit status explicitly.
+#
+# **Not because the implicit form was broken** — measured both ways in
+# isolation and a trap ending in `rm -rf` also exits 1, because bash
+# restores `$?` around an EXIT trap. The reported `exit 0` came from the
+# CALLER: `build-guest.sh | tail -6` takes the pipeline's status, which is
+# `tail`'s. My own command masked it, and I blamed the script.
+#
+# Kept anyway, for one reason that is not cosmetic: `rm -rf` on a tree
+# containing read-only nix store paths CAN fail, and then the implicit
+# status really is `rm`'s. Making it explicit costs four lines and removes
+# the question.
 cleanup() {
   status=$?
   chmod -R u+w "$WORK" 2>/dev/null || true
@@ -231,6 +239,10 @@ install -m 0644 "$KERNEL" "$OUT/Image"
 install -m 0644 "$WORK/initramfs.gz" "$OUT/initramfs.gz"
 install -m 0644 "$WORK/root.img" "$OUT/root.img"
 
+# A caller that pipes this script's output gets the PIPELINE's status, not
+# the script's — `… | tail -6` reports `tail`'s 0 over a failed build. That
+# cost a wrong diagnosis, so the final line is unambiguous: its absence
+# means the build did not finish, whatever the exit status looked like.
 say "done"
 printf '  kernel:    %s\n' "$OUT/Image"
 printf '  initramfs: %s\n' "$OUT/initramfs.gz"

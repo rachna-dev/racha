@@ -1374,16 +1374,44 @@ mod commands {
                 return ExitCode::from(FAILED);
             }
         };
+        let paths = context.paths();
+        let held = rachna::snapshots::held_by_supervisor(&paths);
+
         if running.is_empty() {
             println!("stopped");
+        } else if let Some(name) = &held {
+            // SUSPENDED is not STOPPED, and saying "stopped" for a project
+            // whose memory is parked on disk is the misleading half: the
+            // user types `status` to find out what is going on (`00` §5.2),
+            // and a suspended environment is the state most likely to have
+            // been forgotten about.
+            println!("suspended as `{name}`");
+            println!("  resume it with: rachna resume {name}");
         } else {
             println!("running:");
             for process in &running.processes {
                 println!("  {} (pid {})", process.role, process.pid);
             }
         }
+
+        // Snapshots on disk, whether or not anything is running. A parked
+        // environment nobody can see is one that costs disk and surprises
+        // the user later.
+        let snapshots = rachna::snapshots::list(&paths);
+        if !snapshots.is_empty() {
+            println!(
+                "snapshots: {} ({})",
+                snapshots.len(),
+                snapshots
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
         println!("project:  {}", context.project.as_str());
-        println!("state:    {}", context.paths().root().display());
+        println!("state:    {}", paths.root().display());
 
         // What this host can enforce, which `01` §2.6 says must be reported
         // rather than assumed — and `resources.rs` says must be stated when
