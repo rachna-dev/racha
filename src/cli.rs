@@ -200,6 +200,21 @@ pub enum Command {
     },
     /// `rachna stop`
     Stop,
+    /// `rachna suspend`
+    ///
+    /// Writes the guest's memory to disk and stops it. `02` §4 makes this
+    /// compound — pause, save, stop — because the VM must be `Paused`
+    /// before saving.
+    Suspend,
+    /// `rachna resume`
+    ///
+    /// Restores a suspended guest. Compound for the mirror reason: `02` §4
+    /// measured that restore lands `Paused`, so an explicit resume follows.
+    ///
+    /// **Goes through the policy gate**, like `start`. `00` §3.10c's
+    /// correction: the summary prints on every resume, and a snapshot taken
+    /// under grants the file no longer declares needs a keypress.
+    Resume,
     /// `rachna status`
     Status,
     /// `rachna doctor`
@@ -250,6 +265,8 @@ impl Command {
             Self::Init { .. }
             | Self::Start { .. }
             | Self::Stop
+            | Self::Suspend
+            | Self::Resume
             | Self::Status
             | Self::Version
             | Self::Help => false,
@@ -271,6 +288,8 @@ impl Command {
             Self::Init { .. } => "init",
             Self::Start { .. } => "start",
             Self::Stop => "stop",
+            Self::Suspend => "suspend",
+            Self::Resume => "resume",
             Self::Status => "status",
             Self::Doctor => "doctor",
             Self::Config { action } => match action {
@@ -531,7 +550,7 @@ fn split_equals(args: &[OsString]) -> Vec<OsString> {
 /// every one of these appears in `--help`. One list, so a verb cannot be
 /// added to the parser and missed by either.
 const COMMANDS: &[&str] = &[
-    "init", "start", "stop", "status", "doctor", "config", "audit", "explain",
+    "init", "start", "stop", "suspend", "resume", "status", "doctor", "config", "audit", "explain",
     // The `rachna.nix`-editing verbs (`00` §5.3). `21` §2.5 found these
     // missing from step 10 while the backend verbs were correctly deferred.
     "allow", "revoke", "expose", "unexpose", "add", "port", "set", "secret",
@@ -554,6 +573,8 @@ fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
         "init" => parse_init(rest),
         "start" => parse_start(rest),
         "stop" => expect_no_args("stop", rest, Command::Stop),
+        "suspend" => expect_no_args("suspend", rest, Command::Suspend),
+        "resume" => expect_no_args("resume", rest, Command::Resume),
         "status" => expect_no_args("status", rest, Command::Status),
         "doctor" => expect_no_args("doctor", rest, Command::Doctor),
         "config" => parse_config(rest),
@@ -1003,7 +1024,9 @@ ENVIRONMENT
                             every time; asks for `a` when the grants are
                             new or wider. --accept is for CI only — at a
                             terminal it is ignored and you press `a`
-  stop                      stop the environment
+  stop                      stop the environment, discarding its state
+  suspend                   write the guest's memory to disk and stop
+  resume                    bring a suspended environment back
   status                    what is running, and what it is allowed
   doctor                    check this host, and verify enforcement
 
@@ -1187,6 +1210,34 @@ mod tests {
             assert!(
                 !matches!(parsed, Err(CliError::UnknownCommand { .. })),
                 "`{verb}` is listed and documented but not dispatched"
+            );
+        }
+
+        // THE OTHER DIRECTION, and it is the one that actually broke.
+        // `COMMANDS` claims to be the single list "so a verb cannot be
+        // added to the parser and missed by either" — but it is maintained
+        // by hand, and `suspend` and `resume` were added to the parser,
+        // the help and the dispatch while `COMMANDS` knew nothing about
+        // them. Every check above passed.
+        //
+        // `Command::verb()` is the parser's own answer for what it just
+        // parsed, so this asks the parser rather than a list beside it: a
+        // verb the parser accepts whose name is absent from `COMMANDS` is
+        // undiscoverable in `--help` and unsuggestable on a typo.
+        for word in [
+            "init", "start", "stop", "suspend", "resume", "status", "doctor", "audit", "explain",
+            "allow", "revoke", "expose", "unexpose", "add", "port", "set", "secret",
+        ] {
+            let Ok(Invocation::Rachna(command)) = parse(&["rachna", word]) else {
+                continue;
+            };
+            // `verb()` may be more specific than the word typed (`config
+            // inspect`), so the first token is what has to be listed.
+            let primary = command.verb().split(' ').next().unwrap_or(command.verb());
+            assert!(
+                COMMANDS.contains(&primary),
+                "the parser accepts `{primary}` but COMMANDS omits it, so it is \
+                 missing from --help and from typo suggestions"
             );
         }
 

@@ -168,6 +168,18 @@ pub fn shutdown_request(paths: &ProjectPaths) -> PathBuf {
     paths.runtime_dir().join("shutdown")
 }
 
+/// The file a supervisor watches to know it should SUSPEND its guest.
+///
+/// Separate from [`shutdown_request`] because the two ask for different
+/// things and the guest ends up in different states: a shutdown discards
+/// the running state, a suspend writes it to disk and can be resumed. One
+/// file with a payload would mean parsing it, and a half-written payload
+/// would be a guest suspended when it was asked to stop.
+#[must_use]
+pub fn suspend_request(paths: &ProjectPaths) -> PathBuf {
+    paths.runtime_dir().join("suspend")
+}
+
 /// Whether a pid names a process that still exists.
 ///
 /// `stop` needs this for a different reason than `start`: `stop` must not

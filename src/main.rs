@@ -87,6 +87,8 @@ fn run(command: Command) -> ExitCode {
         Command::Init { .. } => commands::init(),
         Command::Start { accept, supervise } => commands::start(accept, supervise),
         Command::Stop => commands::stop(),
+        Command::Suspend => commands::suspend(),
+        Command::Resume => commands::resume(),
         Command::Status => commands::status(),
         // Everything below still needs work that has not landed. Naming them
         // individually rather than with a catch-all so adding one is a
@@ -415,6 +417,21 @@ mod commands {
         }
 
         if let Some(prompt) = &gate.prompt {
+            // `--accept` in CI covers the SNAPSHOT divergence too, not just
+            // an unapproved grant set. Without this a pipeline could never
+            // resume at all: `run::accept` records approval of the grant
+            // set, the resume gate also asks when a snapshot was taken
+            // under different grants, and no flag reached that — so
+            // `rachna resume --accept` refused with "not a terminal" on a
+            // policy it had just been told to accept.
+            if accept && !context.interactive {
+                print!("{}", gate.shown);
+                if let Some(why) = &gate.divergence {
+                    print!("{why}");
+                }
+                println!("  accepted by --accept");
+                return launch_or_supervise(&context, &policy, supervise, true);
+            }
             print!("{prompt}");
             if !context.interactive {
                 // A pipeline cannot press a key. `00` §3.10c: CI needs the
@@ -484,16 +501,32 @@ mod commands {
         // `--supervise` means "I am the held-open process"; a plain
         // `start` spawns one and returns. The gate above runs either way,
         // so a supervisor cannot be a way around it.
+        // `true`: the gate is behind us, by keypress or by flag.
+        launch_or_supervise(&context, &policy, supervise, true)
+    }
+
+    /// Either holds the guest or spawns something that does.
+    ///
+    /// One function rather than the same three lines at each exit from the
+    /// gate: `start` leaves the gate by two paths now (a keypress and
+    /// `--accept` in CI), and duplicating the routing is how one of them
+    /// comes to skip the supervisor.
+    fn launch_or_supervise(
+        context: &run::Context,
+        policy: &rachna::decide::Policy,
+        supervise: bool,
+        accepted: bool,
+    ) -> ExitCode {
         // On Linux there is nothing to detach from — `supervise.rs` spawns
         // `cloud-hypervisor` as its own process, which already outlives the
         // CLI — so the flag only matters on macOS.
         #[cfg(target_os = "macos")]
         if !supervise {
-            return spawn_supervisor(&context);
+            return spawn_supervisor(context, accepted);
         }
         #[cfg(not(target_os = "macos"))]
         let _ = supervise;
-        launch_approved(&context, &policy)
+        launch_approved(context, policy)
     }
 
     /// Boots the guest for an approved policy.
@@ -534,27 +567,72 @@ mod commands {
         };
 
         let plan = launch_for(policy, &image, &paths, root, state);
-        let guest = match Guest::new(&plan) {
+
+        // The snapshot decides HOW the configuration is built, so this is
+        // read before constructing the guest rather than after. `02` §4:
+        // a restore's config must match the snapshot's, and `Guest::new`
+        // truncates the console — a different attachment, which restore
+        // rejects with "invalid argument".
+        let snapshot = paths.snapshot_dir().join(SNAPSHOT_FILE);
+        let restoring = snapshot.exists();
+
+        let built = if restoring {
+            Guest::for_restore(&plan)
+        } else {
+            Guest::new(&plan)
+        };
+        let guest = match built {
             Ok(guest) => guest,
             Err(error) => {
                 eprintln!("rachna: {error}");
                 return ExitCode::from(REFUSED);
             }
         };
-        if let Err(error) = guest.start() {
-            eprintln!("rachna: {error}");
-            return ExitCode::from(FAILED);
+        // RESTORE if a snapshot is waiting, else cold boot. `02` §4:
+        // restore lands `Paused`, so the resume is explicit — which is why
+        // this is two calls rather than one.
+        let resumed = if restoring {
+            match guest.restore(&snapshot).and_then(|()| guest.resume()) {
+                Ok(()) => true,
+                Err(error) => {
+                    // `02` §4: a macOS update can invalidate saved state,
+                    // and the requirement is to fall back to a cold boot
+                    // LOUDLY rather than fail. A user whose session
+                    // silently vanished is a support problem; one told why
+                    // is mildly annoyed.
+                    eprintln!(
+                        "rachna: could not resume from the snapshot ({error}). \
+                         Booting fresh instead — the suspended session is lost."
+                    );
+                    let _ = std::fs::remove_file(&snapshot);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if !resumed {
+            if let Err(error) = guest.start() {
+                eprintln!("rachna: {error}");
+                return ExitCode::from(FAILED);
+            }
         }
 
         // Waits for the guest to say it is up, rather than printing
         // "started" the moment the hypervisor returns. `02` §6.3 measured a
         // VM reporting Running with a guest that had produced nothing, so
         // the console is the only honest evidence.
-        let up = guest.wait_for_console(
-            &plan.console_log,
-            GUEST_READY_MARKER,
-            std::time::Duration::from_secs(GUEST_BOOT_BUDGET_SECS),
-        );
+        //
+        // A RESUMED guest is skipped: its services came back with its
+        // memory and it will never print the boot marker again, so waiting
+        // for one would time out on a working environment.
+        let up = resumed
+            || guest.wait_for_console(
+                &plan.console_log,
+                GUEST_READY_MARKER,
+                std::time::Duration::from_secs(GUEST_BOOT_BUDGET_SECS),
+            );
         if !up {
             eprintln!(
                 "rachna: the guest did not finish starting within {GUEST_BOOT_BUDGET_SECS}s. \
@@ -577,6 +655,7 @@ mod commands {
         // (`02` §6), so returning would kill it — which is why `start`
         // spawns this rather than doing it inline.
         let request = rachna::supervise::shutdown_request(&paths);
+        let suspend = rachna::supervise::suspend_request(&paths);
         loop {
             let state = guest.state();
             if state != rachna::backend::macos_vm::VmState::Running {
@@ -588,6 +667,29 @@ mod commands {
                 eprintln!("rachna: the guest is {state:?}, so the supervisor is exiting");
                 return ExitCode::from(OK);
             }
+            // `rachna suspend` asks here. Checked BEFORE the shutdown
+            // request: the two are different files precisely so a suspend
+            // cannot be mistaken for a stop, and a guest asked to do both
+            // should keep its state rather than discard it.
+            if suspend.exists() {
+                let _ = std::fs::remove_file(&suspend);
+                // pause -> save -> stop (`02` §4's compound suspend).
+                let outcome = guest
+                    .pause()
+                    .and_then(|()| guest.save(&snapshot))
+                    .and_then(|()| guest.stop());
+                if let Err(error) = outcome {
+                    eprintln!("rachna: could not suspend: {error}");
+                    // The snapshot may be partial, and `24` §6 measured a
+                    // two-of-three snapshot restoring with no error at all
+                    // — so a failed save must not leave a file `resume`
+                    // would trust.
+                    let _ = std::fs::remove_file(&snapshot);
+                    return ExitCode::from(FAILED);
+                }
+                return ExitCode::from(OK);
+            }
+
             // `rachna stop` asks here before it signals. Honouring the
             // request means the guest's init unmounts and syncs; being
             // killed instead left the state volume corrupt (`02` §6.10).
@@ -628,7 +730,7 @@ mod commands {
     /// `supervise.rs` already assumes: a pid in a state file that `stop`
     /// signals.
     #[cfg(target_os = "macos")]
-    fn spawn_supervisor(context: &run::Context) -> ExitCode {
+    fn spawn_supervisor(context: &run::Context, accepted: bool) -> ExitCode {
         use rachna::supervise::{self, Role, Running, Supervised};
 
         let paths = context.paths();
@@ -646,16 +748,49 @@ mod commands {
             }
         };
 
-        // Inherits nothing: the supervisor writes to the console log, and a
-        // stdout tied to this terminal would keep the pipe open after we
-        // return.
-        let child = std::process::Command::new(&binary)
-            .arg("start")
-            .arg(SUPERVISE_FLAG)
+        // Its output goes to a FILE, not to /dev/null. Discarding it threw
+        // away the only diagnostic the supervisor has: a failed restore
+        // falls back to a cold boot and says so loudly — and that message
+        // went nowhere, so a resume that silently rebooted looked like the
+        // restore path never ran at all.
+        //
+        // Not inherited from this terminal either: a stdout tied to the
+        // parent's pipe would keep it open after `start` returns, so the
+        // shell would appear to hang.
+        let log_path = runtime.join("supervisor.log");
+        let supervisor_log = std::fs::File::create(&log_path);
+        let (out, err) = match supervisor_log {
+            Ok(file) => match file.try_clone() {
+                Ok(second) => (
+                    std::process::Stdio::from(file),
+                    std::process::Stdio::from(second),
+                ),
+                Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+            },
+            Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+        };
+
+        // `--accept` IS FORWARDED. The supervisor runs the same gate (that
+        // is the point — a supervisor must not be a way around it), so
+        // without the flag it reached the resume gate with no way through
+        // and refused with "not a terminal" after the parent had already
+        // accepted. The guest then cold-booted instead of resuming, which
+        // looked like the restore path was never taken at all.
+        //
+        // Safe to forward: at this point the parent has either recorded a
+        // human's keypress or been given the flag itself, so the
+        // supervisor is re-checking a decision already made rather than
+        // making a new one.
+        let mut spawn = std::process::Command::new(&binary);
+        spawn.arg("start").arg(SUPERVISE_FLAG);
+        if accepted {
+            spawn.arg("--accept");
+        }
+        let child = spawn
             .current_dir(&context.project_dir)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err)
             .spawn();
         let mut child = match child {
             Ok(child) => child,
@@ -736,6 +871,9 @@ mod commands {
                     if console.exists() {
                         eprintln!("  console: {}", console.display());
                     }
+                    if log_path.exists() {
+                        eprintln!("  supervisor: {}", log_path.display());
+                    }
                     // The supervisor's exit code, so a script sees the
                     // real reason rather than a generic failure.
                     return ExitCode::from(
@@ -795,6 +933,182 @@ mod commands {
     /// Generous because a first boot runs `initdb`: `05` §5 measured 6.97 s
     /// to a bare NixOS userspace, and a database adds to that.
     const GUEST_BOOT_BUDGET_SECS: u64 = 180;
+
+    /// `rachna suspend`.
+    ///
+    /// Asks the running supervisor to write its guest's memory to disk and
+    /// stop. The supervisor does the work because it **holds the VM** — a
+    /// VZ guest lives inside its creating process (`02` §6), so no other
+    /// process can save it.
+    pub(crate) fn suspend() -> ExitCode {
+        let context = match context() {
+            Ok(context) => context,
+            Err(why) => {
+                eprintln!("rachna: {why}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        let running = match run::already_running(&context) {
+            Ok(running) => running,
+            Err(error) => {
+                eprintln!("rachna: {error}");
+                return ExitCode::from(FAILED);
+            }
+        };
+        if running.is_empty() {
+            // Not an error: `00` §5.2's spirit is that these commands are
+            // safe to type when you are unsure what is going on.
+            println!("nothing to suspend");
+            return ExitCode::from(OK);
+        }
+
+        let paths = context.paths();
+        let request = rachna::supervise::suspend_request(&paths);
+        if let Err(error) = std::fs::write(&request, b"suspend\n") {
+            eprintln!("rachna: cannot ask the supervisor to suspend: {error}");
+            return ExitCode::from(FAILED);
+        }
+
+        // Waits for the supervisor to go, because a `suspend` that returns
+        // while the memory is still being written would let the next
+        // command see a half-written snapshot.
+        let deadline = std::time::Instant::now() + SUSPEND_BUDGET;
+        while std::time::Instant::now() < deadline {
+            match run::already_running(&context) {
+                Ok(now) if now.is_empty() => {
+                    let _ = std::fs::remove_file(&request);
+                    run::clear_stale_record(&context);
+                    let snapshot = paths.snapshot_dir().join(SNAPSHOT_FILE);
+                    if snapshot.exists() {
+                        let size = std::fs::metadata(&snapshot).map_or(0, |m| m.len());
+                        println!("suspended ({} MiB)", size / 1024 / 1024);
+                        // NOT "resume it with: rachna resume" on macOS —
+                        // that is an offered command that does not work
+                        // (`02` §6.11), and `00` §3.3's rule makes naming
+                        // a broken action worse than naming none.
+                        if cfg!(target_os = "macos") {
+                            println!(
+                                "  note: the memory snapshot cannot be restored yet \
+                                 (02 §6.11)."
+                            );
+                            println!(
+                                "  `rachna start` boots fresh; your data is on the \
+                                 state volume, not in the snapshot."
+                            );
+                        } else {
+                            println!("  resume it with: rachna resume");
+                        }
+                        return ExitCode::from(OK);
+                    }
+                    // The supervisor stopped and wrote nothing. Reported as
+                    // a failure rather than a suspend, because `resume`
+                    // would then find nothing and the user would have lost
+                    // the running state believing it was saved.
+                    eprintln!(
+                        "rachna: the environment stopped but no snapshot was written. \
+                         Its console is at {}",
+                        paths.console_log().display()
+                    );
+                    return ExitCode::from(FAILED);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("rachna: {error}");
+                    return ExitCode::from(FAILED);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+
+        let _ = std::fs::remove_file(&request);
+        eprintln!(
+            "rachna: the environment did not suspend within {}s. It is still \
+             running; `rachna stop` will tear it down, losing its state",
+            SUSPEND_BUDGET.as_secs()
+        );
+        ExitCode::from(FAILED)
+    }
+
+    /// `rachna resume`.
+    ///
+    /// Boots from a snapshot rather than cold. **Goes through the policy
+    /// gate**, like `start`: `00` §3.10c's correction makes the summary
+    /// unconditional on every resume, and a snapshot taken under grants
+    /// `rachna.nix` no longer declares needs a keypress.
+    pub(crate) fn resume() -> ExitCode {
+        let context = match context() {
+            Ok(context) => context,
+            Err(why) => {
+                eprintln!("rachna: {why}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        // MEASURED LIMIT, stated before anything runs. `02` §6.11: a
+        // rebuilt VZ configuration cannot restore — the same object can,
+        // and `resume` is a different process, so it has no way to offer
+        // one. Attempting it would cold-boot and discard the suspended
+        // session, which is worse than refusing: a user who is told
+        // "cannot resume" still has their state on disk, and one who is
+        // told "started" has lost it.
+        //
+        // Not a `todo!`: the mechanism works within a process, and which
+        // way to close this is a product decision (`02` §6.11's table).
+        if cfg!(target_os = "macos") {
+            eprintln!(
+                "rachna: `resume` cannot restore a suspended session yet. \
+                 Virtualization.framework refuses a rebuilt configuration \
+                 (02 §6.11, measured), and `resume` is a separate process \
+                 from the one that saved."
+            );
+            eprintln!(
+                "  your data is safe: it lives on the state volume, not in \
+                 the snapshot. `rachna start` boots fresh and the database \
+                 comes back."
+            );
+            return ExitCode::from(UNIMPLEMENTED_RESUME);
+        }
+
+        let snapshot = context.paths().snapshot_dir().join(SNAPSHOT_FILE);
+        if !snapshot.exists() {
+            // Names the alternative, per `00` §3.3 — a user with no
+            // snapshot wants to know what to type, not that a file is
+            // absent.
+            eprintln!(
+                "rachna: nothing to resume (no snapshot at {}). \
+                 `rachna start` boots a fresh environment",
+                snapshot.display()
+            );
+            return ExitCode::from(FAILED);
+        }
+
+        // `start` with the snapshot present IS resume: it runs the gate,
+        // spawns the supervisor, and the supervisor restores rather than
+        // cold-boots when a snapshot is there. One path, so a resume
+        // cannot skip a check that `start` makes.
+        start(false, false)
+    }
+
+    /// `resume` is not available: 70, "not built yet".
+    ///
+    /// Distinct from a refusal (77): the policy is fine and the host is
+    /// fine, the mechanism is missing.
+    const UNIMPLEMENTED_RESUME: u8 = 70;
+
+    /// The snapshot's filename, inside the project's `snapshots/`.
+    ///
+    /// One name rather than a timestamped series: `00` §7's suspend/resume
+    /// is "close the laptop and come back", not a history. A named series
+    /// is `rachna snapshot`'s job if that verb is ever built.
+    pub(crate) const SNAPSHOT_FILE: &str = "memory.vzvmsave";
+
+    /// How long `suspend` waits for the memory to be written.
+    ///
+    /// `24` §4 measured 152-329 ms to snapshot a real guest and `16` §4
+    /// measured 2735 ms with Postgres and Node running, so this is that
+    /// with room for a guest that has touched much more memory.
+    const SUSPEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
     /// `rachna stop`.
     pub(crate) fn stop() -> ExitCode {

@@ -143,6 +143,21 @@ impl std::fmt::Display for VmError {
 
 impl std::error::Error for VmError {}
 
+/// What to do with the console log when building a configuration.
+///
+/// An enum rather than a `bool`, because `build(launch, true)` says nothing
+/// about what is true (AGENTS.md, "prefer enums") — and getting it wrong
+/// here is a lost session rather than a cosmetic bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Console {
+    /// Truncate: this is a cold boot, and a stale readiness marker would
+    /// make the next `start` report success without waiting.
+    Fresh,
+    /// Leave it exactly as it is: a restore's configuration must match the
+    /// snapshot's, and a replaced console file does not (`02` §4).
+    Keep,
+}
+
 /// A live guest, and the handle its lifecycle runs through.
 ///
 /// Not `Send`: every VZ call must happen on the queue the VM was created
@@ -215,6 +230,38 @@ impl Guest {
     /// rather than an error return. [`VmError::Invalid`] if the host
     /// refuses the configuration.
     pub fn new(launch: &Launch) -> Result<Self, VmError> {
+        Self::build(launch, Console::Fresh)
+    }
+
+    /// Builds a `Guest` whose configuration must match a snapshot's.
+    ///
+    /// **Measured limit (`02` §6.11): a rebuilt configuration cannot
+    /// restore at all.** The same `Guest` restores its own snapshot
+    /// reliably; a second one built from an identical [`Launch`] is
+    /// refused with "invalid argument", and four candidate causes were
+    /// eliminated. So this is useful only *within* the process that saved
+    /// — it does not make a snapshot portable across a command boundary,
+    /// and `rachna resume` as a separate process cannot work this way.
+    ///
+    /// **`02` §4's hardest constraint**: *"Rebuilding an equivalent config
+    /// with a fresh console pipe fails with `VZErrorRestore` / 'invalid
+    /// argument'"*. Measured again here, from the other end — a supervisor
+    /// is a NEW PROCESS, so it cannot hold the original configuration
+    /// object and must rebuild one the snapshot accepts.
+    ///
+    /// What broke it was [`Console::Fresh`]'s truncation: renaming the
+    /// console aside and creating a new file is a *different* attachment,
+    /// and restore rejected it with "invalid argument" — the supervisor
+    /// then cold-booted and the suspended session was lost.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn for_restore(launch: &Launch) -> Result<Self, VmError> {
+        Self::build(launch, Console::Keep)
+    }
+
+    fn build(launch: &Launch, console: Console) -> Result<Self, VmError> {
         for required in [&launch.kernel, &launch.initrd] {
             if !required.exists() {
                 return Err(VmError::Missing(required.clone()));
@@ -260,11 +307,26 @@ impl Guest {
             // The previous boot's log is not lost silently: it is moved
             // aside, because the most useful console is usually the one
             // from the boot that just failed.
-            if launch.console_log.exists() {
-                let previous = launch.console_log.with_extension("log.previous");
-                let _ = std::fs::rename(&launch.console_log, previous);
+            match console {
+                // A cold boot gets a fresh log, so a readiness marker in
+                // it is about THIS boot (`02` §6.10).
+                Console::Fresh => {
+                    if launch.console_log.exists() {
+                        let previous = launch.console_log.with_extension("log.previous");
+                        let _ = std::fs::rename(&launch.console_log, previous);
+                    }
+                    let _ = std::fs::File::create(&launch.console_log);
+                }
+                // A restore must leave it ALONE. Replacing the file is a
+                // different attachment, and `02` §4's `VZErrorRestore`
+                // follows.
+                Console::Keep => {
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&launch.console_log);
+                }
             }
-            let _ = std::fs::File::create(&launch.console_log);
             let attachment = VZFileSerialPortAttachment::initWithURL_append_error(
                 VZFileSerialPortAttachment::alloc(),
                 &url(&launch.console_log),

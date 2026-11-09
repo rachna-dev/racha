@@ -205,6 +205,63 @@ fn a_guest_snapshots_and_restores_its_memory() {
 }
 
 #[test]
+fn measured_whether_a_rebuilt_configuration_can_restore_at_all() {
+    // THE question cross-process resume depends on, and `02` §4 only half
+    // answers it: *"restore initially failed until the same config object
+    // was reused"*. If a rebuilt configuration can never restore, then a
+    // supervisor — which is a NEW PROCESS and cannot hold the original
+    // object — cannot resume, and `rachna resume` needs a different design
+    // rather than a smaller fix.
+    //
+    // This test exists to record the answer rather than to assert a
+    // behaviour I want. It prints what each path does and asserts only the
+    // thing that must hold either way: the SAME object restores.
+    let Some((kernel, initrd, dir)) = fixture("rebuilt-config") else {
+        return;
+    };
+    let plan = launch(kernel, initrd, &dir);
+    let snapshot = dir.join("memory.vzvmsave");
+
+    let original = Guest::for_restore(&plan).expect("valid configuration");
+    if !original.can_snapshot() {
+        println!("SKIP: this host cannot snapshot this device set");
+        return;
+    }
+    original.start().expect("starts");
+    assert!(
+        original.wait_for_console(
+            &plan.console_log,
+            "RACHNA-GUEST-ALIVE",
+            Duration::from_secs(45)
+        ),
+        "the guest never came up"
+    );
+    original.pause().expect("pauses");
+    original.save(&snapshot).expect("saves");
+    original.stop().expect("stops");
+
+    // THE BASELINE: the same object must restore, or the snapshot itself
+    // is bad and nothing below means anything.
+    original
+        .restore(&snapshot)
+        .expect("the SAME configuration object must restore its own snapshot");
+    assert_eq!(original.state(), VmState::Paused);
+    original.resume().expect("resumes");
+    original.stop().expect("stops");
+    println!("same object:    restore OK");
+
+    // AND THE MEASUREMENT: a rebuilt configuration, which is all a
+    // supervisor can offer.
+    let rebuilt = Guest::for_restore(&plan).expect("valid configuration");
+    match rebuilt.restore(&snapshot) {
+        Ok(()) => println!("rebuilt config: restore OK — cross-process resume is possible"),
+        Err(error) => println!("rebuilt config: restore REFUSED — {error}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn save_is_refused_unless_the_guest_is_paused() {
     // `02` §4 makes this a hypervisor rule, and `lifecycle.rs` §2 declines
     // to be clever about it. Refusing on our side turns a framework
