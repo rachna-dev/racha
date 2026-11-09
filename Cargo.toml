@@ -74,7 +74,53 @@ serde_json = { version = "1.0.154", features = ["raw_value"] }
 rustix = { version = "1", features = ["process", "termios"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-virtualization = "0.3.2"
+objc2-virtualization = { version = "0.3.2", features = [
+    "block2",
+    "VZVirtualMachine",
+    "VZVirtualMachineConfiguration",
+    "VZVirtualMachineDelegate",
+    "VZLinuxBootLoader",
+    "VZVirtioBlockDeviceConfiguration",
+    "VZDiskImageStorageDeviceAttachment",
+    "VZVirtioFileSystemDeviceConfiguration",
+    "VZSharedDirectory",
+    "VZSingleDirectoryShare",
+    "VZMultipleDirectoryShare",
+    "VZVirtioConsoleDeviceSerialPortConfiguration",
+    "VZFileHandleSerialPortAttachment",
+    "VZFileSerialPortAttachment",
+    "VZVirtioEntropyDeviceConfiguration",
+    "VZVirtioTraditionalMemoryBalloonDeviceConfiguration",
+    "VZVirtioSocketDeviceConfiguration",
+    "VZVirtioSocketListener",
+    "VZVirtioSocketConnection",
+    "VZError",
+    "VZStorageDeviceConfiguration",
+    "VZStorageDeviceAttachment",
+    "VZBootLoader",
+    "VZSerialPortConfiguration",
+    "VZSerialPortAttachment",
+    "VZDirectorySharingDeviceConfiguration",
+    "VZDirectoryShare",
+    "VZEntropyDeviceConfiguration",
+    "VZMemoryBalloonDeviceConfiguration",
+    "VZSocketDeviceConfiguration",
+    "objc2-core-foundation",
+] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSError",
+    "NSString",
+    "NSURL",
+    "NSArray",
+    "NSFileHandle",
+    "NSObject",
+    "NSThread",
+    "NSRunLoop",
+    "NSDate",
+] }
+block2 = "0.6"
+dispatch2 = { version = "0.3", features = ["objc2"] }
 
 [dev-dependencies]
 proptest = { version = "1.12.0", default-features = false, features = ["std", "bit-set"] }

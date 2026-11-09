@@ -24,6 +24,12 @@ use crate::lifecycle::{Action, Refused, State};
 
 pub mod linux;
 pub mod macos;
+// The VM itself, macOS only. Separate from `macos` — which is capability
+// reporting and entitlement checks, and stays safe Rust — because this is
+// the ONE module permitted to use `unsafe`, and mixing the two would widen
+// that permission to code that does not need it.
+#[cfg(target_os = "macos")]
+pub mod macos_vm;
 use core::fmt;
 
 /// What a backend can actually do.

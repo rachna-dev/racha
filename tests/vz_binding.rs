@@ -1,16 +1,28 @@
 //! The macOS VZ binding surface, pinned.
 //!
-//! `17-DEPENDENCIES.md` chose `objc2-virtualization` on one measurement:
-//! every method `02` §4 makes a hard constraint is reachable as **safe**
-//! Rust, which matters because `Cargo.toml` denies `unsafe_code` and a
-//! binding needing `unsafe` per call would have meant weakening that lint
-//! across the most security-sensitive module.
+//! Every method `02` §4 makes a hard constraint EXISTS with the signature
+//! claimed. These are method REFERENCES, not string lookups: the file
+//! compiles only if each name and signature exists. That is deliberate —
+//! `12` §2's error was probing for a capability by guessed name, and this
+//! probe's own first draft repeated it
+//! (`validateSaveRestoreSupportAndReturnError`, which does not exist; the
+//! compiler supplied `…WithError`).
 //!
-//! These are method REFERENCES, not string lookups: the file compiles only
-//! if each name and signature exists. That is deliberate — `12` §2's error
-//! was probing for a capability by guessed name, and this probe's own first
-//! draft repeated it (`validateSaveRestoreSupportAndReturnError`, which does
-//! not exist; the compiler supplied `…WithError`).
+//! # What this file does NOT establish, and once claimed to
+//!
+//! It used to be titled "reachable as **safe** Rust", and `17` recorded
+//! `SAFE` against each method on its evidence. **That was false.** All 502
+//! functions in the binding are `pub unsafe fn`, and this file cannot show
+//! otherwise: **taking a reference to an `unsafe fn` is safe; only calling
+//! it is not.** So every assertion here passed while the claim built on
+//! them was wrong.
+//!
+//! The lesson is narrower than "verify your claims" and worth keeping: a
+//! probe is evidence only for the question it actually asks. Using the
+//! compiler is not itself a guarantee of *which* question got answered —
+//! here it answered "does this symbol exist?" and the answer was written
+//! down against "is this call safe?". Calling one in the real
+//! configuration is what settled it (`17`, the 2026-11-09 correction).
 //!
 //! A macOS SDK change that renames a method breaks this at **compile time**,
 //! which is the better end of the trade.
@@ -25,7 +37,7 @@ use objc2_virtualization::{
 };
 
 #[test]
-fn every_hard_constraint_in_02_section_4_is_reachable_as_safe_rust() {
+fn every_hard_constraint_in_02_section_4_exists_with_the_claimed_signature() {
     // `02` §4: validateSaveRestoreSupport is a SEPARATE gate from validate,
     // and must be surfaced as a capability rather than discovered at the
     // first suspend.
