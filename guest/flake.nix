@@ -21,8 +21,33 @@
   # with the same rachna.nix must get the same machine (`08` §4.1.1).
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/3181085bfd08663b6b9e60bc7a8395c2aaa741bd";
 
+  # HOST TOOLING ONLY — deliberately a second input, and the separation is
+  # load-bearing.
+  #
+  # The guest pin above decides what the VM *is*: `08` §4.1.1 requires two
+  # people with the same `rachna.nix` to get the same machine, so bumping it
+  # changes every guest and is never done by accident. But the pin ships
+  # Cloud Hypervisor **53.0**, and `04` §7 recommends targeting **v54** for
+  # the n-2 migration-compatibility guarantee — plus `25` §3 needs v54's
+  # offload daemon, which is the only design where snapshot plaintext never
+  # reaches disk.
+  #
+  # Those are two different questions. The hypervisor is a *host tool* that
+  # runs the guest; it is not part of the guest. Bumping it must not rebuild
+  # anyone's environment, and a single input would have forced exactly that.
+  #
+  # `24`'s correction is why this is explicit rather than implied: that spike
+  # used v53 from the devShell and v54 from elsewhere without recording
+  # which, so its header claimed v54 for measurements taken on v53. The flake
+  # now names both, and the devShell is the version of record for tooling.
+  inputs.host-tools.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      host-tools,
+    }:
     let
       forSystems =
         f:
@@ -130,13 +155,34 @@
       );
 
       devShells = forSystems (
-        system: pkgs: {
+        system: pkgs:
+        let
+          # From `host-tools`, not the guest pin. Asserted below rather than
+          # trusted: a devShell silently giving v53 is what made `24`'s
+          # header wrong.
+          tools = host-tools.legacyPackages.${system};
+        in
+        {
           default = pkgs.mkShell {
-            packages = with pkgs; [
-              cloud-hypervisor
-              virtiofsd
-              jq
+            packages = [
+              tools.cloud-hypervisor
+              tools.virtiofsd
+              pkgs.jq
             ];
+
+            # `04` §7 wants v54 and `25` §3 needs its offload daemon. If the
+            # shell ever resolves to something older, say so on entry rather
+            # than letting a measurement be attributed to the wrong version
+            # — which is the mistake `24`'s header made.
+            shellHook = ''
+              have=$(cloud-hypervisor --version 2>/dev/null | head -1)
+              case "$have" in
+                *v5[4-9]*|*v[6-9][0-9]*) : ;;
+                *) echo "rachna: WARNING — host tooling is '$have'." >&2
+                   echo "  04 §7 targets v54+ and 25 §3 needs its offload" >&2
+                   echo "  daemon. Measurements taken here must record v53." >&2 ;;
+              esac
+            '';
           };
         }
       );
