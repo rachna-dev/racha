@@ -250,13 +250,20 @@ fn measured_whether_a_rebuilt_configuration_can_restore_at_all() {
     original.stop().expect("stops");
     println!("same object:    restore OK");
 
-    // AND THE MEASUREMENT: a rebuilt configuration, which is all a
-    // supervisor can offer.
+    // AND THE MEASUREMENT, now asserted rather than printed: a rebuilt
+    // configuration is REFUSED. This is what makes the design necessary —
+    // the supervisor holds its guest across a suspend because nothing else
+    // can restore it — so if this ever starts passing, the simpler design
+    // (suspend exits, resume rebuilds) becomes available and this test is
+    // where that is noticed.
     let rebuilt = Guest::for_restore(&plan).expect("valid configuration");
-    match rebuilt.restore(&snapshot) {
-        Ok(()) => println!("rebuilt config: restore OK — cross-process resume is possible"),
-        Err(error) => println!("rebuilt config: restore REFUSED — {error}"),
-    }
+    let refused = rebuilt.restore(&snapshot);
+    assert!(
+        refused.is_err(),
+        "a REBUILT configuration restored successfully. `02` §6.11 says it \
+         cannot, and the whole held-supervisor design exists because of \
+         that — re-measure before simplifying, but this is good news"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

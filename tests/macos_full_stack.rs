@@ -166,6 +166,80 @@ fn todos_written_through_the_app_are_read_back_from_postgres() {
 }
 
 #[test]
+fn a_supervisor_holds_its_configuration_across_a_suspend() {
+    // THE design `02` §6.11 forced, exercised at the level that matters:
+    // one `Guest` saves and the SAME `Guest` restores, because a rebuilt
+    // configuration cannot (measured, asserted in
+    // `macos_vm_lifecycle.rs`).
+    //
+    // This is what `rachna suspend` / `rachna resume` are built on — the
+    // supervisor process stays alive while suspended so the object that
+    // saved is still there to restore. A test that built a second guest
+    // would be testing the thing that does not work.
+    let Some((kernel, initrd, root, dir)) = fixture("hold") else {
+        return;
+    };
+    let plan = launch(kernel, initrd, private_root(&root, &dir), &dir);
+    let snapshot = dir.join("memory.vzvmsave");
+
+    let guest = Guest::new(&plan).expect("valid configuration");
+    assert!(
+        guest.can_snapshot(),
+        "this host cannot snapshot this device set"
+    );
+    guest.start().expect("starts");
+    assert!(
+        guest.wait_for_console(&plan.console_log, "RACHNA-TODOS-CHECKED", BOOT_BUDGET),
+        "the stack never came up. Console:\n{}",
+        console(&plan.console_log)
+    );
+
+    let ticks_before = console(&plan.console_log).matches("RACHNA-TICK-").count();
+    assert!(ticks_before > 0, "the guest was not ticking before suspend");
+
+    // suspend: pause -> save -> stop. The guest stops; the Guest lives.
+    guest.pause().expect("pauses");
+    guest.save(&snapshot).expect("saves");
+    guest.stop().expect("stops");
+    assert_eq!(guest.state(), VmState::Stopped);
+
+    // resume: restore -> resume, through the SAME object.
+    guest
+        .restore(&snapshot)
+        .expect("the holding guest restores");
+    assert_eq!(guest.state(), VmState::Paused, "restore must land Paused");
+    guest.resume().expect("resumes");
+    assert_eq!(guest.state(), VmState::Running);
+
+    // THE PROOF, and it is the guest's own output rather than a state
+    // reading: a cold boot would restart the tick counter and re-run
+    // initdb. `02` §6.11 records reading a tick count that could not
+    // distinguish the two, so this waits for a tick BEYOND where it
+    // stopped.
+    let continued = guest.wait_for_console(
+        &plan.console_log,
+        &format!("RACHNA-TICK-{}", ticks_before + 2),
+        Duration::from_secs(30),
+    );
+    let log = console(&plan.console_log);
+    assert!(
+        continued,
+        "the restored guest never continued its work. Console tail:\n{}",
+        log.lines().rev().take(12).collect::<Vec<_>>().join("\n")
+    );
+    // One initdb across the whole cycle: the database came back with the
+    // memory rather than being recreated.
+    assert_eq!(
+        log.matches("RACHNA-PG-INITDB-DONE").count(),
+        1,
+        "postgres re-initialised, so this was a reboot and not a resume"
+    );
+
+    guest.stop().expect("stops");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_running_stack_survives_a_snapshot_and_restore() {
     // THE test. Postgres running, data in it, an app serving — paused,
     // written to disk, stopped, restored, resumed. `02` §4's compound

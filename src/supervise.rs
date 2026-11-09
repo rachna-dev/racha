@@ -180,6 +180,17 @@ pub fn suspend_request(paths: &ProjectPaths) -> PathBuf {
     paths.runtime_dir().join("suspend")
 }
 
+/// The file a suspended supervisor watches to know it should resume.
+///
+/// The third request file, and the reason there are three rather than one
+/// with a payload: a half-written payload would be a guest asked to do the
+/// wrong thing, and these three mean "keep your state", "discard it" and
+/// "bring it back". Confusing any pair of them loses work.
+#[must_use]
+pub fn resume_request(paths: &ProjectPaths) -> PathBuf {
+    paths.runtime_dir().join("resume")
+}
+
 /// Whether a pid names a process that still exists.
 ///
 /// `stop` needs this for a different reason than `start`: `stop` must not
