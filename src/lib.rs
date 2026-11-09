@@ -166,6 +166,7 @@ mod tests {
     }
 }
 
+pub mod agent;
 pub mod credential;
 pub mod decide;
 pub mod decision;
