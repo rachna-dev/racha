@@ -54,6 +54,20 @@ mkdir -p /data/pgdata /data/run
 chown -R postgres:postgres /data
 echo "RACHNA-STATE-READY"
 
+# THE WORKSPACE is already mounted: the initramfs does it BEFORE
+# switch_root, because mounting virtiofs after the pivot gave a live
+# mount serving an empty tree (`02` §6.12). So this only reports what is
+# there, which is also the evidence that matters — "mounted" is the
+# mechanism's verdict on itself, and the file list is the user's.
+if grep -q " /workspace " /proc/mounts 2>/dev/null; then
+  echo "RACHNA-WORKSPACE-MOUNTED"
+  # `find`, not `ls`: shellcheck is right that `ls` mishandles odd
+  # filenames, and a project directory is exactly where they appear.
+  echo "RACHNA-WORKSPACE-FILES: $(find /workspace -maxdepth 1 2>&1 | tr '\n' ' ')"
+else
+  echo "RACHNA-WORKSPACE-MISSING: no virtiofs share tagged 'workspace'"
+fi
+
 # Postgres. `12`-era finding: nothing creates the data dir, so do it here.
 if [ ! -f /data/pgdata/PG_VERSION ]; then
   su postgres -c "@POSTGRES@/bin/initdb -D /data/pgdata -A trust" >/data/initdb.log 2>&1
@@ -89,7 +103,11 @@ fi
 # The todos app.
 # `|| exit` because running the app from the wrong directory would
 # look like a missing file rather than a failed cd.
-cd /workspace || exit 1
+# `/opt/rachna`, NOT `/workspace`. The demo app ships in the image, and
+# the workspace is now the user's real project mounted over virtiofs —
+# running from there would mean the app vanishes the moment a real
+# project appears, which is the normal case rather than an edge one.
+cd /opt/rachna || exit 1
 @NODE@/bin/node todos.js >/data/todos.log 2>&1 &
 i=0
 while [ $i -lt 60 ]; do

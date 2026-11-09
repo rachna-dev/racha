@@ -566,7 +566,20 @@ mod commands {
             }
         };
 
-        let plan = launch_for(policy, &image, &paths, root, state);
+        let plan = launch_for(policy, &image, &paths, &context.project_dir, root, state);
+        // Logged because a share that silently fails to attach is invisible
+        // otherwise: the guest just reports no workspace, which looks
+        // guest-side and is not.
+        for share in &plan.shares {
+            // Recorded because a share that attaches and serves nothing is
+            // invisible otherwise — the guest just reports no workspace,
+            // which reads as host-side and is not (02 §6.12).
+            eprintln!(
+                "rachna: sharing {} as `{}`",
+                share.host_path.display(),
+                share.tag
+            );
+        }
 
         // NO RESTORE HERE, and that is measured rather than chosen. `02`
         // §6.11: only the process that SAVED a snapshot can restore it, so

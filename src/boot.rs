@@ -14,7 +14,7 @@
 //! silently shells out to a 20-minute build is worse than one that tells
 //! you what to run.
 
-use crate::backend::linux::{Disk, Launch};
+use crate::backend::linux::{Disk, Launch, Share};
 use crate::decide::Policy;
 use crate::layout::ProjectPaths;
 use std::path::{Path, PathBuf};
@@ -133,6 +133,7 @@ pub fn launch_for(
     policy: &Policy,
     image: &Image,
     paths: &ProjectPaths,
+    project_dir: &Path,
     root: PathBuf,
     state: PathBuf,
 ) -> Launch {
@@ -160,15 +161,34 @@ pub fn launch_for(
                 read_only: false,
             },
         ],
-        // Empty on macOS: VZ shares a host directory directly rather than
-        // through a virtiofsd socket, so `Share`'s socket field does not
-        // apply. The workspace mount lands here when the VZ directory-share
-        // configuration is wired.
-        shares: Vec::new(),
+        // THE WORKSPACE. Without this the environment is isolated from
+        // the thing it exists to work on — `00` §1's whole premise is a
+        // project directory you can edit on the host and build in the
+        // guest.
+        //
+        // The socket is empty because VZ has no virtiofsd; `Share`'s
+        // comment records why both fields exist.
+        shares: vec![Share {
+            tag: WORKSPACE_TAG.to_owned(),
+            host_path: project_dir.to_path_buf(),
+            socket: PathBuf::new(),
+            // WRITABLE. A guest that cannot write to the workspace cannot
+            // compile, install dependencies, or run a formatter — the
+            // isolation that matters is the HOST boundary (`00` §3), not
+            // the project directory the user is working in.
+            read_only: false,
+        }],
         console_log: paths.console_log(),
         api_socket: paths.api_socket(),
     }
 }
+
+/// The tag the guest mounts the workspace by.
+///
+/// One constant rather than a string at each end: the host names the share
+/// and the guest's init mounts it, and a mismatch is a guest with no
+/// workspace and nothing on the console to say why.
+pub const WORKSPACE_TAG: &str = "workspace";
 
 /// Where this project's writable root copy lives.
 ///
@@ -344,8 +364,18 @@ mod tests {
             &policy(),
             &image,
             &paths,
+            Path::new("/some/project"),
             PathBuf::from("/tmp/root.img"),
             PathBuf::from("/tmp/state.img"),
+        );
+        // THE WORKSPACE IS SHARED. Without it the environment cannot see
+        // the project it exists to work on, which is `00` §1's premise.
+        assert_eq!(launch.shares.len(), 1, "the workspace was not shared");
+        assert_eq!(launch.shares[0].tag, WORKSPACE_TAG);
+        assert_eq!(launch.shares[0].host_path, Path::new("/some/project"));
+        assert!(
+            !launch.shares[0].read_only,
+            "a read-only workspace cannot be built in"
         );
         // TWO disks, in order: the guest sees /dev/vda (root) and /dev/vdb
         // (state), and its init mounts vdb at /data. One disk meant a

@@ -57,13 +57,28 @@ pub const fn measured_capabilities() -> Capabilities {
     }
 }
 
-/// A virtiofs share to attach.
+/// A host directory the guest can see.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Share {
     /// The tag the guest mounts by.
     pub tag: String,
-    /// The vhost-user socket virtiofsd is listening on.
+    /// The host directory being shared.
+    ///
+    /// **The backends need different things from a share and this is the
+    /// one they agree on.** Cloud Hypervisor talks to a `virtiofsd` that
+    /// was pointed at this path; Virtualization.framework shares the
+    /// directory itself and has no daemon and no socket. So the path is on
+    /// the type and the socket is Linux's business.
+    pub host_path: PathBuf,
+    /// The vhost-user socket `virtiofsd` is listening on.
+    ///
+    /// Linux only. Empty on macOS, where there is no daemon to talk to.
     pub socket: PathBuf,
+    /// Whether the guest may write to it.
+    ///
+    /// `00` §3's deny-by-default applies to the workspace too: a `tool`
+    /// grant that only reads should not get a writable mount.
+    pub read_only: bool,
 }
 
 /// A block device to attach.
@@ -401,6 +416,8 @@ mod tests {
                 },
             ],
             shares: vec![Share {
+                host_path: PathBuf::from("/workspace-on-host"),
+                read_only: false,
                 tag: "workspace".to_owned(),
                 socket: PathBuf::from("/p/vfs.sock"),
             }],

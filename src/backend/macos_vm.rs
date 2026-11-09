@@ -63,10 +63,12 @@ use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZEntropyDeviceConfiguration, VZFileSerialPortAttachment,
-    VZLinuxBootLoader, VZSerialPortConfiguration, VZStorageDeviceConfiguration,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioEntropyDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment,
+    VZEntropyDeviceConfiguration, VZFileSerialPortAttachment, VZLinuxBootLoader,
+    VZSerialPortConfiguration, VZSharedDirectory, VZSingleDirectoryShare,
+    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZVirtioFileSystemDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
     VZVirtualMachineState,
 };
 use std::path::Path;
@@ -372,6 +374,54 @@ impl Guest {
                 let devices: Retained<NSArray<VZStorageDeviceConfiguration>> =
                     NSArray::from_retained_slice(&attached);
                 config.setStorageDevices(&devices);
+            }
+
+            // Directory shares: the workspace, and whatever else the
+            // policy grants. VZ shares a host DIRECTORY — no virtiofsd, no
+            // socket — which is why `Share` carries a path.
+            if !launch.shares.is_empty() {
+                let mut devices: Vec<Retained<VZDirectorySharingDeviceConfiguration>> = Vec::new();
+                for share in &launch.shares {
+                    if !share.host_path.is_dir() {
+                        return Err(VmError::Missing(share.host_path.clone()));
+                    }
+                    // `02` §4.1, measured on the guest side: never mount a
+                    // host share over a directory systemd owns. The TAG is
+                    // what the guest mounts by, and the guest decides
+                    // where — so the host's job is to name it accurately
+                    // and not to pick the mount point.
+                    let tag = NSString::from_str(&share.tag);
+                    // The tag must be valid, and VZ is the authority on
+                    // what that means rather than us guessing a charset.
+                    VZVirtioFileSystemDeviceConfiguration::validateTag_error(&tag).map_err(
+                        |error| {
+                            VmError::Invalid(format!(
+                                "`{}` is not a usable share tag: {}",
+                                share.tag,
+                                error.localizedDescription()
+                            ))
+                        },
+                    )?;
+
+                    let directory = VZSharedDirectory::initWithURL_readOnly(
+                        VZSharedDirectory::alloc(),
+                        &url(&share.host_path),
+                        share.read_only,
+                    );
+                    let single = VZSingleDirectoryShare::initWithDirectory(
+                        VZSingleDirectoryShare::alloc(),
+                        &directory,
+                    );
+                    let device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                        VZVirtioFileSystemDeviceConfiguration::alloc(),
+                        &tag,
+                    );
+                    device.setShare(Some(&single));
+                    devices.push(Retained::into_super(device));
+                }
+                let list: Retained<NSArray<VZDirectorySharingDeviceConfiguration>> =
+                    NSArray::from_retained_slice(&devices);
+                config.setDirectorySharingDevices(&list);
             }
 
             config
