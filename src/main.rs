@@ -318,6 +318,22 @@ mod commands {
             }
         };
 
+        // A record left by a crashed supervisor is cleared BEFORE the
+        // check below, so a crash does not make `start` refuse forever.
+        // Separate from the check because `already_running` is a query:
+        // deleting inside it made `stop`'s polling loop destroy the record
+        // it was about to signal.
+        //
+        // NOT under `--supervise`. The supervisor is spawned by a `start`
+        // that records it and is *about* to — at this instant the record
+        // may name a pid that is still starting, so a supervisor clearing
+        // "stale" records deletes its own. Measured: `rachna stop` then
+        // reported "0 process(es)" against a demonstrably running guest,
+        // because there was no record left to read.
+        if !supervise {
+            run::clear_stale_record(&context);
+        }
+
         // Idempotent: `00` §5.2 makes this the command people type on `cd`.
         //
         // SKIPPED under `--supervise`. The supervisor is spawned BY a
@@ -562,7 +578,14 @@ mod commands {
         // spawns this rather than doing it inline.
         let request = rachna::supervise::shutdown_request(&paths);
         loop {
-            if guest.state() != rachna::backend::macos_vm::VmState::Running {
+            let state = guest.state();
+            if state != rachna::backend::macos_vm::VmState::Running {
+                // SAYS WHY. A supervisor that exits silently is
+                // indistinguishable from one that crashed, and `stop` then
+                // reports "0 process(es)" for a guest that stopped on its
+                // own — which is what sent me looking at `stop` when the
+                // supervisor was the problem.
+                eprintln!("rachna: the guest is {state:?}, so the supervisor is exiting");
                 return ExitCode::from(OK);
             }
             // `rachna stop` asks here before it signals. Honouring the

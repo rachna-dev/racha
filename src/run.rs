@@ -418,6 +418,32 @@ pub fn accept(context: &Context, policy: &Policy, now_millis: i64) -> Result<(),
         })
 }
 
+/// Deletes a running-record naming no live process.
+///
+/// Separate from [`already_running`] because that is a query and this is a
+/// write — folding them together made a polling loop destroy the record it
+/// was polling about.
+///
+/// `00` §5.2 makes `start` the command people type on `cd`, so a crash must
+/// not leave an environment that refuses to start until a user finds and
+/// deletes a file nobody told them about.
+pub fn clear_stale_record(context: &Context) {
+    let file = supervise::state_file(&context.paths());
+    let stale = match std::fs::read_to_string(&file) {
+        Ok(text) => Running::from_text(&text).is_ok_and(|recorded| {
+            !recorded.processes.is_empty()
+                && !recorded
+                    .processes
+                    .iter()
+                    .any(|process| supervise::is_running(process.pid))
+        }),
+        Err(_) => false,
+    };
+    if stale {
+        let _ = std::fs::remove_file(&file);
+    }
+}
+
 /// Whether this project has approved anything on this machine before.
 ///
 /// Read from the store, which `08` §3.1 makes a cache rather than truth —
@@ -624,10 +650,15 @@ pub fn already_running(context: &Context) -> Result<Running, supervise::StateErr
         .collect();
 
     if live.is_empty() {
-        // Nothing survived, so the record is stale. Removed rather than
-        // left: `00` §5.2 makes `start` the command people type on `cd`,
-        // and one that needs manual cleanup after a crash is not that.
-        let _ = std::fs::remove_file(&file);
+        // Stale. NOT deleted here, and that is the point: this function is
+        // a QUERY, and `stop` polls it in a loop. Deleting the record as a
+        // side effect of reading meant the first poll that saw the
+        // supervisor momentarily gone destroyed the very record `stop`
+        // then needed to signal it — measured: "stopped 0 process(es)"
+        // with the supervisor still running.
+        //
+        // `clear_stale_record` does the deleting, called where a decision
+        // is being made rather than where a question is being asked.
         return Ok(Running::nothing());
     }
 
@@ -699,8 +730,24 @@ pub fn stop(context: &Context) -> Result<supervise::StopReport, supervise::State
 
     // Re-read: the supervisor may have gone on its own, and signalling a
     // pid that has exited would report a survivor that never survived.
-    let running = already_running(context)?;
-    let report = supervise::stop(&running);
+    let remaining = already_running(context)?;
+    let mut report = supervise::stop(&remaining);
+
+    // CREDIT THE GRACEFUL STOP. `supervise::stop` counts what IT
+    // signalled, so a supervisor that shut down when asked left the report
+    // saying "stopped 0 process(es)" — about a guest that had just stopped
+    // correctly. A user reads that as a failure, and it sent me debugging
+    // `stop` three times while the graceful path was working.
+    for process in &running.processes {
+        let signalled = report
+            .stopped
+            .iter()
+            .chain(report.survived.iter().map(|(process, _)| process))
+            .any(|already| already.pid == process.pid);
+        if !signalled && !supervise::is_running(process.pid) {
+            report.stopped.push(process.clone());
+        }
+    }
     // Only once the processes are gone: a record removed first would leave a
     // running guest nothing can find.
     if report.is_clean() {
@@ -1236,9 +1283,17 @@ mod tests {
             running.is_empty(),
             "a dead pid was reported as running: {running:?}"
         );
-        // And the stale file is gone, so the next start does not re-check
-        // it. `00` §5.2 makes `start` the command people type on `cd`; one
-        // that needs manual cleanup after a crash is not that.
+        // The file is STILL THERE: reading is a query. `stop` polls this
+        // in a loop, and deleting as a side effect of reading destroyed
+        // the record `stop` then needed to signal.
+        assert!(
+            file.exists(),
+            "reading the record deleted it, which breaks stop's polling loop"
+        );
+
+        // `clear_stale_record` is what deletes, and it is called where a
+        // decision is made rather than where a question is asked.
+        clear_stale_record(&context);
         assert!(
             !file.exists(),
             "the stale state file was left behind at {}",
@@ -1271,6 +1326,14 @@ mod tests {
             "a live process was reported as not running"
         );
         assert_eq!(running.processes.len(), 1);
+
+        // And `clear_stale_record` leaves it alone. If it did not, `stop`
+        // would delete the record of the thing it is about to signal.
+        clear_stale_record(&context);
+        assert!(
+            supervise::state_file(&paths).exists(),
+            "a LIVE record was cleared as stale"
+        );
         let _ = std::fs::remove_dir_all(context.rachna_root.parent().expect("parent"));
     }
 
