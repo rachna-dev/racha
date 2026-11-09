@@ -59,11 +59,22 @@ echo "RACHNA-STATE-READY"
 # mount serving an empty tree (`02` §6.12). So this only reports what is
 # there, which is also the evidence that matters — "mounted" is the
 # mechanism's verdict on itself, and the file list is the user's.
-if grep -q " /workspace " /proc/mounts 2>/dev/null; then
+mkdir -p /workspace
+if mount -t virtiofs workspace /workspace 2>/dev/null; then
   echo "RACHNA-WORKSPACE-MOUNTED"
   # `find`, not `ls`: shellcheck is right that `ls` mishandles odd
   # filenames, and a project directory is exactly where they appear.
-  echo "RACHNA-WORKSPACE-FILES: $(find /workspace -maxdepth 1 2>&1 | tr '\n' ' ')"
+  # THE SHELL'S OWN GLOB, not `find` or `ls`. Both of those are busybox
+  # applets that enumerate with `getdents`, and on this virtiofs mount
+  # that returns nothing while every other operation works — reads,
+  # `stat`, `df` all succeed against the host's real files.
+  #
+  # That cost a long hunt: "mounted and empty" read as a broken share,
+  # and `02` §6.12 recorded `switch_root` as the cause on the strength of
+  # it. Wrong. The share was never broken; the tool I was listing with
+  # was. `cat /workspace/rachna.nix` returning the host's file is what
+  # settled it.
+  echo "RACHNA-WORKSPACE-FILES: $(cd /workspace && echo *)"
 else
   echo "RACHNA-WORKSPACE-MISSING: no virtiofs share tagged 'workspace'"
 fi

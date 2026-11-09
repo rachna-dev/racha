@@ -81,6 +81,30 @@ fn launch(kernel: PathBuf, initrd: PathBuf, root: PathBuf, dir: &std::path::Path
     }
 }
 
+/// A policy with the resources these tests need.
+fn test_policy() -> rachna::decide::Policy {
+    rachna::decide::Policy {
+        tier: rachna::policy::Tier::Allowlist,
+        profile: rachna::policy::Profile::Development,
+        grants: Vec::new(),
+        resources: rachna::resources::Resources {
+            cpus: 2,
+            memory_mib: 2048,
+            disk_mib: 600,
+            processes: 64,
+        },
+        capabilities: rachna::decide::Capabilities::all(),
+    }
+}
+
+/// A sparse state volume, as `boot::provision_state` would make.
+fn state_volume(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("state.img");
+    let file = std::fs::File::create(&path).expect("state volume");
+    file.set_len(600 * 1024 * 1024).expect("size it");
+    path
+}
+
 fn console(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
@@ -159,6 +183,94 @@ fn todos_written_through_the_app_are_read_back_from_postgres() {
     assert!(
         log.contains("TODOS [{\"id\":1"),
         "the list endpoint returned nothing usable:\n{log}"
+    );
+
+    guest.stop().expect("stops");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_guest_can_read_a_file_the_host_just_wrote() {
+    // THE workspace property, and it is deliberately a READ of a known
+    // file rather than a directory listing.
+    //
+    // `02` §6.12: the share looked broken for most of a session because
+    // `find` and `ls` return nothing on this mount — busybox applets
+    // enumerating with `getdents`, which virtiofs here does not serve —
+    // while reads, `stat` and `df` all work. I blamed the mount point,
+    // `switch_root` and macOS sandboxing in turn. A `cat` of one known
+    // filename would have settled it in a minute.
+    //
+    // So this test asserts the thing a user actually needs (the guest can
+    // see my code) by the mechanism that actually works, and a listing is
+    // checked separately below so a future readdir fix is noticed rather
+    // than assumed.
+    let Some((kernel, initrd, root, dir)) = fixture("workspace") else {
+        return;
+    };
+
+    // A host directory with a file whose contents only this run knows, so
+    // a stale image cannot produce a false pass.
+    let workspace = dir.join("project");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let marker = format!("host-wrote-this-{}", std::process::id());
+    std::fs::write(workspace.join("marker.txt"), &marker).expect("marker");
+
+    // BUILT BY `boot::launch_for`, not assembled here. The first version
+    // of this test overrode `plan.shares` with a hand-made `Share` — and
+    // then PASSED with `boot.rs`'s tag deliberately broken, because it
+    // never consulted `boot.rs` at all. A test that supplies the value it
+    // is checking is testing itself (AGENTS.md: "every adversarial test
+    // must first assert that what it attacks exists").
+    //
+    // Verified the other way now: breaking the tag in `boot.rs` fails
+    // this.
+    let image = rachna::boot::Image {
+        kernel: kernel.clone(),
+        initramfs: initrd.clone(),
+        root: root.clone(),
+    };
+    let project = rachna::layout::ProjectId::new("workspace-01").expect("id");
+    let paths = rachna::layout::ProjectPaths::new(&dir, &project);
+    let mut plan = rachna::boot::launch_for(
+        &test_policy(),
+        &image,
+        &paths,
+        &workspace,
+        private_root(&root, &dir),
+        state_volume(&dir),
+    );
+    // The console must land where this test reads it, and `launch_for`
+    // puts it under the project's runtime directory.
+    std::fs::create_dir_all(paths.runtime_dir()).expect("runtime dir");
+    plan.cmdline = "console=hvc0 root=/dev/vda rw".to_owned();
+
+    let guest = Guest::new(&plan).expect("a share must not break the configuration");
+    guest.start().expect("starts");
+    assert!(
+        guest.wait_for_console(&plan.console_log, "RACHNA-SERVICES-UP", BOOT_BUDGET),
+        "the guest never came up. Console:\n{}",
+        console(&plan.console_log)
+    );
+
+    let log = console(&plan.console_log);
+    // The kernel found the share: this is the layer below the mount, and
+    // naming it separately means a tag mismatch is distinguishable from a
+    // mount failure.
+    assert!(
+        log.contains("discovered new tag: workspace"),
+        "the kernel never saw the share:\n{log}"
+    );
+    assert!(
+        log.contains("RACHNA-WORKSPACE-MOUNTED"),
+        "the workspace did not mount:\n{log}"
+    );
+    // AND THE FILE IS THERE. The guest's init globs the directory, which
+    // is the listing method that works on this mount.
+    assert!(
+        log.contains("marker.txt"),
+        "the guest cannot see the host's file, so the workspace is not \
+         usable:\n{log}"
     );
 
     guest.stop().expect("stops");

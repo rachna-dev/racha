@@ -102,7 +102,7 @@ chmod +w "$ROOT/bin/busybox"
   # host's e2fsprogs in the guest's boot path.
   for c in sh mount umount echo cat ls sleep poweroff mkdir chown su id ps \
            grep env ln date head tail cut printf touch ip ifconfig hostname \
-           mke2fs mkfs.ext2 blkid sync halt reboot insmod lsmod find uname; do
+           mke2fs mkfs.ext2 blkid sync halt reboot insmod lsmod find uname stat df; do
     ln -sf busybox "bin/$c"
   done )
 
@@ -171,29 +171,14 @@ insmod "$MODDIR/virtiofs.ko" 2>/dev/null
 # listing nothing — the mount survived the pivot and its CONTENTS did
 # not. Mounting at the final path is what works, and the proof is the
 # file list printed on both sides of the pivot.
-# MOUNTED HERE, and the workspace is the one thing in this guest that
-# does not work (`02` §6.12). Recorded rather than hidden:
-#
-#   RACHNA-INITRAMFS-WORKSPACE: my-source-file.txt rachna.nix src
-#   RACHNA-WORKSPACE-FILES:                          <- after switch_root
-#
-# Same mount, same path, contents gone. `/proc/mounts` still shows it, so
-# the kernel believes the filesystem is mounted while serving nothing.
-# `mount --move` was tried and PANICKED the guest ("Attempted to kill
-# init"), so it is not a safe workaround either.
-#
-# Left mounting at the final path because that is the simplest form that
-# boots, and the file list on both sides of the pivot is what makes the
-# failure visible instead of looking like an empty project.
+# The modules are loaded HERE so the root init can mount without
+# needing insmod itself — but the MOUNT happens after the pivot.
+# `02` §6.12 measured that a share mounted here and carried through
+# `switch_root` arrives with its contents gone, so the pivot is what
+# breaks it; mounting afterwards is the other side of that test.
 MODDIR=$(echo /lib/modules/*/kernel/fs/fuse)
 insmod "$MODDIR/fuse.ko" 2>/dev/null
 insmod "$MODDIR/virtiofs.ko" 2>/dev/null
-mkdir -p /mnt/workspace
-if mount -t virtiofs workspace /mnt/workspace 2>/dev/null; then
-  echo "RACHNA-INITRAMFS-WORKSPACE: $(ls /mnt/workspace | tr '\n' ' ')"
-else
-  echo "RACHNA-INITRAMFS-WORKSPACE-FAILED"
-fi
 
 exec switch_root /mnt /init
 INIT
