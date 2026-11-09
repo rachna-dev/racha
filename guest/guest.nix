@@ -520,10 +520,77 @@
 
   # The toolchain a development environment needs. Everything else arrives on
   # the project's closure disk (`00` §7 Layer C), so this stays small.
+  # THE BASE TOOLCHAIN: what belongs in EVERY environment, regardless of
+  # what the project is written in.
+  #
+  # The division is `idea.md` §5.2's: NixOS provides the operating system,
+  # **devenv provides the project's languages and services**. So no Node
+  # here, and no Postgres — a Python project should not carry a Node
+  # runtime it never calls, and `rachna.nix` is the place that says which
+  # it needs.
+  #
+  # An earlier draft of this list was `coreutils bash git`, which is too
+  # minimal to work in: a shell with no `fzf`, no `rg`, no editor is a
+  # shell you leave immediately. The other extreme — baking Node and
+  # Postgres in because one example project used them — makes the base
+  # image everyone downloads carry everyone else's dependencies.
+  #
+  # Every package here was checked to be PREBUILT for aarch64-linux, so
+  # this list costs download time rather than build time (`21` §2.1a).
   environment.systemPackages = with pkgs; [
-    coreutils
+    # devenv itself, so `devenv shell` works inside the guest without the
+    # user installing anything. This is the integration `idea.md` §5.2
+    # asks for, and it is why the base can stay language-agnostic.
+    devenv
+    direnv
+
+    # A shell worth being in.
     bash
+    coreutils
+    findutils
+    gnugrep
+    gnused
+    gawk
+    which
+    less
+    procps
+
+    # The tools people reach for without thinking, and notice the absence
+    # of immediately.
     git
+    fzf
+    ripgrep
+    fd
+    bat
+    jq
+    tree
+    delta
+    zoxide
+
+    # An editor. Not a preference — an environment you cannot edit a file
+    # in is one you shell out of to do the actual work.
+    neovim
+
+    # Long-running work survives a dropped connection.
+    tmux
+
+    # Build and inspect.
+    gnumake
+    curl
+    htop
+  ];
+
+  # `devenv` shells out to `nix`, which needs flakes enabled to read a
+  # `devenv.nix`. Set alongside §219's `substituters = []` rather than
+  # replacing it: nix caught the duplicate definition, and §219's reason
+  # is the stronger one — the guest must not fetch its own packages,
+  # because that would escape both the reproducibility contract and the
+  # network policy. devenv therefore works from the closure already in
+  # the image, which is what makes it deterministic rather than a
+  # download at first use.
+  nix.settings.experimental-features = [
+    "nix-command"
+    "flakes"
   ];
 
   networking.hostName = "rachna";
