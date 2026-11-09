@@ -14,6 +14,13 @@ hostname rachna 2>/dev/null || true
 ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up 2>/dev/null || true
 
 echo "RACHNA-GUEST-ALIVE"
+# The guest's own identity, on the console. Kept because "what operating
+# system is in there" is a fair question whose answer should come from the
+# guest rather than from a document about it — and because the answer is
+# NOT a distribution: there is no /etc/os-release, and pid 1 is this
+# script rather than systemd. `#1-NixOS` in the uname only means nixpkgs
+# compiled the kernel.
+echo "RACHNA-UNAME: $(uname -a)"
 
 # The state volume. THE guest formats it on first use: an unformatted
 # disk is what `provision_state` hands us (a sparse file), because mke2fs
