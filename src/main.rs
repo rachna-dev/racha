@@ -57,6 +57,8 @@ fn main() -> ExitCode {
 }
 
 fn run(command: Command) -> ExitCode {
+    // Captured before the match, because the arms below move `command`.
+    let verb = command.verb();
     match command {
         Command::Version => {
             println!("rachna {}", rachna::version());
@@ -82,24 +84,392 @@ fn run(command: Command) -> ExitCode {
             );
             ExitCode::from(UNIMPLEMENTED)
         }
-        // Everything below needs a VM or a store on disk, and those arrive
-        // with steps 11-13. Naming them individually rather than with a
-        // catch-all so adding a backend is a compile error here, not a
-        // silently-missing verb.
-        Command::Init { .. }
-        | Command::Start { .. }
-        | Command::Stop
-        | Command::Status
-        | Command::Doctor
+        Command::Init { .. } => commands::init(),
+        Command::Start { accept } => commands::start(accept),
+        Command::Stop => commands::stop(),
+        Command::Status => commands::status(),
+        // Everything below still needs work that has not landed. Naming them
+        // individually rather than with a catch-all so adding one is a
+        // compile error here, not a silently-missing verb.
+        Command::Doctor
         | Command::Config { .. }
         | Command::Audit { .. }
         | Command::Explain { .. } => {
             eprintln!(
-                "rachna: `{}` needs a backend, which lands with build-order \
-                 step 11 (design-docs/01-ARCHITECTURE.md §7)",
-                command.verb()
+                "rachna: `{}` is not built yet \
+                 (design-docs/01-ARCHITECTURE.md §7)",
+                verb
             );
             ExitCode::from(UNIMPLEMENTED)
         }
     }
+}
+
+/// The verbs that do something, kept out of `main`'s dispatch.
+///
+/// `main.rs` is untested by design (`01` §7: the library is tested without a
+/// process), and AGENTS.md records the consequence — *anything with
+/// observable behaviour does not belong in it*. So these are thin: each
+/// gathers what the host knows, calls `rachna::run`, and prints. The
+/// decisions live in `run.rs`, where tests reach them.
+mod commands {
+    use rachna::layout::{default_root, ProjectId};
+    use rachna::run::{self, Context, StartError, Started};
+    use rachna::supervise;
+    use rachna::tap;
+    use std::io::IsTerminal;
+    use std::path::{Path, PathBuf};
+    use std::process::ExitCode;
+
+    /// Everything worked.
+    const OK: u8 = 0;
+    /// Something this build cannot do yet.
+    const UNIMPLEMENTED: u8 = 70;
+    /// The policy could not be enforced, or the config is wrong.
+    ///
+    /// Distinct from a usage error: `21` §3.3 makes exit codes an API, and a
+    /// script needs to tell "you asked wrongly" from "the policy refused".
+    const REFUSED: u8 = 77;
+    /// Something failed while trying.
+    const FAILED: u8 = 74;
+
+    /// Builds the context from this host and this directory.
+    ///
+    /// # Errors
+    ///
+    /// A message, when the project directory or the guest cannot be found.
+    fn context() -> Result<Context, String> {
+        let project_dir = std::env::current_dir().map_err(|error| error.to_string())?;
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set, so ~/.rachna cannot be located".to_owned())?;
+
+        // `08` §4.3: the id is derived from the project's canonical path, so
+        // two checkouts of one repo are different projects — which `08`
+        // §4.3's worktree note says is correct rather than incidental.
+        let canonical = project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.clone());
+        let project = ProjectId::new(project_slug(&canonical)).map_err(|e| e.to_string())?;
+
+        Ok(Context {
+            project_dir,
+            rachna_root: default_root(&home),
+            project,
+            // The pinned guest. Not yet fetched — `21` §2.1a is the
+            // supply-chain story — so this is the local checkout.
+            nixpkgs: PathBuf::from("<nixpkgs>"),
+            // `decide::Capabilities` — which policy categories this
+            // backend cannot enforce. Everything is enforceable until a
+            // measured gap says otherwise, and `tap` below carries the one
+            // gap this host actually has.
+            capabilities: rachna::decide::Capabilities::all(),
+            tap: detect_tap(),
+            interactive: std::io::stdin().is_terminal(),
+        })
+    }
+
+    /// A readable, path-derived project id.
+    ///
+    /// `08` §4.3 shows these as `<name>-<hash>`: the name so a user can find
+    /// their own directory under `~/.rachna`, and the hash because two
+    /// checkouts must not share state. The hash is of the *canonical* path,
+    /// so a symlinked route to the same project is the same project.
+    fn project_slug(canonical: &Path) -> String {
+        let name = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".to_owned());
+        // Only characters that are safe in a path component; `ProjectId`
+        // refuses the rest, and sanitising here beats refusing a directory
+        // the user did not choose the name of.
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("{safe}-{:x}", path_hash(canonical))
+    }
+
+    /// A short, stable hash of a path.
+    ///
+    /// `DefaultHasher` is not stable across Rust releases, which would
+    /// orphan a project's state on a toolchain bump — so this is a plain
+    /// FNV-1a, written out because `17`'s rule is to avoid a dependency for
+    /// something this small.
+    fn path_hash(path: &Path) -> u32 {
+        let mut hash: u32 = 0x811c_9dc5;
+        for byte in path.to_string_lossy().as_bytes() {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        hash
+    }
+
+    /// What the hypervisor on this host supports.
+    ///
+    /// **Note the name collision**, which cost a compile error here:
+    /// `backend::Capabilities` is what the *hypervisor* can do (snapshots,
+    /// quotas), while `decide::Capabilities` is which *policy categories*
+    /// this backend cannot enforce. Both are legitimate and the shared name
+    /// is a trap — `Context` needs both, so each is named by its module.
+    fn backend_capabilities() -> rachna::backend::Capabilities {
+        if cfg!(target_os = "macos") {
+            rachna::backend::Capabilities::measured_macos()
+        } else {
+            rachna::backend::Capabilities::measured_linux()
+        }
+    }
+
+    /// Whether the network helper is present and capable.
+    ///
+    /// Reports [`tap::Capability::Unknown`] rather than guessing, which
+    /// `tap.rs` treats as a refusal — the same direction as
+    /// `enforcement::Outcome::Inconclusive`.
+    fn detect_tap() -> tap::Capability {
+        if cfg!(target_os = "macos") {
+            // `02` §7 measured VZ networking needing no privileges at all.
+            return tap::Capability::Present;
+        }
+        tap::Capability::Unknown {
+            why: "rachna-netd is not built yet (15 §7 item 8)".to_owned(),
+        }
+    }
+
+    /// `rachna init` — write a starting `rachna.nix`.
+    pub(crate) fn init() -> ExitCode {
+        let Ok(context) = context() else {
+            eprintln!("rachna: cannot determine this project");
+            return ExitCode::from(FAILED);
+        };
+        let file = context.config_file();
+        if file.exists() {
+            eprintln!("rachna: {} already exists", file.display());
+            return ExitCode::from(REFUSED);
+        }
+        // The secure configuration is the one you get by writing nothing
+        // (`19` §4.5), so the template is deliberately minimal: an empty
+        // allowlist denies all network, and the profile grants only the
+        // workspace.
+        // FLAT, not nested under `isolation`, and the difference is a real
+        // gap rather than a style choice.
+        //
+        // `19` §2.2 writes the user-facing shape as `isolation = { tier =
+        // …; }`, and `config.rs` parses the EVALUATED JSON, which is flat —
+        // because a NixOS-style module emits `config.isolation`'s contents,
+        // not the wrapper (`00` §5.3 rule 3: "this works because rachna.nix
+        // is a NixOS-style module").
+        //
+        // **That module does not exist yet.** So `start` evaluates
+        // `rachna.nix` raw, with nothing to flatten it — and a template
+        // using `19` §2.2's nesting fails with `isolation: no such option`,
+        // which is exactly what the first run of this command did.
+        //
+        // Writing the flat shape makes `init` → `start` work today and is
+        // honest about which half is missing. When the module lands, this
+        // template moves to the nested form and the module does the
+        // flattening.
+        let template = concat!(
+            "# What this environment may do. Nothing here is implied:\n",
+            "# an empty allowlist denies all network, and deleting a line\n",
+            "# makes the environment stricter rather than looser.\n",
+            "#\n",
+            "# NOTE: flat for now. `19` §2.2's `isolation = { … }` nesting\n",
+            "# needs the NixOS-style module that does the flattening, which\n",
+            "# is not built yet.\n",
+            "{\n",
+            "  tier = \"allowlist\";\n",
+            "  profile = \"development\";\n",
+            "  network.allow = [ ];\n",
+            "}\n",
+        );
+        match std::fs::write(&file, template) {
+            Ok(()) => {
+                println!("wrote {}", file.display());
+                println!("edit it, then: rachna start");
+                ExitCode::from(OK)
+            }
+            Err(error) => {
+                eprintln!("rachna: cannot write {}: {error}", file.display());
+                ExitCode::from(FAILED)
+            }
+        }
+    }
+
+    /// `rachna start`.
+    pub(crate) fn start(accept: bool) -> ExitCode {
+        let context = match context() {
+            Ok(context) => context,
+            Err(why) => {
+                eprintln!("rachna: {why}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        // Idempotent: `00` §5.2 makes this the command people type on `cd`.
+        match run::already_running(&context) {
+            Ok(running) if !running.is_empty() => {
+                println!("already running ({} process(es))", running.processes.len());
+                return ExitCode::from(OK);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("rachna: {error}");
+                return ExitCode::from(FAILED);
+            }
+        }
+
+        let policy = match run::evaluate(&context) {
+            Ok(policy) => policy,
+            Err(error) => return report(&error),
+        };
+
+        if accept {
+            let now = now_millis();
+            if let Err(error) = run::accept(&context, &policy, now) {
+                return report(&error);
+            }
+        }
+
+        let approval = match run::approval_of(&context, &policy) {
+            Ok(approval) => approval,
+            Err(error) => return report(&error),
+        };
+
+        match run::check(&policy, &context.tap, approval, context.interactive) {
+            Err(error) => report(&error),
+            Ok(Some(Started::NeedsAcknowledgement { prompt, .. })) => {
+                print!("{prompt}");
+                // Not a failure: the config is fine and a human has not seen
+                // it yet. `21` §3.3 makes the code an API, so this is its
+                // own value rather than a generic error.
+                ExitCode::from(REFUSED)
+            }
+            Ok(Some(other)) => {
+                eprintln!("rachna: unexpected gate result: {other:?}");
+                ExitCode::from(FAILED)
+            }
+            Ok(None) => {
+                // The policy is enforceable and approved. The launch itself
+                // needs the boot bundle, which `21` §2.1a's supply chain has
+                // to deliver first — so this is where the remaining work is.
+                println!(
+                    "{}",
+                    rachna::summary::AccessSummary::new(
+                        policy.tier,
+                        policy.profile,
+                        &policy.grants
+                    )
+                );
+                eprintln!(
+                    "rachna: policy approved and enforceable, but the guest \
+                     image is not fetched yet (21 §2.1a). Everything up to \
+                     the launch now runs."
+                );
+                ExitCode::from(UNIMPLEMENTED)
+            }
+        }
+    }
+
+    /// `rachna stop`.
+    pub(crate) fn stop() -> ExitCode {
+        let context = match context() {
+            Ok(context) => context,
+            Err(why) => {
+                eprintln!("rachna: {why}");
+                return ExitCode::from(FAILED);
+            }
+        };
+        match run::stop(&context) {
+            Ok(report) if report.is_clean() => {
+                println!("{report}");
+                ExitCode::from(OK)
+            }
+            Ok(report) => {
+                eprintln!("{report}");
+                ExitCode::from(FAILED)
+            }
+            Err(error) => {
+                eprintln!("rachna: {error}");
+                ExitCode::from(FAILED)
+            }
+        }
+    }
+
+    /// `rachna status`.
+    pub(crate) fn status() -> ExitCode {
+        let context = match context() {
+            Ok(context) => context,
+            Err(why) => {
+                eprintln!("rachna: {why}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        let running = match run::already_running(&context) {
+            Ok(running) => running,
+            Err(error) => {
+                eprintln!("rachna: {error}");
+                return ExitCode::from(FAILED);
+            }
+        };
+        if running.is_empty() {
+            println!("stopped");
+        } else {
+            println!("running:");
+            for process in &running.processes {
+                println!("  {} (pid {})", process.role, process.pid);
+            }
+        }
+        println!("project:  {}", context.project.as_str());
+        println!("state:    {}", context.paths().root().display());
+
+        // What this host can enforce, which `01` §2.6 says must be reported
+        // rather than assumed — and `resources.rs` says must be stated when
+        // a declared limit is advisory.
+        if let Ok(policy) = run::evaluate(&context) {
+            print!(
+                "{}",
+                rachna::summary::AccessSummary::new(policy.tier, policy.profile, &policy.grants)
+            );
+            for advisory in rachna::resources::Resources::advisory_on(backend_capabilities()) {
+                println!("  ⚠ {advisory}");
+            }
+        }
+        if !context.tap.can_create_tap() {
+            println!("  ⚠ host-mediated networking is unavailable on this host");
+        }
+        ExitCode::from(OK)
+    }
+
+    /// Prints a start failure and picks its exit code.
+    fn report(error: &StartError) -> ExitCode {
+        eprintln!("rachna: {error}");
+        match error {
+            // The config says something this host cannot do, or says
+            // something wrong. Both are refusals rather than crashes.
+            StartError::Unenforceable(_) | StartError::Config { .. } => ExitCode::from(REFUSED),
+            StartError::NoConfig { .. }
+            | StartError::Evaluation { .. }
+            | StartError::Store { .. }
+            | StartError::Supervise(_) => ExitCode::from(FAILED),
+        }
+    }
+
+    /// Now, in epoch milliseconds.
+    fn now_millis() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Re-exported so `start` can name the type in its own error path.
+    #[allow(unused_imports, reason = "used by the match above")]
+    use supervise as _;
 }

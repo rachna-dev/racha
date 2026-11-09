@@ -65,10 +65,30 @@ fn an_unknown_command_exits_with_a_usage_code_and_a_suggestion() {
 #[test]
 fn an_unimplemented_verb_says_so_rather_than_panicking() {
     // A user on a half-built tool should get a sentence, not a backtrace.
-    let (_, stderr, code) = rachna(&["status"]);
+    //
+    // `status` used to be the example here and now WORKS, which is what
+    // this test caught. `audit` is the current one — it needs the query
+    // layer over the store.
+    let (_, stderr, code) = rachna(&["audit"]);
     assert_eq!(code, 70, "stderr: {stderr}");
-    assert!(stderr.contains("step 11"), "{stderr}");
+    assert!(stderr.contains("not built yet"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
+fn status_reports_rather_than_refusing() {
+    // The first verb that does real work. It runs in any directory — a
+    // project with no `rachna.nix` is "stopped", not an error, because
+    // `00` §5.2 makes `status` the thing you type when you are not sure
+    // what is going on.
+    let (stdout, stderr, code) = rachna(&["status"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("stopped") || stdout.contains("running"),
+        "stdout: {stdout}"
+    );
+    // And it names where the state lives, so a user can find or delete it.
+    assert!(stdout.contains("state:"), "stdout: {stdout}");
 }
 
 #[test]
@@ -96,8 +116,18 @@ fn no_invocation_panics() {
     for args in invocations {
         let (_, stderr, code) = rachna(args);
         assert!(!stderr.contains("panicked"), "{args:?} panicked:\n{stderr}");
+        // The defined set, per `21` §3.3's "exit codes are an API". It grew
+        // when `start` and `stop` began doing work, and this assertion is
+        // what caught that — a verb returning an undefined code is a script
+        // that cannot branch on it.
+        //
+        //   0   worked
+        //   64  EX_USAGE — the invocation was not understood
+        //   70  not built yet
+        //   74  tried and failed
+        //   77  refused: the policy is wrong, or cannot be enforced
         assert!(
-            code == 0 || code == 64 || code == 70,
+            matches!(code, 0 | 64 | 70 | 74 | 77),
             "{args:?} exited {code}, which is not a defined code"
         );
     }

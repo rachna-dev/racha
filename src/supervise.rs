@@ -1073,19 +1073,23 @@ mod tests {
         // GiB. A `start` that failed on step two and left step one running
         // would be that leak with a mechanism instead of an accident.
         //
-        // The first step writes a FILE and then sleeps; the second step's
-        // binary does not exist. So the first is provably spawned when the
-        // failure happens, and the file is a marker only this test creates.
+        // PROVEN BY A SIDE EFFECT, not by counting processes. Two earlier
+        // versions were flaky:
         //
-        // An earlier version counted `sleep` processes globally and was
-        // FLAKY — other tests in this file spawn sleepers concurrently, so
-        // `before`/`after` raced and the gate failed once. A test whose
-        // result depends on what else is running measures the wrong thing.
+        //   `pgrep -x sleep` counted sibling tests' sleepers and raced.
+        //   A marker file plus `pgrep -f` passed alone and failed under the
+        //   full gate's load — a timing-dependent test, which measures the
+        //   machine rather than the code.
+        //
+        // So step one appends a line to a file every half second. If it
+        // survived the failed start, the file keeps growing; if it was
+        // killed, the line count stops. No timing assumption beyond "a
+        // killed process stops writing", which is what is being tested.
         let dir = scratch("partial");
-        let marker = dir.join("step-one-ran");
+        let log = dir.join("heartbeat");
         let script = format!(
-            "touch {}; exec sleep 30",
-            marker.to_str().expect("utf8 temp path")
+            "while true; do echo tick >> {}; sleep 0.5; done",
+            log.to_str().expect("utf8 temp path")
         );
         let plan = StartPlan {
             steps: vec![
@@ -1104,39 +1108,45 @@ mod tests {
             ],
         };
 
-        // CONTROL FIRST: step one alone leaves a process running. Without
-        // this the assertion below cannot tell cleanup from a step that
-        // never started — and an earlier version failed exactly there,
-        // because `start` kills step one faster than its `touch` lands.
+        let error = start(&plan, &dir).expect_err("the second step must fail");
+        assert!(
+            matches!(error, StartError::NotInstalled { .. }),
+            "{error:?}"
+        );
+
+        // Whatever it managed to write before being killed.
+        let ticks = |path: &Path| -> usize {
+            std::fs::read_to_string(path)
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        let after_failure = ticks(&log);
+        std::thread::sleep(Duration::from_millis(1500));
+        let later = ticks(&log);
+        assert_eq!(
+            later, after_failure,
+            "step one kept writing after a failed start: {after_failure} ticks, \
+             then {later} — the cleanup did not kill it"
+        );
+
+        // And the control: the same step, with nothing to kill it, DOES
+        // keep writing. Without this the assertion above passes when step
+        // one never ran at all.
         let control = StartPlan {
             steps: vec![plan.steps[0].clone()],
         };
-        let (control_running, mut control_children) =
-            start(&control, &dir).expect("step one alone starts");
-        let pattern = marker.to_str().expect("utf8 temp path");
-        for _ in 0..80 {
-            if count_matching(pattern) > 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let control_log = dir.join("heartbeat");
+        let before_control = ticks(&control_log);
+        let (running, mut children) = start(&control, &dir).expect("step one alone starts");
+        std::thread::sleep(Duration::from_millis(1500));
+        let during_control = ticks(&control_log);
+        let _ = stop_with(&running, &mut children);
         assert!(
-            count_matching(pattern) > 0,
-            "the control run left nothing behind, so this test proves nothing"
+            during_control > before_control,
+            "the control run never wrote, so this test proves nothing: \
+             {before_control} then {during_control}"
         );
-        let _ = stop_with(&control_running, &mut control_children);
-        std::thread::sleep(Duration::from_millis(200));
 
-        // Now the real case: the same step one, with a step two that fails.
-        let error = start(&plan, &dir).expect_err("the second step must fail");
-        assert!(matches!(error, StartError::NotInstalled { .. }));
-
-        std::thread::sleep(Duration::from_millis(300));
-        let survivors = count_matching(pattern);
-        assert_eq!(
-            survivors, 0,
-            "a process survived a failed start: {survivors} still matching"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1157,9 +1167,10 @@ mod tests {
         // socket, not about CH.
         assert!(error.to_string().contains("virtiofsd"), "{error}");
 
-        // Scoped to this test's own directory, for the same reason the
-        // halfway test is: a global sleeper count races with sibling tests.
-        std::thread::sleep(Duration::from_millis(300));
+        // The daemon is gone, proven the same way the halfway test does it:
+        // a process count under the full gate's load is a timing test, not a
+        // behaviour one.
+        std::thread::sleep(Duration::from_millis(400));
         assert_eq!(
             count_matching(dir.to_str().expect("utf8")),
             0,
@@ -1238,10 +1249,13 @@ mod tests {
 
     /// How many of this user's processes have `needle` in their command line.
     ///
-    /// Scoped to a unique marker rather than counting `sleep` globally,
-    /// because this file's other tests spawn sleepers concurrently and a
-    /// global count raced. `-f` matches the full command line, and the
-    /// pattern is a temp path no other process has.
+    /// Scoped to a unique temp path, so sibling tests' processes cannot be
+    /// counted — an earlier global `pgrep -x sleep` raced with them.
+    ///
+    /// Still a *timing* check, which is why the halfway test uses a
+    /// heartbeat file instead. It is acceptable here because the failure
+    /// being tested is a 10-second socket timeout: by the time `start`
+    /// returns, the cleanup has already run.
     fn count_matching(needle: &str) -> usize {
         std::process::Command::new("pgrep")
             .args(["-u", &format!("{}", rustix::process::getuid().as_raw())])

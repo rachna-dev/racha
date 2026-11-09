@@ -213,5 +213,6 @@ pub mod protocol;
 pub mod reload;
 pub mod render;
 pub mod resources;
+pub mod run;
 pub mod snapshot;
 pub mod store;
