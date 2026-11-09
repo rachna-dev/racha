@@ -245,10 +245,26 @@ impl Guest {
             if let Some(parent) = launch.console_log.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&launch.console_log);
+            // TRUNCATED, not appended — and this is a correctness
+            // requirement, not tidiness. A caller decides the guest is up
+            // by finding a marker in this file (`02` §6.3, because the VM's
+            // own state lies), so an appended log means the NEXT start
+            // matches the PREVIOUS boot's marker and reports success
+            // immediately.
+            //
+            // Measured: with `append`, a second `rachna start` returned
+            // "started" without waiting, leaving TWO supervisors running
+            // against one state file — and `stop` could only tear down the
+            // one it knew about.
+            //
+            // The previous boot's log is not lost silently: it is moved
+            // aside, because the most useful console is usually the one
+            // from the boot that just failed.
+            if launch.console_log.exists() {
+                let previous = launch.console_log.with_extension("log.previous");
+                let _ = std::fs::rename(&launch.console_log, previous);
+            }
+            let _ = std::fs::File::create(&launch.console_log);
             let attachment = VZFileSerialPortAttachment::initWithURL_append_error(
                 VZFileSerialPortAttachment::alloc(),
                 &url(&launch.console_log),
@@ -383,6 +399,77 @@ impl Guest {
             unsafe { vm.stopWithCompletionHandler(handler) }
         })?;
         outcome.map_err(VmError::StartFailed)
+    }
+
+    /// Asks the guest to shut itself down, and waits for it to stop.
+    ///
+    /// **Not [`Self::stop`]**, and the difference cost a corrupted
+    /// filesystem to find. `stop` is documented by Apple as *"a destructive
+    /// operation … without giving the guest a chance to stop cleanly"* — so
+    /// a `rachna stop` built on it killed the guest with its state volume
+    /// unflushed, and the next boot mounted a filesystem reporting
+    /// `EXT4-fs error … deleted inode referenced`. The data was on the
+    /// disk; the metadata describing it was not.
+    ///
+    /// This sends the guest the equivalent of a power button press, so its
+    /// init unmounts and syncs. Falls back to a destructive stop when the
+    /// guest does not respond — a guest that ignores shutdown must not
+    /// leave `rachna stop` hanging forever.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::StartFailed`] if neither path could stop the guest.
+    pub fn shutdown(&self, grace: Duration) -> Result<(), VmError> {
+        if self.state() == VmState::Stopped {
+            return Ok(());
+        }
+
+        // PAUSE FIRST, and this order is the whole fix. Pausing stops the
+        // vCPUs with memory and devices intact, which drains the
+        // virtio-blk queue — the writes the guest has already issued reach
+        // the image before the VM goes away.
+        //
+        // The previous version asked the guest first and paused only after
+        // the grace period expired. That looked more polite and was worse:
+        // a busybox `sh` acting as init never acts on VZ's ACPI event (a
+        // `trap` fires only after the current command returns, and the
+        // loop sits in `sleep`), so every stop burned the full grace
+        // waiting for an answer that never came — and `run::stop`'s own
+        // budget expired meanwhile and signalled the supervisor dead,
+        // mid-flush. Measured: the state volume came back unformatted on
+        // the next boot, and Postgres ran `initdb` again.
+        //
+        // Best-effort: a guest that cannot be paused still has to be
+        // stopped, and refusing to stop it would leave it running.
+        let paused = self.pause().is_ok();
+
+        // Then ask, for the guests that DO listen — a NixOS guest with
+        // systemd will unmount properly, which is strictly better than
+        // relying on a drained queue. Only from a non-paused state, since
+        // `canRequestStop` is false while paused.
+        if !paused {
+            let requested = self.on_queue(|vm| {
+                // SAFETY: on the VM's own queue.
+                unsafe {
+                    if vm.canRequestStop() {
+                        vm.requestStopWithError().is_ok()
+                    } else {
+                        false
+                    }
+                }
+            });
+            if requested {
+                let deadline = Instant::now() + grace;
+                while Instant::now() < deadline {
+                    if self.state() == VmState::Stopped {
+                        return Ok(());
+                    }
+                    std::thread::sleep(POLL);
+                }
+            }
+        }
+
+        self.stop()
     }
 
     /// Pauses the guest: vCPUs stop, memory is retained.

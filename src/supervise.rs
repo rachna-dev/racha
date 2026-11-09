@@ -76,18 +76,63 @@ pub enum Role {
     Virtiofsd,
     /// `cloud-hypervisor`.
     Hypervisor,
+    /// A Rachna process holding an in-process VM.
+    ///
+    /// macOS only in practice. A VZ guest lives **inside** the process that
+    /// created it (`02` §6), so there is no hypervisor process to record —
+    /// what `stop` must signal is a Rachna supervisor that re-executed
+    /// itself to hold the guest. Ordered last: it is the thing that owns
+    /// the VM, so it is torn down after anything feeding it.
+    Supervisor,
 }
 
 impl Role {
     /// Every role, in **start** order.
+    ///
+    /// `Supervisor` is not here: it is not part of a `StartPlan`, because
+    /// nothing *spawns* it as a step — `start` re-executes itself. It is a
+    /// role only so that `stop` can find and signal it.
     pub const START_ORDER: [Self; 2] = [Self::Virtiofsd, Self::Hypervisor];
 
-    /// The name a user sees.
+    /// The token used in the state file.
+    ///
+    /// **Must contain no spaces.** [`Running::from_text`] splits each line
+    /// on its first space to separate the role from the pid, so a token
+    /// with a space in it writes a file that cannot be read back — found by
+    /// giving `Supervisor` the display name "rachna (holding the guest)",
+    /// after which `status` reported the state file as corrupt.
+    ///
+    /// Separate from [`Self::describe`] for exactly that reason: the wire
+    /// format and the human wording have different constraints, and one
+    /// string serving both is how they come into conflict.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Virtiofsd => "virtiofsd",
             Self::Hypervisor => "cloud-hypervisor",
+            Self::Supervisor => "rachna-supervisor",
+        }
+    }
+
+    /// The role a state-file token names, if any.
+    ///
+    /// The inverse of [`Self::as_str`], and written beside it so the two
+    /// cannot drift: `from_text` used to match the token list literally,
+    /// and adding a role made it reject files it had just written.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        [Self::Virtiofsd, Self::Hypervisor, Self::Supervisor]
+            .into_iter()
+            .find(|role| role.as_str() == token)
+    }
+
+    /// The wording a user sees, which may contain spaces.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Virtiofsd => "virtiofsd",
+            Self::Hypervisor => "cloud-hypervisor",
+            Self::Supervisor => "rachna, holding the guest",
         }
     }
 }
@@ -96,6 +141,51 @@ impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// The file a supervisor watches to know it should shut its guest down.
+///
+/// # Why a file rather than a signal
+///
+/// A macOS supervisor holds the VM **inside itself** (`02` §6), so being
+/// signalled dead is not the same as stopping cleanly: Apple documents
+/// `stopWithCompletionHandler` as destructive, *"without giving the guest a
+/// chance to stop cleanly"*. Measured consequence — a `rachna stop` that
+/// only signalled left the guest's state volume unflushed, and the next
+/// boot mounted a filesystem reporting `EXT4-fs error … deleted inode
+/// referenced`. The writes were on the disk; the metadata was not.
+///
+/// A `SIGTERM` handler could do the same job, and would need `unsafe` in a
+/// module that is not permitted it (`tests/unsafe_containment.rs`) — plus
+/// async-signal-safety rules that forbid most of what the shutdown path
+/// does. A file is checked on the supervisor's own polling turn, where
+/// doing real work is allowed.
+///
+/// `stop` creates it, waits, and then signals as before: the file is the
+/// *polite* request, and the signal remains the guarantee.
+#[must_use]
+pub fn shutdown_request(paths: &ProjectPaths) -> PathBuf {
+    paths.runtime_dir().join("shutdown")
+}
+
+/// Whether a pid names a process that still exists.
+///
+/// `stop` needs this for a different reason than `start`: `stop` must not
+/// report success for a process it never signalled, and **`start` must not
+/// refuse because of a record left by a process that has since died**. A
+/// state file outlives its processes — a crash, a reboot, a `kill -9` — so
+/// trusting it without asking is how "already running" becomes permanent.
+///
+/// Signal 0 semantics: permission to signal, without signalling. A pid we
+/// do not own answers `Ok` too, which is the right answer here — something
+/// is using that pid, so it is not ours to reuse.
+#[must_use]
+pub fn is_running(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    rustix::process::Pid::from_raw(raw)
+        .is_some_and(|target| rustix::process::test_kill_process(target).is_ok())
 }
 
 /// Everything `stop` needs to tear down what `start` began.
@@ -190,12 +280,14 @@ impl Running {
             };
             match head {
                 "unlink" => transient.push(PathBuf::from(rest)),
-                "virtiofsd" | "cloud-hypervisor" => {
-                    let role = if head == "virtiofsd" {
-                        Role::Virtiofsd
-                    } else {
-                        Role::Hypervisor
-                    };
+                // Derived from `Role::from_token` rather than listed here.
+                // This used to match `"virtiofsd" | "cloud-hypervisor"`
+                // literally, so adding a third role wrote state files the
+                // parser rejected as corrupt — `status` exited 74 against
+                // a guest it had itself started. The writer and the reader
+                // now share one definition of the token set.
+                _ if Role::from_token(head).is_some() => {
+                    let role = Role::from_token(head).unwrap_or(Role::Hypervisor);
                     let pid: u32 = rest.parse().map_err(|_| StateError {
                         line: number,
                         text: line.to_owned(),
@@ -705,6 +797,34 @@ mod tests {
     }
 
     // ---- the ordering 16 §5.2 measured --------------------------------
+
+    #[test]
+    fn no_role_token_contains_a_space_so_every_state_file_round_trips() {
+        // `from_text` splits each line on its FIRST space to separate the
+        // role from the pid, so a token containing a space produces a file
+        // that cannot be read back. That happened: `Supervisor` was given
+        // the name "rachna (holding the guest)", and `status` then reported
+        // the state file as corrupt and exited 74.
+        //
+        // Asserted over every role rather than fixed for one, and the
+        // round trip is checked rather than just the spelling — the
+        // property that matters is readability, not the absence of a
+        // character.
+        for role in [Role::Virtiofsd, Role::Hypervisor, Role::Supervisor] {
+            assert!(
+                !role.as_str().contains(' '),
+                "`{}` has a space, so a state file naming it cannot be parsed",
+                role.as_str()
+            );
+            let written = Running {
+                processes: vec![Supervised { role, pid: 4242 }],
+                transient: Vec::new(),
+            };
+            let read = Running::from_text(&written.to_text())
+                .unwrap_or_else(|error| panic!("{} did not round trip: {error}", role.as_str()));
+            assert_eq!(read.processes, written.processes, "{}", role.as_str());
+        }
+    }
 
     #[test]
     fn virtiofsd_starts_before_the_hypervisor() {

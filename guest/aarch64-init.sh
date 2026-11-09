@@ -15,11 +15,39 @@ ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up 2>/dev/null || true
 
 echo "RACHNA-GUEST-ALIVE"
 
-# The state volume: /dev/vdb if attached, else tmpfs so a cold boot works.
+# The state volume. THE guest formats it on first use: an unformatted
+# disk is what `provision_state` hands us (a sparse file), because mke2fs
+# is a guest-side tool and running the host's would put the host
+# toolchain in the boot path.
+#
+# A tmpfs fallback only when there is NO disk — and it is loud, because a
+# silent fallback is how data loss hides: an earlier version mounted
+# tmpfs whenever vdb was missing, so Postgres ran initdb on every boot and
+# the todos looked persistent while being recreated each time.
 mkdir -p /data
+# ext2 AND ext4 are tried, in that order, because busybox's `mke2fs`
+# makes an **ext2** filesystem and ships no `mkfs.ext4` at all — so a
+# `mount -t ext4` after formatting fails, which is exactly what happened:
+# "RACHNA-STATE-FORMATTING" followed by "cannot use /dev/vdb". ext2 is
+# fine for a state volume; the journal is what ext4 adds, and a snapshot
+# of a paused guest is consistent without it.
+mount_state() {
+  for fs in ext4 ext2; do
+    mount -t $fs /dev/vdb /data 2>/dev/null && return 0
+  done
+  return 1
+}
 if [ -b /dev/vdb ]; then
-  mount /dev/vdb /data 2>/dev/null || mount -t tmpfs tmpfs /data
+  if ! mount_state; then
+    echo "RACHNA-STATE-FORMATTING"
+    mke2fs -q /dev/vdb 2>/dev/null
+    mount_state || {
+      echo "RACHNA-STATE-EPHEMERAL: cannot use /dev/vdb, data will NOT persist"
+      mount -t tmpfs tmpfs /data
+    }
+  fi
 else
+  echo "RACHNA-STATE-EPHEMERAL: no state volume attached, data will NOT persist"
   mount -t tmpfs tmpfs /data
 fi
 mkdir -p /data/pgdata /data/run
@@ -34,17 +62,28 @@ fi
 su postgres -c "@POSTGRES@/bin/postgres -D /data/pgdata -k /data/run -c listen_addresses=''" \
   >/data/postgres.log 2>&1 &
 
-# Wait for the socket, not a fixed sleep.
+# Wait for ACCEPTING CONNECTIONS, not for the socket to exist. The two
+# differ and the gap is exactly where a restart lands: on the second boot
+# Postgres creates its socket and then runs recovery, so a socket-only
+# check let the app connect and get
+#
+#   FATAL: the database system is starting up
+#
+# `pg_isready` asks the question that matters. Found by restarting a
+# project whose database already had data — the first boot never showed
+# it, because initdb leaves nothing to recover.
 i=0
-while [ $i -lt 60 ]; do
-  [ -S /data/run/.s.PGSQL.5432 ] && break
-  sleep 0.5; i=$((i+1))
+until @POSTGRES@/bin/pg_isready -h /data/run -q 2>/dev/null; do
+  i=$((i+1))
+  if [ $i -ge 120 ]; then
+    echo "RACHNA-PG-FAILED"
+    tail -5 /data/postgres.log
+    break
+  fi
+  sleep 0.5
 done
-if [ -S /data/run/.s.PGSQL.5432 ]; then
+if @POSTGRES@/bin/pg_isready -h /data/run -q 2>/dev/null; then
   echo "RACHNA-PG-READY"
-else
-  echo "RACHNA-PG-FAILED"
-  tail -5 /data/postgres.log
 fi
 
 # The todos app.
@@ -102,10 +141,26 @@ sleep 2
 list_todos
 echo "RACHNA-TODOS-CHECKED"
 
-# Stay alive so the host can pause, snapshot and restore us.
+# NO SHUTDOWN TRAP, deliberately — and this is worth stating because the
+# obvious thing does not work. `trap shutdown TERM` was tried: a busybox
+# `sh` acting as init does not act on VZ's ACPI power event, because a
+# trap fires only after the current command returns and this loop spends
+# essentially all its time inside `sleep`. The console showed ticks
+# continuing through a stop that was supposed to be graceful.
+#
+# So durability does not depend on the guest cooperating. The host pauses
+# the VM before stopping it, which drains the virtio-blk queue with
+# memory and devices intact (`02` §6.10) — the writes land whether or not
+# anything in here is listening. A guest that keeps its filesystem
+# without a shutdown handler is a better guarantee than one that needs
+# one.
+#
+# `sync` on every tick is the cheap half of the same belt: it costs
+# nothing on an idle guest and bounds how much can be in flight.
 i=0
 while [ $i -lt 900 ]; do
   echo "RACHNA-TICK-$i"
+  sync
   sleep 1
   i=$((i+1))
 done

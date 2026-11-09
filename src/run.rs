@@ -443,6 +443,14 @@ pub fn history_of(context: &Context) -> Result<History, StartError> {
     })
 }
 
+/// How long `stop` waits for a guest to shut itself down before signalling.
+///
+/// Long enough for an init to unmount and sync a database, short enough
+/// that a wedged guest does not make `rachna stop` feel broken. `05` §5
+/// measured 6.97 s to boot a real NixOS guest; shutdown is the cheaper
+/// direction.
+const GRACEFUL_STOP: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Whether a snapshot is waiting, and whether its policy is still the
 /// file's.
 ///
@@ -594,11 +602,39 @@ pub fn approval_of(context: &Context, policy: &Policy) -> Result<Approval, Start
 /// would start a second guest alongside the first.
 pub fn already_running(context: &Context) -> Result<Running, supervise::StateError> {
     let file = supervise::state_file(&context.paths());
-    match std::fs::read_to_string(&file) {
-        Ok(text) => Running::from_text(&text),
+    let recorded = match std::fs::read_to_string(&file) {
+        Ok(text) => Running::from_text(&text)?,
         // No file means nothing started, which is the common case.
-        Err(_) => Ok(Running::nothing()),
+        Err(_) => return Ok(Running::nothing()),
+    };
+
+    // THE PIDS ARE CHECKED, not trusted. A state file outlives its
+    // processes — a crash, a reboot, `kill -9` — and an unchecked record
+    // means `start` refuses forever with "already running" against
+    // nothing, which a user can only fix by finding and deleting a file
+    // they were never told about.
+    //
+    // Found the other way round, too: a second `start` left TWO
+    // supervisors running because nothing confirmed the first was alive
+    // before deciding what to do.
+    let live: Vec<_> = recorded
+        .processes
+        .into_iter()
+        .filter(|process| supervise::is_running(process.pid))
+        .collect();
+
+    if live.is_empty() {
+        // Nothing survived, so the record is stale. Removed rather than
+        // left: `00` §5.2 makes `start` the command people type on `cd`,
+        // and one that needs manual cleanup after a crash is not that.
+        let _ = std::fs::remove_file(&file);
+        return Ok(Running::nothing());
     }
+
+    Ok(Running {
+        processes: live,
+        transient: recorded.transient,
+    })
 }
 
 /// Launches the guest and records what is running.
@@ -638,6 +674,31 @@ pub fn launch(context: &Context, plan: &StartPlan) -> Result<Started, StartError
 /// **not** touched in that case: `stop` cannot know what to kill, and
 /// guessing is worse than refusing.
 pub fn stop(context: &Context) -> Result<supervise::StopReport, supervise::StateError> {
+    let running = already_running(context)?;
+
+    // ASK FIRST, then signal. A macOS supervisor holds the guest inside
+    // itself, so killing it is a power cut: measured, that left the state
+    // volume with `EXT4-fs error … deleted inode referenced` on the next
+    // boot. The request file lets the supervisor shut the guest down
+    // through its init, and the signal below is still the guarantee that
+    // `stop` stops things.
+    if !running.is_empty() {
+        let paths = context.paths();
+        let request = supervise::shutdown_request(&paths);
+        if std::fs::write(&request, b"stop\n").is_ok() {
+            let deadline = std::time::Instant::now() + GRACEFUL_STOP;
+            while std::time::Instant::now() < deadline {
+                if already_running(context).map(|now| now.is_empty()) == Ok(true) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+        let _ = std::fs::remove_file(&request);
+    }
+
+    // Re-read: the supervisor may have gone on its own, and signalling a
+    // pid that has exited would report a survivor that never survived.
     let running = already_running(context)?;
     let report = supervise::stop(&running);
     // Only once the processes are gone: a record removed first would leave a
@@ -1135,6 +1196,82 @@ mod tests {
         );
         // Nothing changed, so there is nothing to explain.
         assert!(gate.divergence.is_none(), "{:?}", gate.divergence);
+    }
+
+    // ---- what is actually running ----------------------------------------
+
+    #[test]
+    fn a_stale_state_file_does_not_make_start_refuse_forever() {
+        // A state file outlives its processes — a crash, a reboot, a
+        // `kill -9`. Trusting it unchecked meant `start` reported "already
+        // running" against nothing, and the only fix was deleting a file
+        // the user was never told about.
+        let context = context("stale");
+        let paths = context.paths();
+        std::fs::create_dir_all(paths.runtime_dir()).expect("dirs");
+
+        // A pid that cannot be alive: pid 0 is never a user process, and
+        // `is_running` rejects it without signalling anything.
+        let record = supervise::Running {
+            processes: vec![supervise::Supervised {
+                role: supervise::Role::Supervisor,
+                pid: 0,
+            }],
+            transient: Vec::new(),
+        };
+        let file = supervise::state_file(&paths);
+        std::fs::write(&file, record.to_text()).expect("write the stale record");
+
+        // First assert the record EXISTS and parses, or this proves
+        // nothing about liveness filtering.
+        assert!(
+            !supervise::Running::from_text(&std::fs::read_to_string(&file).expect("read"))
+                .expect("parses")
+                .is_empty(),
+            "the fixture did not write a non-empty record"
+        );
+
+        let running = already_running(&context).expect("readable");
+        assert!(
+            running.is_empty(),
+            "a dead pid was reported as running: {running:?}"
+        );
+        // And the stale file is gone, so the next start does not re-check
+        // it. `00` §5.2 makes `start` the command people type on `cd`; one
+        // that needs manual cleanup after a crash is not that.
+        assert!(
+            !file.exists(),
+            "the stale state file was left behind at {}",
+            file.display()
+        );
+        let _ = std::fs::remove_dir_all(context.rachna_root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn a_live_process_is_still_reported_as_running() {
+        // The other half, so the liveness filter cannot simply report
+        // "nothing is running" and pass the test above. Our own pid is the
+        // one process guaranteed to be alive.
+        let context = context("live");
+        let paths = context.paths();
+        std::fs::create_dir_all(paths.runtime_dir()).expect("dirs");
+
+        let record = supervise::Running {
+            processes: vec![supervise::Supervised {
+                role: supervise::Role::Supervisor,
+                pid: std::process::id(),
+            }],
+            transient: Vec::new(),
+        };
+        std::fs::write(supervise::state_file(&paths), record.to_text()).expect("write");
+
+        let running = already_running(&context).expect("readable");
+        assert!(
+            !running.is_empty(),
+            "a live process was reported as not running"
+        );
+        assert_eq!(running.processes.len(), 1);
+        let _ = std::fs::remove_dir_all(context.rachna_root.parent().expect("parent"));
     }
 
     // ---- the snapshot's own grant record ---------------------------------

@@ -77,11 +77,29 @@ fn an_unimplemented_verb_says_so_rather_than_panicking() {
 
 #[test]
 fn status_reports_rather_than_refusing() {
+    // HERMETIC, via HOME. This test read the developer's real `~/.rachna`
+    // and failed on a state file left by an earlier buggy build: a dead pid
+    // in a format the parser no longer accepted. The assertion was right
+    // and the environment was shared, which is the worse kind of flake —
+    // it fails for reasons that have nothing to do with the change under
+    // test, and it can also PASS because of leftovers.
+    let home = std::env::temp_dir().join(format!("rachna-status-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("scratch home");
+
     // The first verb that does real work. It runs in any directory — a
     // project with no `rachna.nix` is "stopped", not an error, because
     // `00` §5.2 makes `status` the thing you type when you are not sure
     // what is going on.
-    let (stdout, stderr, code) = rachna(&["status"]);
+    let binary = env!("CARGO_BIN_EXE_rachna");
+    let output = Command::new(binary)
+        .arg("status")
+        .env("HOME", &home)
+        .output()
+        .expect("the binary runs");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let code = output.status.code().unwrap_or(-1);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(
         stdout.contains("stopped") || stdout.contains("running"),
@@ -89,6 +107,7 @@ fn status_reports_rather_than_refusing() {
     );
     // And it names where the state lives, so a user can find or delete it.
     assert!(stdout.contains("state:"), "stdout: {stdout}");
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -212,6 +231,58 @@ fn every_start_prints_the_access_summary_even_when_approved() {
     assert!(
         !second.contains("has not run here before"),
         "an approved start claimed it had never run here:\n{second}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn start_returns_rather_than_blocking_forever() {
+    // THE property, and it is not obvious. A VZ guest lives inside the
+    // process that created it (`02` §6), so the first wiring of `start`
+    // booted the VM inline and blocked forever to keep it alive. That hung
+    // `no_invocation_panics` and with it the whole gate — the suite simply
+    // stopped, with no failure to read.
+    //
+    // A command that cannot return cannot be scripted and cannot be
+    // tested, so `start` spawns a supervisor and returns. This asserts the
+    // RETURNING, not the booting: it runs with no guest image installed,
+    // which is a fast refusal on any host.
+    let dir = std::env::temp_dir().join(format!("rachna-returns-{}", std::process::id()));
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&home).expect("scratch dirs");
+
+    let binary = env!("CARGO_BIN_EXE_rachna");
+    let run = |args: &[&str]| -> i32 {
+        Command::new(binary)
+            .args(args)
+            .current_dir(&dir)
+            .env("HOME", &home)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the binary runs")
+            .status
+            .code()
+            .unwrap_or(-1)
+    };
+    assert_eq!(run(&["init"]), 0, "init failed");
+
+    // `--accept` so the gate does not refuse first: the point is what
+    // happens AFTER approval, which is where the block was.
+    let started = std::time::Instant::now();
+    let code = run(&["start", "--accept"]);
+    let took = started.elapsed();
+
+    assert!(
+        took < std::time::Duration::from_secs(60),
+        "`start` took {took:?} — it is blocking rather than returning"
+    );
+    // Any defined code is fine; hanging is not. With no image installed
+    // this refuses, which is the fast path.
+    assert!(
+        matches!(code, 0 | 64 | 70 | 74 | 77),
+        "`start` exited {code}, which is not a defined code"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

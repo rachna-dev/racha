@@ -85,7 +85,7 @@ fn run(command: Command) -> ExitCode {
             ExitCode::from(UNIMPLEMENTED)
         }
         Command::Init { .. } => commands::init(),
-        Command::Start { accept } => commands::start(accept),
+        Command::Start { accept, supervise } => commands::start(accept, supervise),
         Command::Stop => commands::stop(),
         Command::Status => commands::status(),
         // Everything below still needs work that has not landed. Naming them
@@ -125,6 +125,12 @@ mod commands {
     /// Everything worked.
     const OK: u8 = 0;
     /// Something this build cannot do yet.
+    /// Not built yet.
+    ///
+    /// `cfg`-gated because on macOS NOTHING in this module returns it any
+    /// more — `start` boots a guest rather than refusing — and an unused
+    /// constant is how a dead exit code outlives the thing that used it.
+    #[cfg(not(target_os = "macos"))]
     const UNIMPLEMENTED: u8 = 70;
     /// The policy could not be enforced, or the config is wrong.
     ///
@@ -303,7 +309,7 @@ mod commands {
     }
 
     /// `rachna start`.
-    pub(crate) fn start(accept: bool) -> ExitCode {
+    pub(crate) fn start(accept: bool, supervise: bool) -> ExitCode {
         let context = match context() {
             Ok(context) => context,
             Err(why) => {
@@ -313,8 +319,15 @@ mod commands {
         };
 
         // Idempotent: `00` §5.2 makes this the command people type on `cd`.
+        //
+        // SKIPPED under `--supervise`. The supervisor is spawned BY a
+        // `start` that has already recorded it, so it would find its own
+        // state file, print "already running" and exit 0 — which is exactly
+        // what happened: `start` reported "the supervisor exited with 0"
+        // and no guest ran. The parent's record is not evidence about the
+        // child.
         match run::already_running(&context) {
-            Ok(running) if !running.is_empty() => {
+            Ok(running) if !running.is_empty() && !supervise => {
                 println!("already running ({} process(es))", running.processes.len());
                 return ExitCode::from(OK);
             }
@@ -447,19 +460,318 @@ mod commands {
             }
         }
 
-        // The policy is enforceable and the user has just seen and accepted
-        // it. The launch itself needs the boot bundle, which `21` §2.1a's
-        // supply chain has to deliver — so this is where the work remains.
+        // Approved, enforceable, and the user has just read what it
+        // permits. Boot it.
         //
         // No second summary print: `gate.shown` above is the one place it
         // appears, so the two cannot disagree.
+        // `--supervise` means "I am the held-open process"; a plain
+        // `start` spawns one and returns. The gate above runs either way,
+        // so a supervisor cannot be a way around it.
+        // On Linux there is nothing to detach from — `supervise.rs` spawns
+        // `cloud-hypervisor` as its own process, which already outlives the
+        // CLI — so the flag only matters on macOS.
+        #[cfg(target_os = "macos")]
+        if !supervise {
+            return spawn_supervisor(&context);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = supervise;
+        launch_approved(&context, &policy)
+    }
+
+    /// Boots the guest for an approved policy.
+    ///
+    /// Separate from [`start`] because that function's job is the **gate** —
+    /// and a gate whose function also owns the launch is one where a future
+    /// edit can reach the launch without passing the gate.
+    #[cfg(target_os = "macos")]
+    fn launch_approved(context: &run::Context, policy: &rachna::decide::Policy) -> ExitCode {
+        use rachna::backend::macos_vm::Guest;
+        use rachna::boot::{launch_for, provision_root, provision_state, Image};
+
+        let image = match Image::find(&context.rachna_root) {
+            Ok(image) => image,
+            Err(error) => {
+                eprintln!("rachna: {error}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        let paths = context.paths();
+        let root = match provision_root(&image, &paths) {
+            Ok(root) => root,
+            Err(error) => {
+                eprintln!("rachna: {error}");
+                return ExitCode::from(FAILED);
+            }
+        };
+        // The persistent volume, separate from the root. Without it the
+        // guest falls back to a tmpfs `/data` and every start is a fresh
+        // database — which is what happened before this existed.
+        let state = match provision_state(policy, &paths) {
+            Ok(state) => state,
+            Err(error) => {
+                eprintln!("rachna: {error}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        let plan = launch_for(policy, &image, &paths, root, state);
+        let guest = match Guest::new(&plan) {
+            Ok(guest) => guest,
+            Err(error) => {
+                eprintln!("rachna: {error}");
+                return ExitCode::from(REFUSED);
+            }
+        };
+        if let Err(error) = guest.start() {
+            eprintln!("rachna: {error}");
+            return ExitCode::from(FAILED);
+        }
+
+        // Waits for the guest to say it is up, rather than printing
+        // "started" the moment the hypervisor returns. `02` §6.3 measured a
+        // VM reporting Running with a guest that had produced nothing, so
+        // the console is the only honest evidence.
+        let up = guest.wait_for_console(
+            &plan.console_log,
+            GUEST_READY_MARKER,
+            std::time::Duration::from_secs(GUEST_BOOT_BUDGET_SECS),
+        );
+        if !up {
+            eprintln!(
+                "rachna: the guest did not finish starting within {GUEST_BOOT_BUDGET_SECS}s. \
+                 Its console is at {}",
+                plan.console_log.display()
+            );
+            let _ = guest.stop();
+            return ExitCode::from(FAILED);
+        }
+
+        println!("started");
+        println!("  console: {}", plan.console_log.display());
+        if !guest.can_snapshot() {
+            // `00` §3.7: a capability that is absent must be SAID so, not
+            // discovered at the first `rachna suspend`.
+            println!("  note: this configuration cannot be suspended");
+        }
+
+        // Holds the guest until asked to stop. This process IS the VM
+        // (`02` §6), so returning would kill it — which is why `start`
+        // spawns this rather than doing it inline.
+        let request = rachna::supervise::shutdown_request(&paths);
+        loop {
+            if guest.state() != rachna::backend::macos_vm::VmState::Running {
+                return ExitCode::from(OK);
+            }
+            // `rachna stop` asks here before it signals. Honouring the
+            // request means the guest's init unmounts and syncs; being
+            // killed instead left the state volume corrupt (`02` §6.10).
+            if request.exists() {
+                if let Err(error) = guest.shutdown(GRACEFUL_SHUTDOWN) {
+                    // Nothing to recover: `shutdown` already fell back to a
+                    // destructive stop. Recorded on the console, which is
+                    // where a supervisor's output goes.
+                    eprintln!("rachna: shutting the guest down: {error}");
+                }
+                return ExitCode::from(OK);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// How long the supervisor gives its guest to shut itself down.
+    ///
+    /// Shorter than `run::GRACEFUL_STOP`, deliberately: `stop` waits for
+    /// the supervisor, so the inner budget must fit inside the outer one or
+    /// `stop` gives up and signals while the guest is still flushing.
+    #[cfg(target_os = "macos")]
+    const GRACEFUL_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// Spawns a supervisor to hold the guest, and returns.
+    ///
+    /// # Why `start` cannot just boot the VM itself
+    ///
+    /// A VZ guest lives **inside** the process that created it (`02` §6), so
+    /// a `start` that booted it directly would have to block forever — and
+    /// that is not a design choice, it is a broken command: it never
+    /// returns, so nothing can script it, and `tests/cli_binary.rs`'s
+    /// `no_invocation_panics` hung the entire gate the first time this was
+    /// wired that way. **A command that cannot return cannot be tested.**
+    ///
+    /// So `start` re-executes itself with `--supervise`, records that pid
+    /// where `stop` looks, and returns. The hidden flag is the mechanism
+    /// `supervise.rs` already assumes: a pid in a state file that `stop`
+    /// signals.
+    #[cfg(target_os = "macos")]
+    fn spawn_supervisor(context: &run::Context) -> ExitCode {
+        use rachna::supervise::{self, Role, Running, Supervised};
+
+        let paths = context.paths();
+        let runtime = paths.runtime_dir();
+        if let Err(error) = std::fs::create_dir_all(&runtime) {
+            eprintln!("rachna: cannot create {}: {error}", runtime.display());
+            return ExitCode::from(FAILED);
+        }
+
+        let binary = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("rachna: cannot find my own binary: {error}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        // Inherits nothing: the supervisor writes to the console log, and a
+        // stdout tied to this terminal would keep the pipe open after we
+        // return.
+        let child = std::process::Command::new(&binary)
+            .arg("start")
+            .arg(SUPERVISE_FLAG)
+            .current_dir(&context.project_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("rachna: cannot start the supervisor: {error}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        let running = Running {
+            processes: vec![Supervised {
+                role: Role::Supervisor,
+                pid: child.id(),
+            }],
+            transient: Vec::new(),
+        };
+        let state = supervise::state_file(&paths);
+        if let Err(error) = std::fs::write(&state, running.to_text()) {
+            // Nothing could stop it, so stop it now — the same rule
+            // `run::launch` applies: a guest nobody can stop is worse than
+            // no guest.
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX))
+                    .unwrap_or(rustix::process::Pid::INIT),
+                rustix::process::Signal::TERM,
+            );
+            eprintln!(
+                "rachna: started, but could not record it in {}: {error}. \
+                 The guest has been stopped.",
+                state.display()
+            );
+            return ExitCode::from(FAILED);
+        }
+
+        // Waits for the guest to say it is up before reporting success.
+        // `02` §6.3: a VM reports Running with a guest that has produced
+        // nothing, so the console is the only honest evidence — and a
+        // `start` that returns before the database is ready is a `start`
+        // whose next command fails.
+        let console = paths.console_log();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(GUEST_BOOT_BUDGET_SECS);
+        while std::time::Instant::now() < deadline {
+            if std::fs::read_to_string(&console)
+                .unwrap_or_default()
+                .contains(GUEST_READY_MARKER)
+            {
+                println!("started");
+                println!("  console: {}", console.display());
+                println!("  stop it with: rachna stop");
+                return ExitCode::from(OK);
+            }
+            // THE SUPERVISOR'S OWN EXIT, checked every turn. Without this
+            // a supervisor that died immediately — no guest image, a
+            // refused configuration — still cost the FULL boot budget
+            // before `start` said anything, because the loop only watched
+            // for success. Found by the test that asserts `start` returns:
+            // it took 180s.
+            //
+            // `try_wait` rather than `wait`: the supervisor normally
+            // outlives us, so blocking on it would be the bug this whole
+            // function exists to avoid.
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = std::fs::remove_file(&state);
+                    eprintln!(
+                        "rachna: the environment did not start. The \
+                         supervisor exited with {}.",
+                        status.code().map_or_else(
+                            || "no code (signalled)".to_owned(),
+                            |code| code.to_string()
+                        )
+                    );
+                    // Its own stderr went nowhere by design (a stderr tied
+                    // to this terminal would keep the pipe open), so point
+                    // at the console, which is where a guest's own
+                    // complaints land (`05` §4.3).
+                    if console.exists() {
+                        eprintln!("  console: {}", console.display());
+                    }
+                    // The supervisor's exit code, so a script sees the
+                    // real reason rather than a generic failure.
+                    return ExitCode::from(
+                        u8::try_from(status.code().unwrap_or(i32::from(FAILED))).unwrap_or(FAILED),
+                    );
+                }
+                // Still running, which is the normal case.
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("rachna: cannot check on the supervisor: {error}");
+                    return ExitCode::from(FAILED);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+
         eprintln!(
-            "rachna: policy approved and enforceable, but the guest image \
-             is not fetched yet (21 §2.1a). Everything up to the launch now \
-             runs."
+            "rachna: the guest did not finish starting within \
+             {GUEST_BOOT_BUDGET_SECS}s. Its console is at {}, and `rachna \
+             stop` will tear it down",
+            console.display()
+        );
+        ExitCode::from(FAILED)
+    }
+
+    /// The hidden flag that makes a `rachna start` hold the guest.
+    ///
+    /// Not in `--help`: it is not for users, it is how `start` re-executes
+    /// itself. `cli.rs` rejects unknown flags, so this is parsed there
+    /// rather than sniffed from `argv` in two places.
+    pub(crate) const SUPERVISE_FLAG: &str = "--supervise";
+
+    /// Boots the guest for an approved policy.
+    ///
+    /// The Linux path goes through `supervise.rs`, which spawns
+    /// `cloud-hypervisor` as a separate process — a different shape from
+    /// macOS entirely (`02` §6), which is why these are separate functions
+    /// rather than one with a `cfg` inside it.
+    #[cfg(not(target_os = "macos"))]
+    fn launch_approved(_context: &run::Context, _policy: &rachna::decide::Policy) -> ExitCode {
+        eprintln!(
+            "rachna: the Linux launch path needs the guest bundle from \
+             `guest/flake.nix` (01 §7.0c). On macOS this works today; see \
+             ci/build-guest-aarch64.sh for how the image is assembled."
         );
         ExitCode::from(UNIMPLEMENTED)
     }
+
+    /// What the guest prints when its services are up.
+    ///
+    /// Matched against the console rather than inferred from the VM's
+    /// state, per `02` §6.3.
+    const GUEST_READY_MARKER: &str = "RACHNA-SERVICES-UP";
+
+    /// How long to wait for that marker.
+    ///
+    /// Generous because a first boot runs `initdb`: `05` §5 measured 6.97 s
+    /// to a bare NixOS userspace, and a database adds to that.
+    const GUEST_BOOT_BUDGET_SECS: u64 = 180;
 
     /// `rachna stop`.
     pub(crate) fn stop() -> ExitCode {

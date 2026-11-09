@@ -62,8 +62,12 @@ done
 cp "$BUSYBOX/bin/busybox" "$ROOT/bin/busybox"
 chmod +w "$ROOT/bin/busybox"
 ( cd "$ROOT"
+  # `mke2fs` included: the guest FORMATS its own state volume on first
+  # use, because the host handing over a pre-formatted image would put the
+  # host's e2fsprogs in the guest's boot path.
   for c in sh mount umount echo cat ls sleep poweroff mkdir chown su id ps \
-           grep env ln date head tail cut printf touch ip ifconfig hostname; do
+           grep env ln date head tail cut printf touch ip ifconfig hostname \
+           mke2fs mkfs.ext2 blkid sync halt reboot; do
     ln -sf busybox "bin/$c"
   done )
 

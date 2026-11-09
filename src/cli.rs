@@ -188,7 +188,16 @@ pub enum Command {
     /// keypress: a flag that worked interactively would let a user accept a
     /// cloned config's permissions in the same breath as asking to start
     /// it, which is the one thing the gate exists to prevent.
-    Start { accept: bool },
+    Start {
+        /// Acknowledge the access summary. **CI only** — ignored at a TTY.
+        accept: bool,
+        /// Hold the guest rather than spawning a supervisor.
+        ///
+        /// Internal. A VZ guest lives inside its creating process (`02`
+        /// §6), so something has to block; `start` re-executes itself with
+        /// this flag so the *user's* `start` can return.
+        supervise: bool,
+    },
     /// `rachna stop`
     Stop,
     /// `rachna status`
@@ -595,9 +604,18 @@ fn parse_init(args: &[OsString]) -> Result<Command, CliError> {
 
 fn parse_start(args: &[OsString]) -> Result<Command, CliError> {
     let mut accept = false;
+    let mut supervise = false;
     for arg in args {
         match arg.to_string_lossy().as_ref() {
             "--accept" => accept = true,
+            // Internal: how `start` re-executes itself to HOLD the guest.
+            // Parsed here rather than sniffed from `argv` in `main`,
+            // because this parser rejects unknown flags and a flag the
+            // binary passes to itself must be one the parser accepts.
+            // Undocumented in `--help` on purpose — it is not for users,
+            // and `cli_binary.rs` asserts every HELPED flag parses, not
+            // that every parsed flag is helped.
+            "--supervise" => supervise = true,
             flag => {
                 return Err(CliError::UnexpectedFlag {
                     command: "start",
@@ -606,7 +624,7 @@ fn parse_start(args: &[OsString]) -> Result<Command, CliError> {
             }
         }
     }
-    Ok(Command::Start { accept })
+    Ok(Command::Start { accept, supervise })
 }
 
 fn parse_config(args: &[OsString]) -> Result<Command, CliError> {
@@ -1522,7 +1540,10 @@ mod tests {
         // distinct round-trips.
         let commands = [
             Command::Init { template: None },
-            Command::Start { accept: false },
+            Command::Start {
+                accept: false,
+                supervise: false,
+            },
             Command::Stop,
             Command::Status,
             Command::Doctor,
@@ -1562,7 +1583,10 @@ mod tests {
         // usable in a message at all.
         let mut names: Vec<&str> = [
             Command::Init { template: None },
-            Command::Start { accept: false },
+            Command::Start {
+                accept: false,
+                supervise: false,
+            },
             Command::Stop,
             Command::Status,
             Command::Doctor,
@@ -1613,11 +1637,17 @@ mod tests {
         );
         assert_eq!(
             command(&["rachna", "start"]),
-            Command::Start { accept: false }
+            Command::Start {
+                accept: false,
+                supervise: false
+            }
         );
         assert_eq!(
             command(&["rachna", "start", "--accept"]),
-            Command::Start { accept: true }
+            Command::Start {
+                accept: true,
+                supervise: false
+            }
         );
         assert_eq!(command(&["rachna", "stop"]), Command::Stop);
         assert_eq!(command(&["rachna", "status"]), Command::Status);
