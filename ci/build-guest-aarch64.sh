@@ -89,9 +89,23 @@ ROOT="$WORK/root"
 # POINT for the user's project, so it stays empty in the image.
 mkdir -p "$ROOT"/{bin,sbin,dev,proc,sys,tmp,etc,var,run,workspace,data,opt/rachna,nix/store}
 
-say "copying the kernel modules"
-mkdir -p "$ROOT/lib/modules"
-cp -a "$MODULES/lib/modules/." "$ROOT/lib/modules/"
+# ONLY THE TWO MODULES THE GUEST LOADS. `cp -a` of the whole tree copied
+# **139 MB** so that `insmod` could use two files — and then the image had
+# to be large enough to hold all of it. Measured: that step alone was the
+# longest in the build and it ran out of disk twice on a machine with a
+# few hundred MB spare.
+#
+# The guest loads `fuse` and `virtiofs` by path and has no `modprobe`, so
+# nothing else in that tree is reachable. Copying it was not caution, it
+# was waste.
+say "copying the two kernel modules the guest loads"
+MODVER=$(basename "$MODULES/lib/modules"/*)
+FUSEDIR="lib/modules/$MODVER/kernel/fs/fuse"
+mkdir -p "$ROOT/$FUSEDIR"
+for module in fuse virtiofs; do
+  cp "$MODULES/$FUSEDIR/$module.ko.xz" "$ROOT/$FUSEDIR/" 2>/dev/null \
+    || cp "$MODULES/$FUSEDIR/$module.ko" "$ROOT/$FUSEDIR/"
+done
 chmod -R u+w "$ROOT/lib/modules"
 # Decompressed: busybox's `insmod` does not handle .xz, and the guest has
 # no `modprobe` to do it for us.
@@ -150,13 +164,15 @@ INITRAMFS="$WORK/initramfs"
 mkdir -p "$INITRAMFS"/{bin,dev,proc,sys,mnt}
 cp "$BUSYBOX/bin/busybox" "$INITRAMFS/bin/busybox"
 chmod +w "$INITRAMFS/bin/busybox"
-mkdir -p "$INITRAMFS/lib/modules"
-cp -a "$MODULES/lib/modules/." "$INITRAMFS/lib/modules/"
+# The same two modules, copied directly rather than copy-then-delete: the
+# initramfs is loaded into GUEST MEMORY, so every byte is RAM the guest
+# does not get, and the host does not need to touch 139 MB to place 2 MB.
+mkdir -p "$INITRAMFS/$FUSEDIR"
+for module in fuse virtiofs; do
+  cp "$MODULES/$FUSEDIR/$module.ko.xz" "$INITRAMFS/$FUSEDIR/" 2>/dev/null \
+    || cp "$MODULES/$FUSEDIR/$module.ko" "$INITRAMFS/$FUSEDIR/"
+done
 chmod -R u+w "$INITRAMFS/lib/modules"
-# Only the two modules the share needs: copying every module would add
-# ~200 MiB to an initramfs the kernel must load into memory.
-find "$INITRAMFS/lib/modules" -type f \
-  ! -name 'fuse.ko*' ! -name 'virtiofs.ko*' -delete
 find "$INITRAMFS/lib/modules" -name '*.ko.xz' -exec "$XZ/bin/xz" -d {} \;
 
 ( cd "$INITRAMFS"
@@ -232,7 +248,19 @@ INIT
 
 say "building the root image"
 mkdir -p "$OUT"
-python3 -c "f=open('$WORK/root.img','wb'); f.truncate(2*1024*1024*1024); f.close()"
+# SIZED FROM THE CONTENT, with headroom, rather than a flat 2 GiB. The
+# guest writes its data to a separate state volume (`08` §4.1.3), so the
+# root only ever holds what this script puts in it — and a 2 GiB
+# declaration meant the build needed 2 GiB of free disk to assemble ~700
+# MB of files. It failed on exactly that, twice.
+CONTENT_MB=$(du -sm "$ROOT" | cut -f1)
+IMAGE_MB=$(( CONTENT_MB + CONTENT_MB / 5 + 128 ))
+say "root image: ${CONTENT_MB}MB of content -> ${IMAGE_MB}MB image"
+python3 -c "
+import sys
+f = open('$WORK/root.img', 'wb')
+f.truncate($IMAGE_MB * 1024 * 1024)
+f.close()"
 "$E2FS/bin/mke2fs" -t ext4 -d "$ROOT" -F -L rachna-root -q "$WORK/root.img"
 
 install -m 0644 "$KERNEL" "$OUT/Image"
