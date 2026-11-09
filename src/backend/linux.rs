@@ -79,6 +79,15 @@ pub struct Share {
     /// `00` §3's deny-by-default applies to the workspace too: a `tool`
     /// grant that only reads should not get a writable mount.
     pub read_only: bool,
+    /// Where the guest should put it.
+    ///
+    /// `None` means the guest's own default for that share — the workspace.
+    /// Carried here because the guest has to be TOLD: a tag identifies a
+    /// share, and only the host knows the destination the user declared.
+    /// Without it a `.zshrc` mapped to `~/.zshrc` would arrive as an
+    /// anonymous share the guest mounts wherever it likes, which for a
+    /// shell config is the difference between working and inert.
+    pub guest_path: Option<PathBuf>,
 }
 
 /// A block device to attach.
@@ -418,6 +427,7 @@ mod tests {
             shares: vec![Share {
                 host_path: PathBuf::from("/workspace-on-host"),
                 read_only: false,
+                guest_path: None,
                 tag: "workspace".to_owned(),
                 socket: PathBuf::from("/p/vfs.sock"),
             }],

@@ -176,6 +176,48 @@ impl fmt::Display for ToolKind {
     }
 }
 
+/// The guest's home directory.
+///
+/// `guest/guest.nix` declares `users.users.dev.home = "/home/dev"`, and a
+/// `~` in a mount's target resolves to it. One constant rather than the
+/// string at each end: the two must agree or a dotfile lands somewhere the
+/// shell never reads, and nothing on the console would say so.
+pub const GUEST_HOME: &str = "/home/dev";
+
+/// Resolves a leading `~` in a declared path.
+///
+/// # Why `~` means two different things
+///
+/// A mount has two ends and the same character is correct for both, because
+/// that is what a user means by it:
+///
+/// - in `source`, `~` is the **host's** home — the file you are sharing
+/// - in `target`, `~` is the **guest's** home — where the shell will look
+///
+/// `{ source = "~/.zshrc"; target = "~/.zshrc"; }` therefore reads exactly
+/// as intended and resolves to two different absolute paths. Requiring
+/// `/Users/shriyans/.zshrc` instead is both tedious and **not portable**: a
+/// teammate cloning the repo has a different username, so the config breaks
+/// for them — and `00` §3.2 makes the file the thing a team shares.
+///
+/// Expanded only at the START of a path. A `~` elsewhere is a literal
+/// character in a filename, and a file genuinely called `a~b` must not be
+/// rewritten.
+///
+/// # Errors
+///
+/// Returns the path unchanged when it has no leading `~`, which is the
+/// common case and not a failure.
+#[must_use]
+pub fn expand_home(path: &std::path::Path, home: &std::path::Path) -> PathBuf {
+    let Ok(text) = path.strip_prefix("~") else {
+        return path.to_path_buf();
+    };
+    // `strip_prefix("~")` on exactly `~` leaves an empty path, which joins
+    // to the home itself rather than to a stray separator.
+    home.join(text)
+}
+
 /// One permission, as declared in `rachna.nix`.
 ///
 /// Every variant's category is recoverable via [`Self::category`], so the
@@ -312,6 +354,7 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// One grant of every variant, so adding a variant fails to compile here.
     fn every_grant() -> Vec<Grant> {
@@ -378,6 +421,53 @@ mod tests {
             }
         }
         all
+    }
+
+    #[test]
+    fn a_leading_tilde_resolves_and_nothing_else_does() {
+        // `~/.zshrc` is how a person writes this, and requiring
+        // `/Users/shriyans/.zshrc` is not just tedious — it is NOT
+        // PORTABLE. A teammate cloning the repo has a different username,
+        // so the config breaks for them, and `00` §3.2 makes the file the
+        // thing a team shares.
+        let home = PathBuf::from("/Users/someone");
+
+        assert_eq!(
+            expand_home(Path::new("~/.zshrc"), &home),
+            PathBuf::from("/Users/someone/.zshrc")
+        );
+        // Exactly `~` is the home itself, not the home plus a stray
+        // separator.
+        assert_eq!(expand_home(Path::new("~"), &home), home);
+
+        // ONLY at the start. A `~` inside a filename is a literal
+        // character, and a real file called `a~b` must not be rewritten.
+        for untouched in ["/abs/path", "relative/path", "a~b", "./x", "/tmp/a~"] {
+            assert_eq!(
+                expand_home(Path::new(untouched), &home),
+                PathBuf::from(untouched),
+                "`{untouched}` was rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_ends_of_a_mount_resolve_against_different_homes() {
+        // The property that makes `{ source = "~/.zshrc"; target =
+        // "~/.zshrc"; }` read as intended: the same character means the
+        // HOST's home on one side and the GUEST's on the other, because
+        // that is what a user means by it.
+        let host = PathBuf::from("/Users/someone");
+        let source = expand_home(Path::new("~/.zshrc"), &host);
+        let target = expand_home(Path::new("~/.zshrc"), Path::new(GUEST_HOME));
+
+        assert_eq!(source, PathBuf::from("/Users/someone/.zshrc"));
+        assert_eq!(target, PathBuf::from("/home/dev/.zshrc"));
+        assert_ne!(
+            source, target,
+            "both ends resolved to the same path, so one of the two homes \
+             is not being used"
+        );
     }
 
     #[test]

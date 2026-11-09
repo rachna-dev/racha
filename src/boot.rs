@@ -134,16 +134,21 @@ pub fn launch_for(
     image: &Image,
     paths: &ProjectPaths,
     project_dir: &Path,
+    home: &Path,
     root: PathBuf,
     state: PathBuf,
 ) -> Launch {
+    let shares = shares_for(policy, project_dir, home);
     Launch {
         kernel: image.kernel.clone(),
         initrd: image.initramfs.clone(),
         // `root=/dev/vda rw` matches what the initramfs looks for. Not
         // configurable: a mismatch between this and the initramfs is a boot
         // failure with no diagnostic, so the two are written together.
-        cmdline: "console=hvc0 root=/dev/vda rw".to_owned(),
+        // The mount map rides on the command line: see
+        // `mount_parameters` for why that is the only channel available
+        // before the guest has mounted anything.
+        cmdline: format!("console=hvc0 root=/dev/vda rw{}", mount_parameters(&shares)),
         memory_mib: policy.resources.memory_mib,
         cpus: policy.resources.cpus,
         // ORDER IS THE INTERFACE: the guest sees these as /dev/vda and
@@ -168,16 +173,7 @@ pub fn launch_for(
         //
         // The socket is empty because VZ has no virtiofsd; `Share`'s
         // comment records why both fields exist.
-        shares: vec![Share {
-            tag: WORKSPACE_TAG.to_owned(),
-            host_path: project_dir.to_path_buf(),
-            socket: PathBuf::new(),
-            // WRITABLE. A guest that cannot write to the workspace cannot
-            // compile, install dependencies, or run a formatter — the
-            // isolation that matters is the HOST boundary (`00` §3), not
-            // the project directory the user is working in.
-            read_only: false,
-        }],
+        shares,
         console_log: paths.console_log(),
         api_socket: paths.api_socket(),
     }
@@ -189,6 +185,102 @@ pub fn launch_for(
 /// and the guest's init mounts it, and a mismatch is a guest with no
 /// workspace and nothing on the console to say why.
 pub const WORKSPACE_TAG: &str = "workspace";
+
+/// The tag-to-destination map, as kernel command-line parameters.
+///
+/// # Why the command line and not a file
+///
+/// VZ identifies a share by a **tag** and gives the host no way to say
+/// where the guest should mount it — the guest decides. A tag is also
+/// length-limited and cannot contain `/`, so the destination cannot be
+/// encoded in the tag itself.
+///
+/// A file beside the console was the first idea and does not work: the
+/// guest cannot read the host's runtime directory, which is the whole
+/// point of the isolation. The kernel command line is the one channel that
+/// reaches a guest before anything is mounted, which is exactly when the
+/// init needs this.
+///
+/// Rendered as `rachna.mount=tag:/path`, repeated. Paths with spaces are
+/// refused earlier rather than quoted here: the kernel command line has no
+/// quoting, so a space would silently split one mount into two.
+#[must_use]
+fn mount_parameters(shares: &[Share]) -> String {
+    shares
+        .iter()
+        .filter_map(|share| {
+            // Only shares with a declared destination. The workspace's is
+            // fixed and the guest's init already knows it.
+            let guest_path = share.guest_path.as_ref()?;
+            let path = guest_path.to_string_lossy();
+            // A space would split the parameter, so such a mount is
+            // dropped WITH the summary still showing it — which would be a
+            // permission silently not applied. Refused at parse time
+            // instead; this is the belt.
+            if path.contains(char::is_whitespace) {
+                return None;
+            }
+            Some(format!(" rachna.mount={}:{path}", share.tag))
+        })
+        .collect()
+}
+
+/// Every directory the guest can see./// Every directory the guest can see.
+///
+/// The workspace, plus whatever `filesystem.mounts` declares. **The
+/// declared mounts were being gated and audited and never mounted** — the
+/// policy carried them, the summary showed them, and this function built a
+/// one-element list containing only the workspace. A permission the user
+/// approved and the guest never received.
+///
+/// `~` is expanded at both ends, with the two meanings `expand_home`
+/// describes: the host's home in `source`, the guest's in `target`.
+fn shares_for(policy: &Policy, project_dir: &Path, home: &Path) -> Vec<Share> {
+    let mut shares = vec![Share {
+        tag: WORKSPACE_TAG.to_owned(),
+        host_path: project_dir.to_path_buf(),
+        socket: PathBuf::new(),
+        // WRITABLE. A guest that cannot write to the workspace cannot
+        // compile, install dependencies, or run a formatter — the
+        // isolation that matters is the HOST boundary (`00` §3), not the
+        // project directory the user is working in.
+        read_only: false,
+        // The workspace has a fixed destination the guest's init knows.
+        guest_path: None,
+    }];
+
+    for (index, grant) in policy.grants.iter().enumerate() {
+        let crate::grant::Grant::Filesystem {
+            path,
+            target,
+            access,
+        } = grant
+        else {
+            continue;
+        };
+        let host_path = crate::grant::expand_home(path, home);
+        // The project directory is already shared as the workspace. A
+        // config that also mounts `.` would otherwise get two shares of
+        // one directory, which VZ accepts and the guest then sees twice.
+        if host_path == project_dir {
+            continue;
+        }
+        shares.push(Share {
+            // Tags must be unique and are what the guest mounts by, so
+            // they are generated rather than taken from the path — a path
+            // contains `/`, which is not a legal tag.
+            tag: format!("mount{index}"),
+            host_path,
+            socket: PathBuf::new(),
+            read_only: *access == crate::decision::Access::ReadOnly,
+            // Where the guest puts it. `None` means the guest's default.
+            guest_path: target
+                .as_ref()
+                .map(|t| crate::grant::expand_home(t, Path::new(crate::grant::GUEST_HOME))),
+        });
+    }
+    shares
+}
 
 /// Where this project's writable root copy lives.
 ///
@@ -365,6 +457,7 @@ mod tests {
             &image,
             &paths,
             Path::new("/some/project"),
+            Path::new("/Users/someone"),
             PathBuf::from("/tmp/root.img"),
             PathBuf::from("/tmp/state.img"),
         );
@@ -461,6 +554,117 @@ mod tests {
             std::fs::read(&again).expect("readable"),
             b"the guest has written here",
             "starting again replaced the state volume"
+        );
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn a_declared_mount_reaches_the_guest_and_not_only_the_summary() {
+        // THE gap. The policy carried `filesystem.mounts`, the permission
+        // summary showed them, and `launch_for` built a share list
+        // containing only the workspace — so a mount the user read and
+        // approved was never given to the guest. A permission that is
+        // audited and not applied is worse than one that is absent: the
+        // user believes they have it.
+        let root_dir = scratch("mounts");
+        let dir = root_dir.join("guests").join(host_arch());
+        std::fs::create_dir_all(&dir).expect("dirs");
+        for name in ["Image", "initramfs.gz", "root.img"] {
+            std::fs::write(dir.join(name), b"x").expect("file");
+        }
+        let image = Image::find(&root_dir).expect("found");
+        let project = crate::layout::ProjectId::new("mounted-01").expect("id");
+        let paths = ProjectPaths::new(&root_dir, &project);
+
+        let mut policy = policy();
+        policy.grants = vec![crate::grant::Grant::Filesystem {
+            path: PathBuf::from("~/.zshrc"),
+            target: Some(PathBuf::from("~/.zshrc")),
+            access: crate::decision::Access::ReadOnly,
+        }];
+
+        let launch = launch_for(
+            &policy,
+            &image,
+            &paths,
+            Path::new("/some/project"),
+            Path::new("/Users/someone"),
+            PathBuf::from("/tmp/root.img"),
+            PathBuf::from("/tmp/state.img"),
+        );
+
+        // The workspace, plus the declared mount.
+        assert_eq!(launch.shares.len(), 2, "{:?}", launch.shares);
+        let declared = launch
+            .shares
+            .iter()
+            .find(|s| s.tag != WORKSPACE_TAG)
+            .expect("the declared mount is missing from the shares");
+
+        // BOTH ends resolved, against different homes.
+        assert_eq!(
+            declared.host_path,
+            PathBuf::from("/Users/someone/.zshrc"),
+            "the source's `~` was not expanded against the host's home"
+        );
+        assert_eq!(
+            declared.guest_path.as_deref(),
+            Some(Path::new("/home/dev/.zshrc")),
+            "the target's `~` was not expanded against the guest's home"
+        );
+        // Read-only carried through: a dotfile the guest can rewrite is one
+        // it can use to change what runs on the HOST next time.
+        assert!(declared.read_only, "a read-only mount became writable");
+
+        // And the guest is TOLD where to put it, on the kernel command
+        // line — VZ has no field for a destination, so without this the
+        // share arrives anonymous and the guest mounts it anywhere.
+        assert!(
+            launch
+                .cmdline
+                .contains(&format!("rachna.mount={}:/home/dev/.zshrc", declared.tag)),
+            "the destination never reached the guest: {}",
+            launch.cmdline
+        );
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn mounting_the_project_directory_does_not_share_it_twice() {
+        // `{ source = "."; }` is a reasonable thing to write, and the
+        // workspace is already that directory — two shares of one path is
+        // something VZ accepts and the guest then sees twice.
+        let root_dir = scratch("dupe");
+        let dir = root_dir.join("guests").join(host_arch());
+        std::fs::create_dir_all(&dir).expect("dirs");
+        for name in ["Image", "initramfs.gz", "root.img"] {
+            std::fs::write(dir.join(name), b"x").expect("file");
+        }
+        let image = Image::find(&root_dir).expect("found");
+        let project = crate::layout::ProjectId::new("dupe-0001").expect("id");
+        let paths = ProjectPaths::new(&root_dir, &project);
+
+        let mut policy = policy();
+        policy.grants = vec![crate::grant::Grant::Filesystem {
+            path: PathBuf::from("/some/project"),
+            target: None,
+            access: crate::decision::Access::ReadWrite,
+        }];
+
+        let launch = launch_for(
+            &policy,
+            &image,
+            &paths,
+            Path::new("/some/project"),
+            Path::new("/Users/someone"),
+            PathBuf::from("/tmp/root.img"),
+            PathBuf::from("/tmp/state.img"),
+        );
+        assert_eq!(
+            launch.shares.len(),
+            1,
+            "the project directory was shared twice: {:?}",
+            launch.shares
         );
         let _ = std::fs::remove_dir_all(&root_dir);
     }

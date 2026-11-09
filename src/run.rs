@@ -59,6 +59,13 @@ pub struct Context {
     pub project_dir: PathBuf,
     /// The Rachna root, normally `~/.rachna` (`08` §4.1).
     pub rachna_root: PathBuf,
+    /// The host's home directory.
+    ///
+    /// Kept rather than used once to build `rachna_root` and dropped: a
+    /// `~` in a mount's `source` resolves against it, which is what makes
+    /// `{ source = "~/.zshrc"; }` portable between teammates with
+    /// different usernames (`grant::expand_home`).
+    pub home: PathBuf,
     /// This project's stable id.
     pub project: ProjectId,
     /// The pinned nixpkgs the guest is built from.
@@ -775,6 +782,7 @@ mod tests {
         Context {
             project_dir: root.join("project"),
             rachna_root: root.join("rachna"),
+            home: root.join("home"),
             project: ProjectId::new("app-a3f2").expect("valid"),
             nixpkgs: PathBuf::from("/nixpkgs"),
             capabilities: Capabilities::all(),

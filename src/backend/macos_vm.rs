@@ -390,6 +390,13 @@ impl Guest {
                     // what the guest mounts by, and the guest decides
                     // where — so the host's job is to name it accurately
                     // and not to pick the mount point.
+                    // The TAG carries the destination to the guest, because
+                    // VZ has no field for one: a share is identified by tag
+                    // and the guest decides where to mount it. So the tag is
+                    // the whole protocol between the two halves, and
+                    // `guest_path` has to be encoded somewhere the guest can
+                    // read — `share_map` beside the console does that, since
+                    // a tag is limited to 36 characters and a path is not.
                     let tag = NSString::from_str(&share.tag);
                     // The tag must be valid, and VZ is the authority on
                     // what that means rather than us guessing a charset.

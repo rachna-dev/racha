@@ -165,6 +165,7 @@ mod commands {
         Ok(Context {
             project_dir,
             rachna_root: default_root(&home),
+            home,
             project,
             // The pinned guest. Not yet fetched — `21` §2.1a is the
             // supply-chain story — so this is the local checkout.
@@ -567,7 +568,15 @@ mod commands {
             }
         };
 
-        let plan = launch_for(policy, &image, &paths, &context.project_dir, root, state);
+        let plan = launch_for(
+            policy,
+            &image,
+            &paths,
+            &context.project_dir,
+            &context.home,
+            root,
+            state,
+        );
         // Logged because a share that silently fails to attach is invisible
         // otherwise: the guest just reports no workspace, which looks
         // guest-side and is not.

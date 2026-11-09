@@ -160,25 +160,48 @@ mount -t ext4 /dev/vda /mnt || { echo "RACHNA-INITRAMFS-FAILED"; exec sh; }
 # mounts, so the share is mounted into the NEW root's /workspace before
 # pivoting — after which it is simply part of the filesystem the guest
 # boots into.
-MODDIR=$(echo /lib/modules/*/kernel/fs/fuse)
-insmod "$MODDIR/fuse.ko" 2>/dev/null
-insmod "$MODDIR/virtiofs.ko" 2>/dev/null
-# Mounted DIRECTLY into the new root, so `switch_root` inherits it as an
-# ordinary part of the filesystem rather than having to carry it across.
 #
-# MEASURED (`02` §6.12): mounting into the initramfs and letting
-# `switch_root` move it gave `/proc/mounts` showing the share and `ls -a`
-# listing nothing — the mount survived the pivot and its CONTENTS did
-# not. Mounting at the final path is what works, and the proof is the
-# file list printed on both sides of the pivot.
-# The modules are loaded HERE so the root init can mount without
-# needing insmod itself — but the MOUNT happens after the pivot.
-# `02` §6.12 measured that a share mounted here and carried through
-# `switch_root` arrives with its contents gone, so the pivot is what
-# breaks it; mounting afterwards is the other side of that test.
+# The modules are loaded here too, so the root init does not need
+# `insmod` itself. `CONFIG_VIRTIO_FS=m` on this kernel, and the kernel
+# package ships no modules directory — they come from a separate
+# `modules` output.
 MODDIR=$(echo /lib/modules/*/kernel/fs/fuse)
 insmod "$MODDIR/fuse.ko" 2>/dev/null
 insmod "$MODDIR/virtiofs.ko" 2>/dev/null
+
+mkdir -p /mnt/workspace
+if mount -t virtiofs workspace /mnt/workspace 2>/dev/null; then
+  echo "RACHNA-INITRAMFS-WORKSPACE: $(ls /mnt/workspace | tr '\n' ' ')"
+else
+  echo "RACHNA-INITRAMFS-WORKSPACE-FAILED"
+fi
+
+# DECLARED MOUNTS, from `rachna.mount=tag:/path` on the kernel command
+# line. The host cannot tell VZ where a share belongs — a share is
+# identified by tag and the guest decides — so the command line carries
+# the map. It is also the only channel that reaches a guest before
+# anything is mounted, which is when this is needed.
+#
+# Mounted into `/mnt`, which `switch_root` is about to make `/`, so each
+# lands at its final path and a dotfile is in place before any shell
+# starts.
+for param in $(cat /proc/cmdline); do
+  case "$param" in
+    rachna.mount=*)
+      spec=${param#rachna.mount=}
+      tag=${spec%%:*}
+      dest=${spec#*:}
+      # The parent is created because a declared destination may be
+      # somewhere the image has nothing — a home directory, say.
+      mkdir -p "/mnt$dest" 2>/dev/null
+      if mount -t virtiofs "$tag" "/mnt$dest" 2>/dev/null; then
+        echo "RACHNA-MOUNT: $tag -> $dest"
+      else
+        echo "RACHNA-MOUNT-FAILED: $tag -> $dest"
+      fi
+      ;;
+  esac
+done
 
 exec switch_root /mnt /init
 INIT

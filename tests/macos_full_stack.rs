@@ -237,6 +237,7 @@ fn the_guest_can_read_a_file_the_host_just_wrote() {
         &image,
         &paths,
         &workspace,
+        &dir,
         private_root(&root, &dir),
         state_volume(&dir),
     );
