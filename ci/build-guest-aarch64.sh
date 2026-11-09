@@ -65,7 +65,17 @@ WORK=$(mktemp -d)
 # read-only permissions, and `rm -rf` then fails on every single path.
 # Found by running this script — the image built and the cleanup failed,
 # which would have left ~400 MiB in TMPDIR on every invocation.
-trap 'chmod -R u+w "$WORK" 2>/dev/null || true; rm -rf "$WORK"' EXIT
+# The trap PRESERVES the exit status. A trap ending in `rm -rf` hands the
+# script `rm`'s status instead of the failure that triggered it — measured:
+# a build died on a syntax error partway through and still reported exit 0,
+# so a caller saw success and a half-written image.
+cleanup() {
+  status=$?
+  chmod -R u+w "$WORK" 2>/dev/null || true
+  rm -rf "$WORK" 2>/dev/null || true
+  exit $status
+}
+trap cleanup EXIT
 ROOT="$WORK/root"
 #  holds the shipped demo app;  is a MOUNT
 # POINT for the user's project, so it stays empty in the image.
