@@ -71,7 +71,7 @@ serde_json = { version = "1.0.154", features = ["raw_value"] }
 #                     adds `bitflags`/`errno`/`libc`, all three already in
 #                     the tree via rusqlite.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "termios"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-virtualization = "0.3.2"

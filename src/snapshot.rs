@@ -329,16 +329,51 @@ pub enum ResumeApproval {
 }
 
 impl ResumeApproval {
-    /// Whether the resume may proceed without asking.
+    /// Whether resuming needs the user to answer before it proceeds.
+    ///
+    /// **Not `may_resume_silently`**, which is what this was called and is
+    /// the rule `00` §3.10c now rejects. A resume is never silent: the
+    /// summary prints every time, and this decides only whether a keypress
+    /// is also required. The old name described a resume that printed
+    /// nothing, which is exactly the behaviour the correction removed.
     ///
     /// An explicit match, so adding a variant is a compile error here rather
     /// than silently counting as permitted.
     #[must_use]
-    pub const fn may_resume_silently(&self) -> bool {
+    pub const fn needs_acknowledgement(&self) -> bool {
         match *self {
-            Self::Unchanged => true,
-            Self::NeedsApproval { .. } | Self::Unrecorded => false,
+            Self::Unchanged => false,
+            Self::NeedsApproval { .. } | Self::Unrecorded => true,
         }
+    }
+}
+
+/// Whether a resume carrying `taken_with` may proceed under `running`.
+///
+/// A free function on the two fingerprints rather than a method, because
+/// **the grant set is the only field it reads** and a caller that has the
+/// fingerprint should not have to fabricate a whole [`Metadata`] — which is
+/// what `run::resume_verdict` was about to do. `check_restorable` genuinely
+/// needs the rest of the struct; this does not.
+///
+/// `approved` is the store's answer for the *current* grant set
+/// (`store::approval`), supplied rather than looked up here so this stays
+/// pure and so there is one approval authority.
+#[must_use]
+pub fn resume_approval(taken_with: &str, running: &str, approved: bool) -> ResumeApproval {
+    if taken_with.is_empty() {
+        return ResumeApproval::Unrecorded;
+    }
+    // Both conditions, and both are necessary. An unchanged grant set that
+    // was never approved must still ask — otherwise suspending before
+    // approving and resuming afterwards would launder an unapproved policy
+    // through the snapshot.
+    if taken_with == running && approved {
+        return ResumeApproval::Unchanged;
+    }
+    ResumeApproval::NeedsApproval {
+        taken_with: taken_with.to_owned(),
+        running: running.to_owned(),
     }
 }
 
@@ -359,20 +394,7 @@ impl Metadata {
         running_fingerprint: &str,
         approved: bool,
     ) -> ResumeApproval {
-        if self.grant_fingerprint.is_empty() {
-            return ResumeApproval::Unrecorded;
-        }
-        // Both conditions, and both are necessary. An unchanged grant set
-        // that was never approved must still ask — otherwise suspending
-        // before approving and resuming afterwards would launder an
-        // unapproved policy through the snapshot.
-        if self.grant_fingerprint == running_fingerprint && approved {
-            return ResumeApproval::Unchanged;
-        }
-        ResumeApproval::NeedsApproval {
-            taken_with: self.grant_fingerprint.clone(),
-            running: running_fingerprint.to_owned(),
-        }
+        resume_approval(&self.grant_fingerprint, running_fingerprint, approved)
     }
 
     /// Whether this snapshot can be restored into `running`.
@@ -619,13 +641,19 @@ mod tests {
     const FINGERPRINT: &str = "tier=allowlist\nprofile=development\n";
 
     #[test]
-    fn an_unchanged_and_approved_grant_set_resumes_silently() {
-        // The common case, and it must stay silent: a prompt on every resume
+    fn an_unchanged_and_approved_grant_set_resumes_without_a_keypress() {
+        // The common case. It needs no keypress — a prompt on every resume
         // is the noise `00` §3.10c warns teaches people to bypass the gate.
+        //
+        // NOT "resumes silently", which is what this test was called and
+        // asserted. `00` §3.10c now makes the summary unconditional, so a
+        // resume always PRINTS what it permits; this verdict governs only
+        // whether it also waits. The rename is the point: the old name was
+        // the rejected rule written into the suite.
         let snapshot = metadata();
         let verdict = snapshot.check_resume_approval(FINGERPRINT, true);
         assert_eq!(verdict, ResumeApproval::Unchanged);
-        assert!(verdict.may_resume_silently());
+        assert!(!verdict.needs_acknowledgement());
     }
 
     #[test]
@@ -637,7 +665,7 @@ mod tests {
         let snapshot = metadata();
         let widened = "tier=open\nprofile=development\n";
         let verdict = snapshot.check_resume_approval(widened, true);
-        assert!(!verdict.may_resume_silently());
+        assert!(verdict.needs_acknowledgement());
         let ResumeApproval::NeedsApproval {
             taken_with,
             running,
@@ -660,7 +688,7 @@ mod tests {
         let snapshot = metadata();
         let verdict = snapshot.check_resume_approval(FINGERPRINT, false);
         assert!(
-            !verdict.may_resume_silently(),
+            verdict.needs_acknowledgement(),
             "an unapproved policy was laundered through a suspend/resume cycle"
         );
     }
@@ -675,7 +703,7 @@ mod tests {
         old.grant_fingerprint = String::new();
         let verdict = old.check_resume_approval(FINGERPRINT, true);
         assert_eq!(verdict, ResumeApproval::Unrecorded);
-        assert!(!verdict.may_resume_silently());
+        assert!(verdict.needs_acknowledgement());
     }
 
     #[test]
@@ -693,9 +721,9 @@ mod tests {
         );
         // And the resume check still catches it, so this is a separation of
         // concerns rather than a hole.
-        assert!(!snapshot
+        assert!(snapshot
             .check_resume_approval(FINGERPRINT, true)
-            .may_resume_silently());
+            .needs_acknowledgement());
     }
 
     #[test]
@@ -711,9 +739,9 @@ mod tests {
         let snapshot = metadata();
         let narrowed = "tier=none\nprofile=sealed\n";
         assert!(
-            !snapshot
+            snapshot
                 .check_resume_approval(narrowed, true)
-                .may_resume_silently(),
+                .needs_acknowledgement(),
             "a resume under a different policy went unreviewed"
         );
     }

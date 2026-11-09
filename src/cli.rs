@@ -181,7 +181,13 @@ pub enum Command {
     Init { template: Option<String> },
     /// `rachna start [--accept]`
     ///
-    /// `--accept` acknowledges the first-run access summary (`00` §3.10c).
+    /// Also the resume path: there is no separate `resume` verb.
+    ///
+    /// `--accept` acknowledges the access summary **in CI only**. At a
+    /// terminal it is ignored, because `00` §3.10c makes the gate a
+    /// keypress: a flag that worked interactively would let a user accept a
+    /// cloned config's permissions in the same breath as asking to start
+    /// it, which is the one thing the gate exists to prevent.
     Start { accept: bool },
     /// `rachna stop`
     Stop,
@@ -942,8 +948,10 @@ USAGE
 
 ENVIRONMENT
   init [--template <url>]   write a starting rachna.nix
-  start [--accept]          start or resume; --accept acknowledges the
-                            first-run access summary
+  start [--accept]          start or resume. Shows what rachna.nix permits
+                            every time; asks for `a` when the grants are
+                            new or wider. --accept is for CI only — at a
+                            terminal it is ignored and you press `a`
   stop                      stop the environment
   status                    what is running, and what it is allowed
   doctor                    check this host, and verify enforcement

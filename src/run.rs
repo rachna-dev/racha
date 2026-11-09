@@ -43,7 +43,7 @@ use crate::eval::Invocation;
 use crate::layout::{ProjectId, ProjectPaths};
 use crate::store::approval::Approval;
 use crate::store::Store;
-use crate::summary::{review_prompt, AccessSummary, Selection};
+use crate::summary::{review_prompt, AccessSummary, Reason, Selection};
 use crate::supervise::{self, Children, Running, StartPlan};
 use crate::tap;
 use core::fmt;
@@ -207,9 +207,21 @@ pub fn evaluate(context: &Context) -> Result<Policy, StartError> {
 
 /// Everything between a policy and a launch, with no side effects.
 ///
-/// Returns the gate's verdict. **Pure**, so the ordering of steps 3 and 4 is
-/// testable without a filesystem — and both are refusals a user will meet
-/// far more often than a successful first run.
+/// Returns what to show the user and whether to wait for them. **Pure**, so
+/// the ordering of steps 3 and 4 is testable without a filesystem.
+///
+/// # The summary is unconditional
+///
+/// An earlier version returned `None` for an approved grant set, meaning
+/// "say nothing, proceed" — so a second `start` printed nothing and
+/// launched. That is corrected in `00` §3.10c, and the reason is the one
+/// §3.10c already gives for the first run: **a user about to hand a
+/// directory to a VM should be told what that VM may do, every time.**
+///
+/// The approval record changes only whether *input* is required, never
+/// whether the summary appears. Otherwise `rachna.db` would be deciding
+/// whether a user sees their own permissions, and `08` §3.1 is explicit
+/// that the database is a cache rather than truth.
 ///
 /// # Errors
 ///
@@ -218,8 +230,10 @@ pub fn check(
     policy: &Policy,
     tap_capability: &tap::Capability,
     approval: Approval,
+    history: History,
+    resuming: Option<&crate::snapshot::ResumeApproval>,
     interactive: bool,
-) -> Result<Option<Started>, StartError> {
+) -> Result<Gate, StartError> {
     // Step 3 BEFORE the gate, deliberately. `16` §5.3 measured that a
     // networked guest does not boot at all without the capability, so asking
     // a user to approve a grant set that cannot run would waste their
@@ -233,24 +247,153 @@ pub fn check(
 
     // Step 4: the grant set.
     let summary = AccessSummary::new(policy.tier, policy.profile, &policy.grants);
-    if approval.permits_apply() {
-        return Ok(None);
-    }
-    // A config that grants NOTHING needs no acknowledgement: `00` §3.10c's
-    // gate exists so a user sees what they are about to permit, and there is
-    // nothing to see. Found by running it — the prompt said "needs no
-    // acknowledgement" and the gate refused anyway, which is a message and
-    // a behaviour disagreeing in the most confusing possible way.
+
+    // A config that grants NOTHING needs no keypress: the gate exists so a
+    // user sees what they are about to permit, and there is nothing to
+    // permit. The summary still prints — `00` §3.10c's "secrets none is
+    // information" applies to the whole set.
     //
     // `is_empty` is `summary.rs`'s own question, so this cannot drift from
-    // what the summary printed: a `none (… forbids it)` line is not a grant.
-    if summary.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(Started::NeedsAcknowledgement {
-        prompt: format!("{summary}\n{}", review_prompt(&summary, interactive)),
+    // what the summary showed: a `none (… forbids it)` line is not a grant.
+    let approved = approval.permits_apply();
+
+    // Resume is the SAME gate, not a parallel one. `00` §3.10c's third
+    // reason for making the summary unconditional is that a rule covering
+    // only `start` leaves the steady-state path uncovered — §7 Layer A
+    // makes resume the common case.
+    //
+    // A snapshot whose grant set differs from the file's, or that predates
+    // grant recording, needs input even when the CURRENT set is approved:
+    // what is coming back to life is the snapshot's policy, and approving
+    // today's file never reviewed that.
+    let snapshot_disagrees = resuming.is_some_and(|verdict| {
+        matches!(
+            *verdict,
+            crate::snapshot::ResumeApproval::NeedsApproval { .. }
+                | crate::snapshot::ResumeApproval::Unrecorded
+        )
+    });
+
+    let needs_input = !summary.is_empty() && (!approved || snapshot_disagrees);
+
+    // ONE reason drives both the header and the prompt's sentence, so the
+    // two cannot disagree about why the gate is asking. They did: the
+    // header said "first run" while the config had plainly run here.
+    // `Widened` describes an UNAPPROVED set in a project with history. Once
+    // the set is approved it is simply what is running, and keeping the
+    // "widened since you approved" wording would describe the state before
+    // the keypress — found by pressing `a` and running again, where an
+    // approved config was still told it had widened.
+    let reason = if snapshot_disagrees {
+        Reason::SnapshotDiverged
+    } else if history == History::RanBefore && !approved {
+        Reason::Widened
+    } else {
+        Reason::FirstRun
+    };
+
+    Ok(Gate {
+        shown: format!("{}{summary}", gate_header(approved, reason)),
+        prompt: if needs_input {
+            Some(review_prompt(&summary, reason, interactive))
+        } else {
+            None
+        },
+        divergence: resuming.and_then(describe_divergence),
         summary,
-    }))
+    })
+}
+
+/// The line above the grant list, saying which case this is.
+///
+/// Lives here rather than in [`AccessSummary`]'s `Display` because it
+/// depends on the **approval record**, which the summary deliberately does
+/// not know. It used to be hardcoded as `"rachna.nix grants, first run:"`,
+/// and once `00` §3.10c made the summary unconditional that became a lie
+/// told to every user on every subsequent start — found by running `start`
+/// twice and reading the output.
+fn gate_header(approved: bool, reason: Reason) -> String {
+    let what = match (approved, reason) {
+        // Resume is where "first run" would be most misleading: the config
+        // has run here — that is why there is a snapshot.
+        (_, Reason::SnapshotDiverged) => "resuming under these grants:",
+        (_, Reason::Widened) => "grants, widened since you approved:",
+        (true, Reason::FirstRun) => "running under these grants:",
+        (false, Reason::FirstRun) => "grants, first run:",
+    };
+    format!("  rachna.nix {what}\n")
+}
+
+/// The sentence a resume gate adds, when the snapshot's policy is not the
+/// file's.
+///
+/// `00` §3.3's rule applies here as everywhere: a user told "permissions
+/// changed" cannot act, so the fingerprints are named. [`None`] for an
+/// unchanged snapshot — there is nothing to say.
+fn describe_divergence(verdict: &crate::snapshot::ResumeApproval) -> Option<String> {
+    use crate::snapshot::ResumeApproval;
+    match *verdict {
+        ResumeApproval::Unchanged => None,
+        ResumeApproval::Unrecorded => Some(
+            "  this snapshot predates grant recording, so what it was\n  \
+             permitted cannot be compared. review the grants above.\n"
+                .to_owned(),
+        ),
+        ResumeApproval::NeedsApproval {
+            ref taken_with,
+            ref running,
+        } => Some(format!(
+            "  the grants changed since this snapshot was taken:\n  \
+             taken with  {taken_with}\n  rachna.nix  {running}\n"
+        )),
+    }
+}
+
+/// Whether this project has ever had a grant set approved on this machine.
+///
+/// Needed because [`Approval`] answers only about the grant set in front of
+/// it: `Unseen` is returned both for a genuine first run *and* for a config
+/// that has run here for months and just gained a host. Telling the second
+/// user "this config has not run here before" reads as a bug and costs the
+/// gate its credibility — which is the one thing it cannot afford.
+///
+/// An enum rather than a `bool` because `check(…, true, …)` at a call site
+/// says nothing about what is true (AGENTS.md, "prefer enums").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum History {
+    /// No grant set has ever been approved for this project here.
+    Fresh,
+    /// Some grant set was approved here before, so this config is not new.
+    RanBefore,
+}
+
+/// What to show the user, and whether to wait for them.
+///
+/// The summary is **always** present; the prompt is present only when a
+/// human has not yet approved this grant set. `00` §3.10c: the approval
+/// record changes whether input is required, never whether the summary
+/// appears.
+#[derive(Debug)]
+pub struct Gate {
+    /// The grant summary, rendered. Always shown.
+    pub shown: String,
+    /// The prompt, when input is required.
+    pub prompt: Option<String>,
+    /// Why a resume's policy differs from the file's, when it does.
+    ///
+    /// Shown between the summary and the prompt: the summary says what the
+    /// grants ARE, this says what changed about them.
+    pub divergence: Option<String>,
+    /// The summary itself, for a caller that needs to record it.
+    pub summary: AccessSummary,
+}
+
+impl Gate {
+    /// Whether the user must answer before anything starts.
+    #[must_use]
+    pub const fn needs_input(&self) -> bool {
+        self.prompt.is_some()
+    }
 }
 
 /// Records a human's approval of a policy's grant set.
@@ -274,6 +417,138 @@ pub fn accept(context: &Context, policy: &Policy, now_millis: i64) -> Result<(),
             why: error.to_string(),
         })
 }
+
+/// Whether this project has approved anything on this machine before.
+///
+/// Read from the store, which `08` §3.1 makes a cache rather than truth —
+/// and that is exactly the right status for this. It changes only the
+/// *wording* of the gate, never whether the gate asks: delete the database
+/// and a widened config is called a first run, which is conservative in the
+/// safe direction.
+///
+/// # Errors
+///
+/// [`StartError::Store`] if the store cannot be opened or read.
+pub fn history_of(context: &Context) -> Result<History, StartError> {
+    let store = open_store(context)?;
+    let ran_before = store
+        .has_approved_anything()
+        .map_err(|error| StartError::Store {
+            why: error.to_string(),
+        })?;
+    Ok(if ran_before {
+        History::RanBefore
+    } else {
+        History::Fresh
+    })
+}
+
+/// Whether a snapshot is waiting, and whether its policy is still the
+/// file's.
+///
+/// `start` is also `resume` — there is no second verb — so this is what
+/// gives resume the gate that `00` §3.10c requires. [`None`] means there is
+/// no snapshot to come back to, which is a cold start and not a problem.
+///
+/// # Why the fingerprint is read from a file beside the snapshot
+///
+/// A snapshot has to carry the grant set it was **taken** under, and the
+/// approval store only knows the set the file has **now**. Comparing the
+/// file against itself would always say "unchanged" and the resume gate
+/// would be unfalsifiable — exactly the design smell AGENTS.md names. So the
+/// fingerprint is recorded next to the memory image when the snapshot is
+/// written, and read back here.
+///
+/// A snapshot directory with no fingerprint file is
+/// [`ResumeApproval::Unrecorded`], not "fine": it is either a snapshot from
+/// before this field existed or one whose record was removed, and both
+/// answer "ask".
+///
+/// # Errors
+///
+/// [`StartError::Store`] only if the approval store cannot be read. A
+/// missing or unreadable fingerprint is a verdict, not an error — refusing
+/// to start because a sidecar file is corrupt would strand a user with a
+/// perfectly restorable guest.
+pub fn resume_verdict(
+    context: &Context,
+    policy: &Policy,
+) -> Result<Option<crate::snapshot::ResumeApproval>, StartError> {
+    let snapshot_dir = context.paths().snapshot_dir();
+    // An EMPTY directory is not a snapshot. `layout.rs` creates
+    // `snapshots/` as part of the project's durable tree, so its existence
+    // says nothing — and treating it as a snapshot would gate every cold
+    // start on a policy no snapshot was ever taken under, which is a prompt
+    // the user cannot act on.
+    if !snapshot_dir.is_dir() || !has_snapshot(&snapshot_dir) {
+        return Ok(None);
+    }
+
+    let summary = AccessSummary::new(policy.tier, policy.profile, &policy.grants);
+    let running = summary.fingerprint();
+    let approved = approval_of(context, policy)?.permits_apply();
+
+    let taken_with =
+        std::fs::read_to_string(snapshot_dir.join(GRANT_FINGERPRINT_FILE)).unwrap_or_default();
+
+    // Delegated to `snapshot.rs` rather than re-decided here: one place
+    // answers "may this resume", and it is the place with the tests.
+    Ok(Some(crate::snapshot::resume_approval(
+        &taken_with,
+        &running,
+        approved,
+    )))
+}
+
+/// Whether a snapshot directory actually holds one.
+///
+/// Any entry other than our own sidecar counts: the memory image, the
+/// device config, whatever a backend writes. Deliberately not a list of
+/// expected filenames — `24` §6's completeness check is the place that
+/// knows those, and duplicating it here would mean two definitions of "a
+/// snapshot exists" that can disagree.
+fn has_snapshot(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name() != std::ffi::OsStr::new(GRANT_FINGERPRINT_FILE))
+    })
+}
+
+/// Records the grant set a snapshot is being taken under.
+///
+/// The writer for what [`resume_verdict`] reads. **Called when a snapshot is
+/// written**, so that resuming it can tell whether `rachna.nix` has moved
+/// since — without this, `taken_with` is always empty, every resume reports
+/// [`ResumeApproval::Unrecorded`], and the gate degrades to "always ask"
+/// rather than answering the question it was built for.
+///
+/// # Errors
+///
+/// [`StartError::Store`] if the file cannot be written. **Refused rather
+/// than proceeding**: a snapshot whose grant set was not recorded resumes
+/// unreviewable, and silently taking one would build the gap `25`-era work
+/// found in the first place.
+pub fn record_snapshot_grants(context: &Context, policy: &Policy) -> Result<(), StartError> {
+    let dir = context.paths().snapshot_dir();
+    std::fs::create_dir_all(&dir).map_err(|error| StartError::Store {
+        why: format!("cannot create {}: {error}", dir.display()),
+    })?;
+    let summary = AccessSummary::new(policy.tier, policy.profile, &policy.grants);
+    std::fs::write(dir.join(GRANT_FINGERPRINT_FILE), summary.fingerprint()).map_err(|error| {
+        StartError::Store {
+            why: format!("cannot record the snapshot's grant set: {error}"),
+        }
+    })
+}
+
+/// The file beside a snapshot recording the grant set it was taken under.
+///
+/// A plain file rather than a column in `rachna.db`, deliberately: `08` §3.1
+/// makes the database a cache, and a cache that can be deleted must not be
+/// the only record of what a snapshot was permitted. Delete the database and
+/// the next resume still asks.
+pub const GRANT_FINGERPRINT_FILE: &str = "grants.fingerprint";
 
 /// The grants a user declined, as the `revoke` commands that remove them.
 ///
@@ -433,6 +708,8 @@ mod tests {
             // UNSEEN, so the gate would also have something to say — which
             // is what makes the ordering observable.
             Approval::Unseen,
+            History::Fresh,
+            None,
             false,
         )
         .expect_err("an unenforceable policy must be refused");
@@ -453,18 +730,22 @@ mod tests {
         // waits. Returning `NeedsAcknowledgement` rather than an error is
         // the point — a script's exit code must not call this a failure.
         let policy = policy(Tier::Allowlist, vec![network("github.com")]);
-        let verdict = check(&policy, &tap::Capability::Present, Approval::Unseen, false)
-            .expect("enforceable")
-            .expect("must not proceed");
-
-        let Started::NeedsAcknowledgement { prompt, summary } = verdict else {
-            panic!("an unapproved grant set was allowed to launch")
-        };
+        let gate = check(
+            &policy,
+            &tap::Capability::Present,
+            Approval::Unseen,
+            History::Fresh,
+            None,
+            false,
+        )
+        .expect("enforceable");
+        assert!(gate.needs_input(), "an unapproved grant set did not ask");
         // The summary names what it is about to permit.
-        assert!(prompt.contains("github.com"), "{prompt}");
+        assert!(gate.shown.contains("github.com"), "{}", gate.shown);
         // And the prompt names the command, per `00` §3.3.
+        let prompt = gate.prompt.as_deref().expect("a prompt");
         assert!(prompt.contains("rachna start --accept"), "{prompt}");
-        assert!(!summary.is_empty());
+        assert!(!gate.summary.is_empty());
     }
 
     #[test]
@@ -474,12 +755,22 @@ mod tests {
         // prompt said "needs no acknowledgement" and the gate refused
         // anyway — a message and a behaviour disagreeing.
         let sealed = policy(Tier::None, vec![]);
+        let gate = check(
+            &sealed,
+            &tap::Capability::Present,
+            Approval::Unseen,
+            History::Fresh,
+            None,
+            false,
+        )
+        .expect("enforceable");
         assert!(
-            check(&sealed, &tap::Capability::Present, Approval::Unseen, false)
-                .expect("enforceable")
-                .is_none(),
-            "a config granting nothing was gated"
+            !gate.needs_input(),
+            "a config granting nothing asked for input"
         );
+        // But the summary still prints — `00` §3.10c's "secrets none is
+        // information" applies to the whole set.
+        assert!(!gate.shown.is_empty(), "the summary was suppressed");
     }
 
     #[test]
@@ -491,10 +782,12 @@ mod tests {
                 &granting,
                 &tap::Capability::Present,
                 Approval::Unseen,
+                History::Fresh,
+                None,
                 false
             )
             .expect("enforceable")
-            .is_some(),
+            .needs_input(),
             "a real grant set skipped the gate"
         );
     }
@@ -503,14 +796,25 @@ mod tests {
     fn an_approved_grant_set_proceeds() {
         // The positive path, so the two refusals above are not vacuous.
         let policy = policy(Tier::Allowlist, vec![network("github.com")]);
-        let verdict = check(
+        let gate = check(
             &policy,
             &tap::Capability::Present,
             Approval::Approved,
+            History::Fresh,
+            None,
             false,
         )
         .expect("enforceable");
-        assert!(verdict.is_none(), "an approved set did not proceed");
+        assert!(!gate.needs_input(), "an approved set asked again");
+        // THE CORRECTION. An approved set still SHOWS its permissions:
+        // `00` §3.10c's earlier "thereafter start is silent" made a second
+        // start print nothing and launch, which is the behaviour this
+        // assertion exists to prevent.
+        assert!(
+            gate.shown.contains("github.com"),
+            "an approved start was silent about what it permits: {}",
+            gate.shown
+        );
     }
 
     #[test]
@@ -518,16 +822,24 @@ mod tests {
         // Most of what makes the refusal acceptable: a project wanting no
         // network must not be blocked by a capability it does not use.
         let policy = policy(Tier::None, vec![]);
-        assert!(check(
+        // `expect` IS the assertion: a sealed policy must be ENFORCEABLE
+        // without the capability. It then asks for nothing, because an
+        // approved empty grant set has nothing to review.
+        let gate = check(
             &policy,
             &tap::Capability::Missing {
-                helper: PathBuf::from("/x")
+                helper: PathBuf::from("/x"),
             },
             Approval::Approved,
+            History::Fresh,
+            None,
             false,
         )
-        .expect("sealed is enforceable")
-        .is_none());
+        .expect("sealed is enforceable without CAP_NET_ADMIN");
+        assert!(
+            !gate.needs_input(),
+            "a sealed approved policy asked for input"
+        );
     }
 
     #[test]
@@ -548,6 +860,8 @@ mod tests {
                     helper: PathBuf::from("/x")
                 },
                 Approval::Approved,
+                History::Fresh,
+                None,
                 false,
             )
             .is_err(),
@@ -561,21 +875,372 @@ mod tests {
         // keypress nobody can send is worse than one that refuses.
         let policy = policy(Tier::Allowlist, vec![network("github.com")]);
         let rendered = |interactive: bool| -> String {
-            match check(
+            check(
                 &policy,
                 &tap::Capability::Present,
                 Approval::Unseen,
+                History::Fresh,
+                None,
                 interactive,
             )
             .expect("enforceable")
-            .expect("needs ack")
-            {
-                Started::NeedsAcknowledgement { prompt, .. } => prompt,
-                other => panic!("expected an acknowledgement, got {other:?}"),
-            }
+            .prompt
+            .expect("an unapproved set needs input")
         };
         assert!(rendered(true).contains("[a] accept all"));
         assert!(rendered(false).contains("rachna start --accept"));
+    }
+
+    #[test]
+    fn the_header_does_not_call_an_approved_start_a_first_run() {
+        // Found by RUNNING `start` twice. The summary's header was the
+        // hardcoded "rachna.nix grants, first run:", which was true exactly
+        // once and became a lie on every later start the moment `00` §3.10c
+        // made the summary unconditional.
+        let policy = policy(Tier::Allowlist, vec![network("github.com")]);
+        let rendered = |approval: Approval| -> String {
+            check(
+                &policy,
+                &tap::Capability::Present,
+                approval,
+                History::Fresh,
+                None,
+                false,
+            )
+            .expect("enforceable")
+            .shown
+        };
+
+        // First assert the first-run wording EXISTS, or the negative below
+        // would pass against a header that said nothing at all.
+        let unseen = rendered(Approval::Unseen);
+        assert!(unseen.contains("first run"), "{unseen}");
+
+        let approved = rendered(Approval::Approved);
+        assert!(
+            !approved.contains("first run"),
+            "an approved start was told it had never run here: {approved}"
+        );
+        // And it still says what the grants ARE, which is the whole point.
+        assert!(approved.contains("github.com"), "{approved}");
+    }
+
+    #[test]
+    fn a_widened_config_is_not_told_it_has_never_run_here() {
+        // Found by widening a real policy and reading the output: a config
+        // that had run and been approved, then gained one host, was shown
+        // "grants, first run:" and "this config has not run here before".
+        // Both false. A user who knows better reads that as a bug, and a
+        // gate the user does not believe is a gate that gets bypassed.
+        let policy = policy(Tier::Allowlist, vec![network("github.com")]);
+
+        // First assert the first-run wording EXISTS for a fresh project,
+        // so the negative below is not vacuous.
+        let fresh = check(
+            &policy,
+            &tap::Capability::Present,
+            Approval::Unseen,
+            History::Fresh,
+            None,
+            false,
+        )
+        .expect("enforceable");
+        let fresh_prompt = fresh.prompt.as_deref().expect("a prompt");
+        assert!(fresh.shown.contains("first run"), "{}", fresh.shown);
+        assert!(
+            fresh_prompt.contains("has not run here before"),
+            "{fresh_prompt}"
+        );
+
+        // The same unapproved set, in a project that HAS approved before.
+        let widened = check(
+            &policy,
+            &tap::Capability::Present,
+            Approval::Unseen,
+            History::RanBefore,
+            None,
+            false,
+        )
+        .expect("enforceable");
+        assert!(
+            widened.needs_input(),
+            "a widened grant set skipped the gate"
+        );
+        let prompt = widened.prompt.as_deref().expect("a prompt");
+        assert!(
+            !prompt.contains("has not run here before"),
+            "a config that had run here was told it had not: {prompt}"
+        );
+        assert!(
+            !widened.shown.contains("first run"),
+            "a widened config was called a first run: {}",
+            widened.shown
+        );
+        // And it says what IS true, per `00` §3.3 — a message that names no
+        // reason is not actionable.
+        assert!(prompt.contains("more than you approved"), "{prompt}");
+    }
+
+    #[test]
+    fn the_header_and_the_prompt_agree_about_why_the_gate_asks() {
+        // They are derived from ONE `Reason`, and this is what keeps that
+        // true: they disagreed once, the header saying "first run" while
+        // the config had plainly run here.
+        let policy = policy(Tier::Allowlist, vec![network("github.com")]);
+        for (history, in_header, in_prompt) in [
+            (History::Fresh, "first run", "has not run here before"),
+            (History::RanBefore, "widened", "more than you approved"),
+        ] {
+            let gate = check(
+                &policy,
+                &tap::Capability::Present,
+                Approval::Unseen,
+                history,
+                None,
+                false,
+            )
+            .expect("enforceable");
+            assert!(
+                gate.shown.contains(in_header),
+                "{history:?}: {}",
+                gate.shown
+            );
+            let prompt = gate.prompt.as_deref().expect("a prompt");
+            assert!(prompt.contains(in_prompt), "{history:?}: {prompt}");
+        }
+    }
+
+    #[test]
+    fn an_approved_set_is_not_still_described_as_widened() {
+        // Found by pressing `a` and running again: the header still read
+        // "widened since you approved" for a set that had just BEEN
+        // approved. `Widened` describes the state before the keypress.
+        let policy = policy(Tier::Allowlist, vec![network("github.com")]);
+        let rendered = |approval: Approval| -> String {
+            check(
+                &policy,
+                &tap::Capability::Present,
+                approval,
+                History::RanBefore,
+                None,
+                false,
+            )
+            .expect("enforceable")
+            .shown
+        };
+
+        // The wording EXISTS while unapproved, or the negative is vacuous.
+        let before = rendered(Approval::Unseen);
+        assert!(before.contains("widened"), "{before}");
+
+        let after = rendered(Approval::Approved);
+        assert!(
+            !after.contains("widened"),
+            "an approved set was still called widened: {after}"
+        );
+        assert!(after.contains("running under these grants"), "{after}");
+    }
+
+    // ---- resume goes through the SAME gate -------------------------------
+
+    #[test]
+    fn a_resume_whose_snapshot_predates_the_file_asks_even_when_approved() {
+        // THE user-reported gap, at the layer below: `start` is also
+        // `resume` (`cli.rs` help: "start or resume"), and a snapshot
+        // carries the policy it was TAKEN under. Approving today's file
+        // never reviewed yesterday's.
+        use crate::snapshot::ResumeApproval;
+        let policy = policy(Tier::Allowlist, vec![network("github.com")]);
+
+        // First assert what this attacks EXISTS: approved + no snapshot
+        // asks nothing, so the resume verdict is the only variable.
+        let plain = check(
+            &policy,
+            &tap::Capability::Present,
+            Approval::Approved,
+            History::Fresh,
+            None,
+            true,
+        )
+        .expect("enforceable");
+        assert!(!plain.needs_input(), "the baseline already asked");
+
+        let diverged = ResumeApproval::NeedsApproval {
+            taken_with: "tier=open\nprofile=development\n".to_owned(),
+            running: "tier=allowlist\nprofile=development\n".to_owned(),
+        };
+        let gate = check(
+            &policy,
+            &tap::Capability::Present,
+            Approval::Approved,
+            History::Fresh,
+            Some(&diverged),
+            true,
+        )
+        .expect("enforceable");
+        assert!(
+            gate.needs_input(),
+            "a resume under a policy the snapshot never ran went unreviewed"
+        );
+        // And it says WHAT changed, not just that something did (`00` §3.3).
+        let why = gate.divergence.as_deref().expect("a divergence note");
+        assert!(why.contains("tier=open"), "{why}");
+        assert!(why.contains("tier=allowlist"), "{why}");
+    }
+
+    #[test]
+    fn a_resume_with_an_unrecorded_grant_set_asks_without_claiming_a_diff() {
+        // A snapshot from before grant recording. The honest message has no
+        // two sides to show, which is why `Unrecorded` is its own variant.
+        use crate::snapshot::ResumeApproval;
+        let policy = policy(Tier::Allowlist, vec![network("github.com")]);
+        let gate = check(
+            &policy,
+            &tap::Capability::Present,
+            Approval::Approved,
+            History::Fresh,
+            Some(&ResumeApproval::Unrecorded),
+            true,
+        )
+        .expect("enforceable");
+        assert!(
+            gate.needs_input(),
+            "an unrecorded grant set resumed unreviewed"
+        );
+        let why = gate.divergence.as_deref().expect("a divergence note");
+        assert!(why.contains("predates grant recording"), "{why}");
+    }
+
+    #[test]
+    fn an_unchanged_resume_still_prints_the_summary() {
+        // The user's correction applied to resume: "same for resume". An
+        // unchanged, approved snapshot needs no keypress — and must still
+        // say what it is about to permit.
+        use crate::snapshot::ResumeApproval;
+        let policy = policy(Tier::Allowlist, vec![network("github.com")]);
+        let gate = check(
+            &policy,
+            &tap::Capability::Present,
+            Approval::Approved,
+            History::Fresh,
+            Some(&ResumeApproval::Unchanged),
+            true,
+        )
+        .expect("enforceable");
+        assert!(!gate.needs_input(), "an unchanged resume asked again");
+        assert!(
+            gate.shown.contains("github.com"),
+            "a resume was silent about what it permits: {}",
+            gate.shown
+        );
+        // Nothing changed, so there is nothing to explain.
+        assert!(gate.divergence.is_none(), "{:?}", gate.divergence);
+    }
+
+    // ---- the snapshot's own grant record ---------------------------------
+
+    #[test]
+    fn a_cold_start_is_not_gated_by_an_empty_snapshot_directory() {
+        // `layout.rs` creates `snapshots/` as part of the durable tree, so
+        // its EXISTENCE says nothing. Treating it as a snapshot would gate
+        // every cold start on a policy no snapshot was taken under — a
+        // prompt about a diff that does not exist.
+        let context = context("cold");
+        let policy = policy(Tier::Allowlist, vec![network("github.com")]);
+        std::fs::create_dir_all(context.paths().snapshot_dir()).expect("dirs");
+
+        assert_eq!(
+            resume_verdict(&context, &policy).expect("readable"),
+            None,
+            "an empty snapshots/ directory was treated as a snapshot"
+        );
+        let _ = std::fs::remove_dir_all(context.rachna_root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn a_snapshot_taken_and_resumed_under_the_same_policy_needs_no_keypress() {
+        // The round trip through the real filesystem: record, then read
+        // back. This is what makes the resume gate falsifiable — without a
+        // writer, `taken_with` is always empty, every resume reports
+        // `Unrecorded`, and "always asks" would look like it worked.
+        let context = context("warm");
+        let policy = policy(Tier::Allowlist, vec![network("github.com")]);
+        accept(&context, &policy, 1).expect("approve");
+        record_snapshot_grants(&context, &policy).expect("record");
+        // A snapshot file, so the directory holds more than our sidecar.
+        std::fs::write(context.paths().snapshot_dir().join("memory.img"), b"x")
+            .expect("snapshot file");
+
+        assert_eq!(
+            resume_verdict(&context, &policy).expect("readable"),
+            Some(crate::snapshot::ResumeApproval::Unchanged),
+            "an unchanged, approved snapshot asked anyway"
+        );
+        let _ = std::fs::remove_dir_all(context.rachna_root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn a_snapshot_resumed_under_a_changed_policy_asks_and_names_both_sides() {
+        // THE case the whole resume gate exists for: `git pull` changed
+        // `rachna.nix`, and yesterday's guest is about to come back.
+        let context = context("changed");
+        let taken_under = policy(Tier::Allowlist, vec![network("github.com")]);
+        record_snapshot_grants(&context, &taken_under).expect("record");
+        std::fs::write(context.paths().snapshot_dir().join("memory.img"), b"x")
+            .expect("snapshot file");
+
+        // The file now grants more, and that wider set is itself approved —
+        // so only the SNAPSHOT's divergence can make this ask.
+        let now = policy(
+            Tier::Allowlist,
+            vec![network("github.com"), network("evil.test")],
+        );
+        accept(&context, &now, 2).expect("approve the wider set");
+
+        let verdict = resume_verdict(&context, &now)
+            .expect("readable")
+            .expect("a snapshot is present");
+        let crate::snapshot::ResumeApproval::NeedsApproval {
+            taken_with,
+            running,
+        } = &verdict
+        else {
+            panic!("a resume under a changed policy went unreviewed: {verdict:?}")
+        };
+        assert_ne!(taken_with, running, "the two sides were identical");
+        let _ = std::fs::remove_dir_all(context.rachna_root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn a_snapshot_whose_grant_record_was_deleted_asks_rather_than_assuming() {
+        // The adversarial case. The record is a plain file, so anyone can
+        // remove it — and `08` §3.1 makes the store a cache precisely
+        // because deleting state must not grant anything. Deleting this
+        // must make the gate ASK, never wave the resume through.
+        let context = context("deleted");
+        let policy = policy(Tier::Allowlist, vec![network("github.com")]);
+        accept(&context, &policy, 1).expect("approve");
+        record_snapshot_grants(&context, &policy).expect("record");
+        std::fs::write(context.paths().snapshot_dir().join("memory.img"), b"x")
+            .expect("snapshot file");
+
+        // First assert what this attacks EXISTS: with the record present
+        // and the policy unchanged, the resume is silent.
+        assert_eq!(
+            resume_verdict(&context, &policy).expect("readable"),
+            Some(crate::snapshot::ResumeApproval::Unchanged),
+            "the baseline already asked, so deleting proves nothing"
+        );
+
+        std::fs::remove_file(context.paths().snapshot_dir().join(GRANT_FINGERPRINT_FILE))
+            .expect("delete the record");
+
+        assert_eq!(
+            resume_verdict(&context, &policy).expect("readable"),
+            Some(crate::snapshot::ResumeApproval::Unrecorded),
+            "deleting the grant record let a snapshot resume unreviewed"
+        );
+        let _ = std::fs::remove_dir_all(context.rachna_root.parent().expect("parent"));
     }
 
     // ---- the approval record -------------------------------------------
@@ -583,7 +1248,8 @@ mod tests {
     #[test]
     fn accepting_records_the_grant_set_and_a_later_start_proceeds() {
         // End to end through the real store: the gate asks once and not
-        // again, which is `00` §3.10c's "thereafter start is silent".
+        // again. NOT "thereafter start is silent" — `00` §3.10c rejects
+        // that — the summary still prints; only the keypress is dropped.
         let context = context("accept");
         let policy = policy(Tier::Allowlist, vec![network("github.com")]);
 
@@ -596,14 +1262,22 @@ mod tests {
             approval_of(&context, &policy).expect("readable"),
             Approval::Approved
         );
-        assert!(check(
+        let after = check(
             &policy,
             &tap::Capability::Present,
             approval_of(&context, &policy).expect("readable"),
-            false
+            History::Fresh,
+            None,
+            false,
         )
-        .expect("enforceable")
-        .is_none());
+        .expect("enforceable");
+        assert!(!after.needs_input(), "an accepted grant set asked again");
+        // And it is STILL not silent, which is the correction.
+        assert!(
+            after.shown.contains("github.com"),
+            "an accepted start stopped naming its permissions: {}",
+            after.shown
+        );
         let _ = std::fs::remove_dir_all(context.rachna_root.parent().expect("parent"));
     }
 

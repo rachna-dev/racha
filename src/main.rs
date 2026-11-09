@@ -114,7 +114,8 @@ fn run(command: Command) -> ExitCode {
 /// decisions live in `run.rs`, where tests reach them.
 mod commands {
     use rachna::layout::{default_root, ProjectId};
-    use rachna::run::{self, Context, StartError, Started};
+    use rachna::run::{self, Context, StartError};
+    use rachna::summary::Answer;
     use rachna::supervise;
     use rachna::tap;
     use std::io::IsTerminal;
@@ -329,7 +330,13 @@ mod commands {
             Err(error) => return report(&error),
         };
 
-        if accept {
+        // `--accept` is the NON-TTY path and nothing else. `00` §3.10c:
+        // "at a terminal it is a keypress, not a command to retype" — a flag
+        // that worked interactively would let a user accept a cloned
+        // config's permissions in the same breath as asking to start it,
+        // which is the one thing this gate exists to prevent. So at a TTY
+        // the flag is ignored and `a` is the only way through.
+        if accept && !context.interactive {
             let now = now_millis();
             if let Err(error) = run::accept(&context, &policy, now) {
                 return report(&error);
@@ -341,39 +348,117 @@ mod commands {
             Err(error) => return report(&error),
         };
 
-        match run::check(&policy, &context.tap, approval, context.interactive) {
-            Err(error) => report(&error),
-            Ok(Some(Started::NeedsAcknowledgement { prompt, .. })) => {
-                print!("{prompt}");
-                // Not a failure: the config is fine and a human has not seen
-                // it yet. `21` §3.3 makes the code an API, so this is its
-                // own value rather than a generic error.
-                ExitCode::from(REFUSED)
-            }
-            Ok(Some(other)) => {
-                eprintln!("rachna: unexpected gate result: {other:?}");
-                ExitCode::from(FAILED)
-            }
-            Ok(None) => {
-                // The policy is enforceable and approved. The launch itself
-                // needs the boot bundle, which `21` §2.1a's supply chain has
-                // to deliver first — so this is where the remaining work is.
-                println!(
-                    "{}",
-                    rachna::summary::AccessSummary::new(
-                        policy.tier,
-                        policy.profile,
-                        &policy.grants
-                    )
-                );
+        // Resume shares this gate. There is no separate `resume` verb —
+        // `start` is both (`cli.rs` help: "start or resume") — so passing
+        // the snapshot's verdict here is what gives resume the summary the
+        // user asked for, rather than a second code path that could drift.
+        let resuming = match run::resume_verdict(&context, &policy) {
+            Ok(verdict) => verdict,
+            Err(error) => return report(&error),
+        };
+
+        // Whether this project ever approved anything here — it decides
+        // what the gate SAYS, not whether it asks. Without it a config that
+        // merely widened is told it has never run here.
+        let history = match run::history_of(&context) {
+            Ok(history) => history,
+            Err(error) => return report(&error),
+        };
+
+        let gate = match run::check(
+            &policy,
+            &context.tap,
+            approval,
+            history,
+            resuming.as_ref(),
+            context.interactive,
+        ) {
+            Ok(gate) => gate,
+            Err(error) => return report(&error),
+        };
+
+        // THE SUMMARY IS UNCONDITIONAL. `00` §3.10c, corrected: a user about
+        // to hand a directory to a VM should be told what that VM may do,
+        // every time — not once in the project's history.
+        print!("{}", gate.shown);
+        if let Some(why) = &gate.divergence {
+            print!("{why}");
+        }
+
+        if let Some(prompt) = &gate.prompt {
+            print!("{prompt}");
+            if !context.interactive {
+                // A pipeline cannot press a key. `00` §3.10c: CI needs the
+                // flag, and blocking forever on input nobody can send is
+                // worse than refusing.
+                //
+                // It SAYS which refusal this is. A mutant flipping this
+                // condition survived because a piped `start` then read
+                // stdin, hit EOF, aborted, and exited 77 — the same code by
+                // a different route, indistinguishable from the outside.
+                // The two cases also need different advice: a pipeline
+                // cannot press `a`, so telling it to is useless.
                 eprintln!(
-                    "rachna: policy approved and enforceable, but the guest \
-                     image is not fetched yet (21 §2.1a). Everything up to \
-                     the launch now runs."
+                    "rachna: not a terminal, so the summary cannot be \
+                     acknowledged here. Pass --accept in CI."
                 );
-                ExitCode::from(UNIMPLEMENTED)
+                return ExitCode::from(REFUSED);
+            }
+            match read_answer() {
+                Answer::AcceptAll => {
+                    if let Err(error) = run::accept(&context, &policy, now_millis()) {
+                        return report(&error);
+                    }
+                }
+                Answer::ShowAll => {
+                    // The long form rolled up per category; print every
+                    // entry, then ask again rather than proceeding — a `l`
+                    // that started would mean reading the list accepted it.
+                    // Right-aligned numbers, width from the largest. With
+                    // `[{}]` the columns step out of line at `[10]`, which
+                    // is exactly the size of list this branch exists for.
+                    let items = gate.summary.reviewable();
+                    let width = items.len().to_string().len();
+                    for item in &items {
+                        println!(
+                            "  [{:>width$}] {:<8} {}",
+                            item.number,
+                            item.category.as_str(),
+                            item.entry
+                        );
+                    }
+                    // The prompt's own leading text follows a blank line
+                    // everywhere else; without one here the list runs
+                    // straight into "this config has not run here before".
+                    println!();
+                    print!("{prompt}");
+                    if !matches!(read_answer(), Answer::AcceptAll) {
+                        println!("not started");
+                        return ExitCode::from(REFUSED);
+                    }
+                    if let Err(error) = run::accept(&context, &policy, now_millis()) {
+                        return report(&error);
+                    }
+                }
+                Answer::Abort => {
+                    println!("not started");
+                    return ExitCode::from(REFUSED);
+                }
             }
         }
+
+        // The policy is enforceable and the user has just seen and accepted
+        // it. The launch itself needs the boot bundle, which `21` §2.1a's
+        // supply chain has to deliver — so this is where the work remains.
+        //
+        // No second summary print: `gate.shown` above is the one place it
+        // appears, so the two cannot disagree.
+        eprintln!(
+            "rachna: policy approved and enforceable, but the guest image \
+             is not fetched yet (21 §2.1a). Everything up to the launch now \
+             runs."
+        );
+        ExitCode::from(UNIMPLEMENTED)
     }
 
     /// `rachna stop`.
@@ -445,6 +530,78 @@ mod commands {
             println!("  ⚠ host-mediated networking is unavailable on this host");
         }
         ExitCode::from(OK)
+    }
+
+    /// One keypress, with no Enter.
+    ///
+    /// **Anything unrecognised aborts** — `summary::Answer::from_key`
+    /// decides, and a stray byte must never accept a cloned config's
+    /// permissions.
+    ///
+    /// # Why raw mode rather than `read_line`
+    ///
+    /// `00` §3.10c promises **a keypress**: *"pressing `a` is the same
+    /// decision"* as running the command again, and that is only true if
+    /// `a` alone decides. With `read_line` the user types `a` and then
+    /// waits — found by driving the real binary under a pty, where a lone
+    /// `a` produced no response at all. A gate that appears to hang is a
+    /// gate people kill and work around.
+    ///
+    /// The terminal settings are restored on **every** path, including the
+    /// error ones. A process that exits leaving a terminal in raw mode
+    /// leaves the user's shell with no echo and no line editing, which
+    /// looks like it broke their terminal rather than refused a start.
+    ///
+    /// Not a TTY, or the attributes cannot be read? Fall back to a line.
+    /// `start` already refuses before prompting when stdin is not
+    /// interactive, so this covers the odd case of a TTY that will not go
+    /// raw rather than the pipeline.
+    fn read_answer() -> Answer {
+        use std::io::{Read, Write};
+        // Flush, or the prompt sits in a buffer while we wait for input the
+        // user does not know we want.
+        let _ = std::io::stdout().flush();
+
+        let stdin = std::io::stdin();
+        let Ok(saved) = rustix::termios::tcgetattr(&stdin) else {
+            return read_answer_line();
+        };
+        let mut raw = saved.clone();
+        raw.make_raw();
+        if rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &raw).is_err()
+        {
+            return read_answer_line();
+        }
+
+        let mut byte = [0_u8; 1];
+        let read = std::io::stdin().read(&mut byte);
+        // BEFORE interpreting the key: the restore must not depend on what
+        // was typed, or an unexpected byte leaves the terminal raw.
+        let _ = rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &saved);
+        // Raw mode suppresses the echo of the newline the user's keypress
+        // would normally produce, so the next line we print would start in
+        // the prompt's column.
+        println!();
+
+        // The DECISION is `summary::answer_from_read`, which is pure and
+        // tested. It used to be this `match`, and a mutant deleting its
+        // `Ok(1)` arm — making every keypress abort — survived the whole
+        // suite: a gate that always refuses looks safe while blocking every
+        // start, with nothing in the output to explain it.
+        rachna::summary::answer_from_read(read.ok(), byte[0])
+    }
+
+    /// A whole line, for a terminal that will not go raw.
+    fn read_answer_line() -> Answer {
+        use std::io::BufRead;
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line).is_err() {
+            return Answer::Abort;
+        }
+        line.trim()
+            .chars()
+            .next()
+            .map_or(Answer::Abort, Answer::from_key)
     }
 
     /// Prints a start failure and picks its exit code.

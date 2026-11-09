@@ -133,6 +133,90 @@ fn no_invocation_panics() {
     }
 }
 
+#[test]
+fn every_start_prints_the_access_summary_even_when_approved() {
+    // THE user-reported defect, at the binary. `00` §3.10c once said
+    // "thereafter start is silent", the implementation followed it, and a
+    // second `start` printed nothing and launched. The correction: the
+    // summary prints every time; only the keypress is conditional.
+    //
+    // Driven through the real binary because the defect was in `main.rs`'s
+    // wiring — `run::check` can be right while nothing prints it.
+    let dir = std::env::temp_dir().join(format!("rachna-gate-{}", std::process::id()));
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&home).expect("scratch dirs");
+
+    let binary = env!("CARGO_BIN_EXE_rachna");
+    let run = |args: &[&str]| -> (String, i32) {
+        let output = Command::new(binary)
+            .args(args)
+            .current_dir(&dir)
+            .env("HOME", &home)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the binary runs");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            output.status.code().unwrap_or(-1),
+        )
+    };
+
+    let (_, code) = run(&["init"]);
+    assert_eq!(code, 0, "init failed");
+    let config = dir.join("rachna.nix");
+    let text = std::fs::read_to_string(&config).expect("rachna.nix");
+    std::fs::write(
+        &config,
+        text.replace(
+            "network.allow = [ ];",
+            "network.allow = [ \"github.com:443\" ];",
+        ),
+    )
+    .expect("widen");
+
+    // First start: unapproved, so it refuses and names the commands.
+    let (first, code) = run(&["start"]);
+    assert_eq!(code, 77, "an unapproved start did not refuse:\n{first}");
+    assert!(first.contains("github.com"), "{first}");
+    // And it refuses for the RIGHT reason. Without this, a piped start that
+    // wrongly tried to read stdin would hit EOF, abort, and exit 77 by a
+    // different route — the same code, so the assertion above cannot tell
+    // the two apart. A mutant flipping that condition survived on exactly
+    // this ambiguity.
+    assert!(
+        first.contains("not a terminal"),
+        "a piped start did not say why it could not ask:\n{first}"
+    );
+    assert!(
+        !first.contains("not started"),
+        "a piped start read stdin instead of refusing outright:\n{first}"
+    );
+
+    // Approve (non-TTY, so the flag applies).
+    let (_, code) = run(&["start", "--accept"]);
+    assert_ne!(code, 77, "--accept did not record the approval");
+
+    // THE ASSERTION. The second start must still say what it permits.
+    let (second, _) = run(&["start"]);
+    assert!(
+        second.contains("github.com"),
+        "an approved start was SILENT about what it permits:\n{second}"
+    );
+    // And it must not claim this is the first run, which would be a lie the
+    // user can detect — and a gate they stop believing.
+    assert!(
+        !second.contains("has not run here before"),
+        "an approved start claimed it had never run here:\n{second}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn the_binary_carries_the_virtualization_entitlement() {

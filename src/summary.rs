@@ -435,6 +435,35 @@ impl Answer {
     }
 }
 
+/// The answer a one-byte read means.
+///
+/// `bytes_read` is [`None`] for a failed read, `Some(n)` for a successful
+/// one. Only exactly one byte is an answer: zero is EOF and anything else
+/// means the read did not do what was asked.
+///
+/// # Why this is not a `match` at the call site
+///
+/// It was, inside `main.rs`'s `read_answer`, and a mutant that **deleted the
+/// one-byte arm** — making every keypress abort — survived the entire
+/// suite. `main.rs` has no tests because its functions read real stdin, so
+/// the decision was unfalsifiable where it sat. Moving it here costs one
+/// function call and makes "a deliberate `a` starts, everything else does
+/// not" a property with a test.
+///
+/// A gate that always refuses is the dangerous direction to get wrong *in
+/// practice*: it looks safe, blocks every approved start, and gives the user
+/// nothing to act on — the failure reported as "rachna will not start".
+#[must_use]
+pub const fn answer_from_read(bytes_read: Option<usize>, byte: u8) -> Answer {
+    match bytes_read {
+        Some(1) => Answer::from_key(byte as char),
+        // EOF, a failed read, or a read that did not return one byte. Abort,
+        // per `00` §3.10c: anything that is not a deliberate `a` must not
+        // accept a cloned config's permissions.
+        _ => Answer::Abort,
+    }
+}
+
 /// Whether the review gate can be answered interactively.
 ///
 /// False when stdin is not a terminal, which is not a detail: `00` §3.10c
@@ -459,8 +488,38 @@ pub const fn can_prompt(stdin_is_terminal: bool) -> bool {
 /// Both commands here are real: a test parses every one through
 /// [`Invocation::from_argv`](crate::cli::Invocation::from_argv), because an
 /// offered command the CLI rejects is worse than none.
+/// Why the gate is asking.
+///
+/// The prompt used to hardcode *"this config has not run here before"*,
+/// which was true only on a genuine first run. Once `00` §3.10c made the
+/// summary unconditional, a config that had run here many times and then
+/// gained a host was told it had never run — found by widening a policy and
+/// reading the output. A user who knows the config has run here reads that
+/// sentence as a bug and stops trusting the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// This grant set has never been seen on this machine.
+    FirstRun,
+    /// The config has run here, and now asks for more than was approved.
+    Widened,
+    /// A snapshot is being resumed under a grant set it was not taken with.
+    SnapshotDiverged,
+}
+
+impl Reason {
+    /// The sentence that states the case.
+    #[must_use]
+    pub const fn sentence(self) -> &'static str {
+        match self {
+            Self::FirstRun => "  this config has not run here before.\n\n",
+            Self::Widened => "  this config now asks for more than you approved.\n\n",
+            Self::SnapshotDiverged => "  this snapshot was taken under different grants.\n\n",
+        }
+    }
+}
+
 #[must_use]
-pub fn review_prompt(summary: &AccessSummary, interactive: bool) -> String {
+pub fn review_prompt(summary: &AccessSummary, reason: Reason, interactive: bool) -> String {
     let total = summary.reviewable().len();
     if total == 0 {
         // Nothing granted. `00` §3.10c still requires the summary — "secrets
@@ -471,7 +530,7 @@ pub fn review_prompt(summary: &AccessSummary, interactive: bool) -> String {
     }
 
     let mut out = String::new();
-    out.push_str("  this config has not run here before.\n\n");
+    out.push_str(reason.sentence());
 
     if interactive {
         // A keypress, because `--accept` makes the user run the command
@@ -565,19 +624,42 @@ impl fmt::Display for GrantDiff {
 
 impl fmt::Display for AccessSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "  rachna.nix grants, first run:")?;
+        // NO HEADER HERE. It used to read "rachna.nix grants, first run:"
+        // unconditionally, which became a lie the moment `00` §3.10c made
+        // the summary print on every start: an approved config was told it
+        // had never run. The header depends on the approval record, which
+        // this type deliberately does not know — so the caller writes it
+        // (`run::gate_header`).
         writeln!(f)?;
+        // ABOVE THE LIMIT, roll up per category. `00` §3.10c requires this
+        // and nothing implemented it: `too_long_to_itemise` gated only the
+        // prompt's `[l]` option, so a 13-host config printed all thirteen
+        // AND offered to list them again. Found by running one.
+        //
+        // The reason it matters is §3.10c's own requirement applied to
+        // itself — *"the summary must be complete or it is worse than
+        // nothing"* — and a wall of entries is a summary nobody completes.
+        let roll_up = self.too_long_to_itemise();
         for (category, entries) in &self.lines {
             let label = category.as_str();
             match entries.split_first() {
                 None => writeln!(f, "  {label:<9} none")?,
-                Some((first, rest)) => {
+                // One entry still reads better as itself than as
+                // "1 entries", whatever the total is.
+                Some((first, rest)) if !roll_up || rest.is_empty() => {
                     writeln!(f, "  {label:<9} {first}")?;
                     for entry in rest {
                         writeln!(f, "  {:<9} {entry}", "")?;
                     }
                 }
+                Some((_, rest)) => {
+                    writeln!(f, "  {label:<9} {} entries", rest.len() + 1)?;
+                }
             }
+        }
+        if roll_up {
+            writeln!(f)?;
+            writeln!(f, "  review in full:  rachna config inspect")?;
         }
         // Trailing blank line, so a caller appending the acknowledgement
         // prompt does not have to remember one.
@@ -773,6 +855,91 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_above_the_limit_rolls_up_rather_than_listing_everything() {
+        // `00` §3.10c: above twelve entries the summary rolls up per
+        // category and points at `config inspect`. NOTHING implemented it —
+        // `too_long_to_itemise` gated only the prompt's `[l]` option, so a
+        // 13-host config printed all thirteen and then offered to list them
+        // again. Found by running one, not by reading the code.
+        let many: Vec<Grant> = (1..=13)
+            .map(|n| Grant::Network {
+                endpoint: endpoint(&format!("h{n}.example.com"), 443),
+            })
+            .collect();
+        let long = AccessSummary::new(Tier::Allowlist, Profile::Development, &many);
+
+        // First assert the threshold is crossed, or this tests nothing.
+        assert!(
+            long.too_long_to_itemise(),
+            "13 grants was not over the limit"
+        );
+
+        let shown = format!("{long}");
+        assert!(
+            shown.contains("13 entries"),
+            "a summary over the limit did not roll up:\n{shown}"
+        );
+        assert!(
+            !shown.contains("h7.example.com"),
+            "a rolled-up summary still listed every host:\n{shown}"
+        );
+        // And it says where the full list is, per `00` §3.3 — a summary that
+        // hides entries without naming the command is a dead end.
+        assert!(shown.contains("rachna config inspect"), "{shown}");
+    }
+
+    #[test]
+    fn a_summary_at_the_limit_still_lists_every_entry() {
+        // The other side of the boundary, so the rollup cannot swallow the
+        // itemised form that every real config measured in `20` produces.
+        let twelve: Vec<Grant> = (1..=12)
+            .map(|n| Grant::Network {
+                endpoint: endpoint(&format!("h{n}.example.com"), 443),
+            })
+            .collect();
+        let summary = AccessSummary::new(Tier::Allowlist, Profile::Development, &twelve);
+        assert!(!summary.too_long_to_itemise());
+
+        let shown = format!("{summary}");
+        for n in 1..=12 {
+            assert!(
+                shown.contains(&format!("h{n}.example.com")),
+                "h{n} was hidden at the limit:\n{shown}"
+            );
+        }
+        assert!(!shown.contains("entries"), "{shown}");
+    }
+
+    #[test]
+    fn a_one_byte_read_of_the_accept_key_accepts_and_nothing_else_does() {
+        // THE property the mutant found missing. Deleting the one-byte arm
+        // from `main.rs`'s match made every keypress abort, and nothing
+        // caught it — a gate that always refuses looks safe while blocking
+        // every approved start, with nothing in the output to explain it.
+        assert_eq!(answer_from_read(Some(1), b'a'), Answer::AcceptAll);
+        assert!(
+            answer_from_read(Some(1), b'a').starts(),
+            "a deliberate `a` did not start the environment"
+        );
+        assert_eq!(answer_from_read(Some(1), b'l'), Answer::ShowAll);
+    }
+
+    #[test]
+    fn a_read_that_is_not_exactly_one_byte_aborts() {
+        // EOF, a failed read, or a read that returned more than was asked
+        // for. `00` §3.10c: anything that is not a deliberate `a` must not
+        // accept a cloned config's permissions.
+        for bytes in [None, Some(0), Some(2), Some(usize::MAX)] {
+            assert_eq!(
+                answer_from_read(bytes, b'a'),
+                Answer::Abort,
+                "{bytes:?} bytes read was treated as an answer"
+            );
+            assert!(!answer_from_read(bytes, b'a').starts());
+        }
+    }
+
+    #[test]
     fn only_a_deliberate_key_accepts_and_everything_else_aborts() {
         // THE safety property. A stray byte — a resized terminal, a
         // bracketed-paste escape sequence, a cat on the keyboard — must not
@@ -836,13 +1003,13 @@ mod tests {
         // user NEITHER. `00` §3.3's rules apply to this prompt as to a
         // denial — a message naming no command is not actionable.
         // Non-interactive: names the flag, because CI cannot press a key.
-        let piped = review_prompt(&realistic(), false);
+        let piped = review_prompt(&realistic(), Reason::FirstRun, false);
         assert!(piped.contains("rachna start --accept"), "{piped}");
         assert!(piped.contains("rachna revoke"), "{piped}");
 
         // Interactive: offers the keypress, and does NOT tell a user at a
         // terminal to retype a command they can answer in one character.
-        let tty = review_prompt(&realistic(), true);
+        let tty = review_prompt(&realistic(), Reason::FirstRun, true);
         assert!(tty.contains("[a] accept all"), "{tty}");
         assert!(tty.contains("[q] quit"), "{tty}");
         assert!(
@@ -861,7 +1028,7 @@ mod tests {
         // they are substituted with a real target first.
         for summary in [realistic(), long_summary()] {
             for interactive in [true, false] {
-                for line in review_prompt(&summary, interactive).lines() {
+                for line in review_prompt(&summary, Reason::FirstRun, interactive).lines() {
                     let text = line.split('#').next().unwrap_or("").trim();
                     let Some(start) = text.find("rachna ") else {
                         continue;
@@ -958,12 +1125,12 @@ mod tests {
 
         // And the prompt changes shape: it points at `config inspect`
         // rather than implying the user should read 40 numbered lines.
-        let prompt = review_prompt(&long, false);
+        let prompt = review_prompt(&long, Reason::FirstRun, false);
         assert!(prompt.contains("config inspect"), "{prompt}");
         assert!(prompt.contains("40 grants"), "{prompt}");
         // Interactively, the same case offers `l` rather than a command —
         // the entries were rolled up, so there has to be a way to see them.
-        let tty = review_prompt(&long, true);
+        let tty = review_prompt(&long, Reason::FirstRun, true);
         assert!(tty.contains("[l] list all 40 grants"), "{tty}");
     }
 
@@ -999,7 +1166,7 @@ mod tests {
         // is noise.
         let sealed = AccessSummary::new(Tier::None, Profile::Sealed, &[]);
         for interactive in [true, false] {
-            let prompt = review_prompt(&sealed, interactive);
+            let prompt = review_prompt(&sealed, Reason::FirstRun, interactive);
             assert!(prompt.contains("grants nothing"), "{prompt}");
             assert!(!prompt.contains("--accept"), "{prompt}");
             assert!(!prompt.contains("[a]"), "{prompt}");

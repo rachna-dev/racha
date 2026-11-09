@@ -118,6 +118,25 @@ impl Store {
     /// # Errors
     ///
     /// [`StoreError::Sqlite`] if the row cannot be written.
+    /// Whether any grant set has ever been approved for this project.
+    ///
+    /// Distinct from [`Self::approval_of`], which asks about **one** grant
+    /// set. The gate needs both: *is this set approved* decides whether to
+    /// ask, and *has anything been approved here* decides what to SAY —
+    /// "first run" is a lie to a user whose config has run here for months
+    /// and just gained a host.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] if the table cannot be read.
+    pub fn has_approved_anything(&self) -> Result<bool, StoreError> {
+        let mut statement = self
+            .connection()
+            .prepare("SELECT 1 FROM config_revisions WHERE approved = 1 LIMIT 1")?;
+        let mut rows = statement.query([])?;
+        Ok(rows.next()?.is_some())
+    }
+
     pub fn approve(&self, summary: &AccessSummary, now_millis: i64) -> Result<(), StoreError> {
         self.connection().execute(
             "INSERT INTO config_revisions (id, ts, approved) VALUES (?1, ?2, 1)
@@ -195,6 +214,50 @@ mod tests {
         // configs happened to share one.
         assert_eq!(store.approval_of(&other).expect("read"), Approval::Unseen);
         assert!(!store.approval_of(&other).expect("read").permits_apply());
+    }
+
+    #[test]
+    fn project_history_is_separate_from_this_sets_approval() {
+        // What the gate's WORDING rests on. `approval_of` answers about one
+        // grant set, so it returns `Unseen` both for a genuine first run
+        // and for a config that has run here for months and gained a host.
+        // Telling the second user "this config has not run here before" is
+        // a lie they can detect, and a gate they do not believe gets
+        // bypassed.
+        let store = Store::in_memory().expect("store");
+        let first = summary(&[network("github.com")]);
+        let widened = summary(&[network("github.com"), network("crates.io")]);
+
+        assert!(
+            !store.has_approved_anything().expect("read"),
+            "a fresh store claimed a prior approval"
+        );
+
+        store.approve(&first, 1).expect("approve");
+
+        // The widened set is unapproved — so the gate still ASKS …
+        assert_eq!(store.approval_of(&widened).expect("read"), Approval::Unseen);
+        // … and the project has history, so it must not say "first run".
+        assert!(
+            store.has_approved_anything().expect("read"),
+            "a project with an approved set was reported as fresh"
+        );
+    }
+
+    #[test]
+    fn a_pending_record_alone_is_not_history() {
+        // `Pending` means shown-and-not-approved. A user who saw a summary
+        // and pressed `q` has approved nothing, so the next start is still
+        // that config's first run here — saying otherwise would imply they
+        // had once allowed it.
+        let store = Store::in_memory().expect("store");
+        let set = summary(&[network("github.com")]);
+        store.record_pending(&set, 1).expect("record");
+        assert_eq!(store.approval_of(&set).expect("read"), Approval::Pending);
+        assert!(
+            !store.has_approved_anything().expect("read"),
+            "declining a summary was counted as having run here"
+        );
     }
 
     #[test]
