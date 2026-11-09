@@ -535,6 +535,7 @@ mod tests {
         let policy = Policy {
             grants: vec![Grant::Filesystem {
                 path: PathBuf::from("/workspace"),
+                target: None,
                 access: Access::ReadOnly,
             }],
             ..permissive()
@@ -560,6 +561,7 @@ mod tests {
         let policy = Policy {
             grants: vec![Grant::Filesystem {
                 path: PathBuf::from("/workspace"),
+                target: None,
                 access: Access::ReadOnly,
             }],
             ..permissive()
@@ -582,10 +584,12 @@ mod tests {
             grants: vec![
                 Grant::Filesystem {
                     path: PathBuf::from("/workspace"),
+                    target: None,
                     access: Access::ReadOnly,
                 },
                 Grant::Filesystem {
                     path: PathBuf::from("/workspace"),
+                    target: None,
                     access: Access::ReadWrite,
                 },
             ],
@@ -606,6 +610,7 @@ mod tests {
         let policy = Policy {
             grants: vec![Grant::Filesystem {
                 path: PathBuf::from("/workspace"),
+                target: None,
                 access: Access::ReadWrite,
             }],
             ..permissive()
@@ -741,6 +746,7 @@ mod tests {
                 },
                 Grant::Filesystem {
                     path: PathBuf::from("/workspace"),
+                    target: None,
                     access: Access::ReadWrite,
                 },
                 Grant::Tool {

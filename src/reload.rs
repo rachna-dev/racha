@@ -381,10 +381,12 @@ mod tests {
             (
                 vec![Grant::Filesystem {
                     path: PathBuf::from("/w"),
+                    target: None,
                     access: Access::ReadOnly,
                 }],
                 vec![Grant::Filesystem {
                     path: PathBuf::from("/w"),
+                    target: None,
                     access: Access::ReadWrite,
                 }],
             ),

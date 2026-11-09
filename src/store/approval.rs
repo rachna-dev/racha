@@ -361,10 +361,12 @@ mod tests {
         let store = Store::in_memory().expect("store");
         let read_only = summary(&[Grant::Filesystem {
             path: PathBuf::from("/workspace"),
+            target: None,
             access: Access::ReadOnly,
         }]);
         let read_write = summary(&[Grant::Filesystem {
             path: PathBuf::from("/workspace"),
+            target: None,
             access: Access::ReadWrite,
         }]);
 

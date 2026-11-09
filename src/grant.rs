@@ -185,8 +185,27 @@ impl fmt::Display for ToolKind {
 pub enum Grant {
     /// `network.allow = [ "registry.npmjs.org:443" ]`.
     Network { endpoint: Endpoint },
-    /// `filesystem.mounts = [ { source = ./.; access = "read-write"; } ]`.
-    Filesystem { path: PathBuf, access: Access },
+    /// `filesystem.mounts = [ { source = ./.; target = "/workspace"; } ]`.
+    ///
+    /// **The generic host-to-guest mapping**, and the thing dotfiles are a
+    /// use of rather than a feature beside: a `.zshrc` on the host reaching
+    /// `/home/dev/.zshrc` in the guest is this grant, not a separate
+    /// mechanism. Editor config, a shared cache directory and a scratch
+    /// volume are the same shape.
+    Filesystem {
+        /// Where it lives on the host.
+        path: PathBuf,
+        /// Where the guest sees it.
+        ///
+        /// `None` means the guest's own default for that mount — the
+        /// workspace. Carried rather than discarded: `config.rs` parsed
+        /// `target`, documented it in this file's own example, and threw it
+        /// away, so the documented feature did not exist. A mapping whose
+        /// destination cannot be stated is not a mapping.
+        target: Option<PathBuf>,
+        /// Read-only unless stated. A forgotten field must not grant writes.
+        access: Access,
+    },
     /// `tools.expose = [ { name = "rust-analyzer"; kind = "lsp"; } ]`.
     Tool {
         name: String,
@@ -302,6 +321,7 @@ mod tests {
             },
             Grant::Filesystem {
                 path: PathBuf::from("/workspace"),
+                target: None,
                 access: Access::ReadWrite,
             },
             Grant::Tool {
@@ -405,6 +425,7 @@ mod tests {
         for access in [Access::ReadOnly, Access::ReadWrite] {
             let grant = Grant::Filesystem {
                 path: PathBuf::from("/workspace"),
+                target: None,
                 access,
             };
             assert_eq!(grant.access(), access);

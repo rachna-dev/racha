@@ -67,7 +67,17 @@ fn request() -> impl Strategy<Value = Request> {
 fn grant() -> impl Strategy<Value = Grant> {
     prop_oneof![
         endpoint().prop_map(|endpoint| Grant::Network { endpoint }),
-        (path(), access()).prop_map(|(path, access)| Grant::Filesystem { path, access }),
+        // A target is generated too, Some and None both reachable: the
+        // mapping is the point of this grant, and a generator that only
+        // ever produced `None` would leave every property about targets
+        // untested while looking covered.
+        (path(), proptest::option::of(path()), access()).prop_map(|(path, target, access)| {
+            Grant::Filesystem {
+                path,
+                target,
+                access,
+            }
+        },),
         any::<u16>().prop_map(|guest| Grant::Port { guest, host: guest }),
         "[a-z]{1,8}".prop_map(|name| Grant::Secret { name }),
     ]
@@ -153,7 +163,11 @@ proptest! {
             // Grant generously: the capability check must still win.
             grants: vec![
                 Grant::Network { endpoint: Endpoint::new("*", 0).unwrap() },
-                Grant::Filesystem { path: PathBuf::from("/"), access: Access::ReadWrite },
+                Grant::Filesystem {
+                    path: PathBuf::from("/"),
+                    target: None,
+                    access: Access::ReadWrite,
+                },
                 Grant::Port { guest: 0, host: 0 },
             ],
             resources: rachna::resources::Resources::default(),

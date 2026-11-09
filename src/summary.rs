@@ -98,12 +98,27 @@ impl AccessSummary {
         for grant in grants.iter().filter(|g| g.category() == category) {
             entries.insert(match grant {
                 Grant::Network { endpoint } => endpoint.to_string(),
-                Grant::Filesystem { path, access } => {
+                Grant::Filesystem {
+                    path,
+                    target,
+                    access,
+                } => {
                     let access = match access {
                         Access::ReadOnly => "read-only",
                         Access::ReadWrite => "read-write",
                     };
-                    format!("{}  {access}", path.display())
+                    // THE MAPPING, both ends. A summary showing only the
+                    // host path tells a user which file is exposed and not
+                    // where it lands — and for a dotfile the destination is
+                    // the whole point: `.zshrc` at `/home/dev/.zshrc` is a
+                    // shell that will execute, and the same file somewhere
+                    // inert is not.
+                    match target {
+                        Some(target) => {
+                            format!("{} -> {}  {access}", path.display(), target.display())
+                        }
+                        None => format!("{}  {access}", path.display()),
+                    }
                 }
                 Grant::Tool {
                     name,
@@ -700,6 +715,7 @@ mod tests {
             },
             Grant::Filesystem {
                 path: PathBuf::from("/workspace"),
+                target: None,
                 access: Access::ReadWrite,
             },
             Grant::Port {
@@ -1375,10 +1391,12 @@ mod tests {
         // different permission, and keying on a path alone would miss it.
         let read_only = vec![Grant::Filesystem {
             path: PathBuf::from("/workspace"),
+            target: None,
             access: Access::ReadOnly,
         }];
         let read_write = vec![Grant::Filesystem {
             path: PathBuf::from("/workspace"),
+            target: None,
             access: Access::ReadWrite,
         }];
         let a = AccessSummary::new(Tier::Allowlist, Profile::Online, &read_only);

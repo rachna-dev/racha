@@ -346,6 +346,15 @@ fn mount_grants(root: &Object, grants: &mut Vec<Grant>, errors: &mut Vec<ConfigE
                 return;
             };
             let source = string_field(mount, at, "source", errors);
+            // READ, not discarded. This field was documented in this file's
+            // own header, asserted in its tests, and thrown away — so
+            // `target` was a documented feature that did nothing. Optional:
+            // a mount with no target gets the guest's default, which is the
+            // workspace.
+            let target = mount
+                .get("target")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from);
             let access = match mount.get("access").and_then(|v| v.as_str()) {
                 // Through `Access::parse`, not a match here: these two words
                 // had four separate spellings in this file, which is the
@@ -366,6 +375,7 @@ fn mount_grants(root: &Object, grants: &mut Vec<Grant>, errors: &mut Vec<ConfigE
             if let (Some(source), Some(access)) = (source, access) {
                 grants.push(Grant::Filesystem {
                     path: PathBuf::from(source),
+                    target,
                     access,
                 });
             }
@@ -636,6 +646,63 @@ mod tests {
     }
 
     #[test]
+    fn a_mount_carries_where_the_guest_sees_it() {
+        // THE generic host-to-guest mapping, and it was documented without
+        // being implemented: this file's own header showed `"target":
+        // "/workspace"`, a test asserted a config containing it parsed, and
+        // the parser read `source` and `access` and dropped `target` on the
+        // floor. `Grant::Filesystem` had nowhere to put it.
+        //
+        // Dotfiles are the case that made the gap obvious — a `.zshrc` is
+        // only a shell config if it lands at `~/.zshrc`, and the same file
+        // anywhere else is inert — but the mechanism is general: editor
+        // config, a shared cache, a scratch volume.
+        let policy = parse(
+            r#"{ "tier": "allowlist", "profile": "development",
+                  "filesystem": { "mounts": [
+                    { "source": "/Users/you/.zshrc",
+                      "target": "/home/dev/.zshrc" } ] } }"#,
+            Capabilities::all(),
+        )
+        .expect("a mount with a target must parse");
+
+        let Some(crate::grant::Grant::Filesystem {
+            path,
+            target,
+            access,
+        }) = policy.grants.first()
+        else {
+            panic!("no filesystem grant: {:?}", policy.grants)
+        };
+        assert_eq!(path, &PathBuf::from("/Users/you/.zshrc"));
+        assert_eq!(
+            target.as_deref(),
+            Some(std::path::Path::new("/home/dev/.zshrc")),
+            "the target was parsed and discarded"
+        );
+        // And read-only by default: a dotfile the guest can rewrite is a
+        // dotfile the guest can use to change what runs on your host next
+        // time you open a shell.
+        assert_eq!(*access, Access::ReadOnly);
+    }
+
+    #[test]
+    fn a_mount_without_a_target_is_still_valid() {
+        // The target is OPTIONAL: the common case is the workspace, and
+        // requiring a destination for it would be ceremony.
+        let policy = parse(
+            r#"{ "tier": "allowlist", "profile": "development",
+                  "filesystem": { "mounts": [ { "source": "." } ] } }"#,
+            Capabilities::all(),
+        )
+        .expect("a mount with no target must parse");
+        let Some(crate::grant::Grant::Filesystem { target, .. }) = policy.grants.first() else {
+            panic!("no filesystem grant")
+        };
+        assert_eq!(*target, None);
+    }
+
+    #[test]
     fn the_real_evaluation_output_parses_into_every_grant() {
         let policy = parsed(REAL);
         assert_eq!(policy.tier, Tier::Allowlist);
@@ -815,6 +882,7 @@ mod tests {
             parsed(json).grants,
             [Grant::Filesystem {
                 path: PathBuf::from("/p"),
+                target: None,
                 access: Access::ReadOnly,
             }]
         );

@@ -209,7 +209,14 @@ fn filesystem_grants(observed: &[Request]) -> Vec<Grant> {
         grants.extend(
             minimal_covering_paths(&paths)
                 .into_iter()
-                .map(|path| Grant::Filesystem { path, access }),
+                .map(|path| Grant::Filesystem {
+                    path,
+                    // Synthesised grants take the guest's default
+                    // location: this is inferring what a project needs,
+                    // and inventing a mount point would be guessing.
+                    target: None,
+                    access,
+                }),
         );
     }
     grants
@@ -498,10 +505,12 @@ mod tests {
             vec![
                 Grant::Filesystem {
                     path: PathBuf::from("/workspace/src"),
+                    target: None,
                     access: Access::ReadWrite,
                 },
                 Grant::Filesystem {
                     path: PathBuf::from("/workspace/target"),
+                    target: None,
                     access: Access::ReadWrite,
                 },
             ],
@@ -522,6 +531,7 @@ mod tests {
             grants,
             vec![Grant::Filesystem {
                 path: PathBuf::from("/workspace"),
+                target: None,
                 access: Access::ReadWrite,
             }]
         );
@@ -560,6 +570,7 @@ mod tests {
             grants,
             vec![Grant::Filesystem {
                 path: PathBuf::from("/workspace/vendor"),
+                target: None,
                 access: Access::ReadOnly,
             }]
         );
@@ -577,6 +588,7 @@ mod tests {
         assert_eq!(grants.len(), 2, "both access levels were observed");
         assert!(grants.contains(&Grant::Filesystem {
             path: PathBuf::from("/workspace/src"),
+            target: None,
             access: Access::ReadWrite,
         }));
     }
