@@ -214,6 +214,39 @@ pub enum Command {
 }
 
 impl Command {
+    /// Whether running this verb would refuse because it is not built.
+    ///
+    /// A verb can **parse and then exit 70**, which is the hole that let the
+    /// first-run prompt advertise `rachna revoke`: the test behind that
+    /// prompt asserted the parser accepted every command it offered, and
+    /// `revoke` does — then `main` prints "not built yet". Running it was
+    /// the only way to find out.
+    ///
+    /// So the prompts assert against this instead. `00` §3.3 asks that a
+    /// message name an action the user can take; naming one that fails
+    /// spends their trust rather than their time.
+    ///
+    /// An explicit match, so building a verb means deleting its arm here
+    /// and a new verb must be classified rather than silently counted as
+    /// working.
+    #[must_use]
+    pub const fn is_unimplemented(&self) -> bool {
+        match *self {
+            // `00` §5.3's editing verbs wait on the CST editor.
+            Self::Edit(_)
+            | Self::Doctor
+            | Self::Config { .. }
+            | Self::Audit { .. }
+            | Self::Explain { .. } => true,
+            Self::Init { .. }
+            | Self::Start { .. }
+            | Self::Stop
+            | Self::Status
+            | Self::Version
+            | Self::Help => false,
+        }
+    }
+
     /// The verb a user typed to get here.
     ///
     /// Lives on the type rather than in `main.rs`, which is where it started.

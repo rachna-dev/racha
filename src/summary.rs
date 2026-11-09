@@ -541,7 +541,17 @@ pub fn review_prompt(summary: &AccessSummary, reason: Reason, interactive: bool)
             out.push_str(&format!("  [l] list all {total} grants\n"));
         }
         out.push_str("  [q] quit, and change rachna.nix first\n");
-        out.push_str("\n  to drop one:  rachna revoke <category> <target>\n");
+        // "edit rachna.nix" rather than "rachna revoke", because `revoke`
+        // currently PARSES and then exits 70 — the comment-preserving
+        // editor is not built (`00` §5.3). Found by running the command
+        // this prompt was advertising.
+        //
+        // An offered command that does not work is worse than no offer:
+        // this prompt exists because `00` §3.3 says a message naming no
+        // action is not actionable, and naming one that fails spends the
+        // user's trust instead of their time. The test behind these lines
+        // checks the parser ACCEPTS them, which is weaker than it reads.
+        out.push_str("\n  to drop one:  edit rachna.nix, then start again\n");
     } else {
         // Not a TTY. `00` §3.10c: "CI needs a flag … RACHNA_ACCEPT=1 or
         // --accept in the pipeline." A pipeline blocked forever on a
@@ -550,14 +560,17 @@ pub fn review_prompt(summary: &AccessSummary, reason: Reason, interactive: bool)
         out.push_str("  accept everything:   rachna start --accept\n");
         if summary.too_long_to_itemise() {
             out.push_str(&format!(
-                "  review in full:      rachna config inspect   ({total} grants)\n"
+                // NOT `rachna config inspect`: it parses and then exits 70
+                // (`01` §7). The file is the authority anyway, and reading
+                // it is the one instruction that cannot be unimplemented.
+                "  review in full:      rachna.nix   ({total} grants)\n"
             ));
         }
         // No backticks: this line is copied, not read. The test caught one
         // glued to `--accept`, which the parser then rejected as the flag
         // "--accept`" — an offered command that cannot work, which is the
         // defect this whole prompt exists to avoid.
-        out.push_str("  drop one:            rachna revoke <category> <target>\n");
+        out.push_str("  drop one:            edit rachna.nix, then start again\n");
     }
     out
 }
@@ -657,10 +670,14 @@ impl fmt::Display for AccessSummary {
                 }
             }
         }
-        if roll_up {
-            writeln!(f)?;
-            writeln!(f, "  review in full:  rachna config inspect")?;
-        }
+        // NO "review in full" line here. The PROMPT names where the full
+        // list is, and it is the half that knows whether the reader can
+        // press `[l]` — a pipe cannot. Printing it in both places produced
+        // two such lines, one of them offering a keypress to a pipeline.
+        //
+        // That leaves the rolled-up summary saying only what the counts
+        // are, which is its job; `review_prompt` says what to do about
+        // them, which is its job.
         // Trailing blank line, so a caller appending the acknowledgement
         // prompt does not have to remember one.
         writeln!(f)
@@ -885,7 +902,15 @@ mod tests {
         );
         // And it says where the full list is, per `00` §3.3 — a summary that
         // hides entries without naming the command is a dead end.
-        assert!(shown.contains("rachna config inspect"), "{shown}");
+        // Where the full list lives is the PROMPT's line, not this one —
+        // only the prompt knows whether the reader can press `[l]`. Asserted
+        // the other way round so the two cannot both claim it again.
+        assert!(
+            !shown.contains("review in full"),
+            "the summary duplicated the prompt's pointer:\n{shown}"
+        );
+        let prompt = review_prompt(&long, Reason::FirstRun, false);
+        assert!(prompt.contains("review in full"), "{prompt}");
     }
 
     #[test]
@@ -1005,7 +1030,17 @@ mod tests {
         // Non-interactive: names the flag, because CI cannot press a key.
         let piped = review_prompt(&realistic(), Reason::FirstRun, false);
         assert!(piped.contains("rachna start --accept"), "{piped}");
-        assert!(piped.contains("rachna revoke"), "{piped}");
+        // A way to drop one — and it must be one that WORKS. This asserted
+        // `rachna revoke`, which parses and then exits 70 because the
+        // comment-preserving editor is not built (`00` §5.3). Found by
+        // running the command the prompt was advertising: an offered
+        // command that fails spends the user's trust, which is the opposite
+        // of what `00` §3.3 asks of this line.
+        assert!(piped.contains("edit rachna.nix"), "{piped}");
+        assert!(
+            !piped.contains("rachna revoke"),
+            "the prompt offers a verb that is not built: {piped}"
+        );
 
         // Interactive: offers the keypress, and does NOT tell a user at a
         // terminal to retype a command they can answer in one character.
@@ -1017,7 +1052,11 @@ mod tests {
             "a terminal user was told to retype the command: {tty}"
         );
         // The edit path is still offered, since that is how a subset works.
-        assert!(tty.contains("rachna revoke"), "{tty}");
+        assert!(tty.contains("edit rachna.nix"), "{tty}");
+        assert!(
+            !tty.contains("rachna revoke"),
+            "the prompt offers a verb that is not built: {tty}"
+        );
     }
 
     #[test]
@@ -1048,6 +1087,17 @@ mod tests {
                         "the prompt offers `{command}`, which the parser rejects: {:?}",
                         parsed.err()
                     );
+                    // AND it has to do something. Parsing was the only bar
+                    // here, and `rachna revoke` cleared it while exiting 70
+                    // — the prompt advertised a verb that is not built, and
+                    // only running it showed that.
+                    if let Ok(crate::cli::Invocation::Rachna(command)) = parsed {
+                        assert!(
+                            !command.is_unimplemented(),
+                            "the prompt offers `{command:?}`, which parses and then \
+                             refuses as not built yet"
+                        );
+                    }
                 }
             }
         }
@@ -1123,10 +1173,10 @@ mod tests {
         let counts = long.counts_by_category();
         assert_eq!(counts, vec![(Category::Network, 40)]);
 
-        // And the prompt changes shape: it points at `config inspect`
+        // And the prompt changes shape: it points at the full list
         // rather than implying the user should read 40 numbered lines.
         let prompt = review_prompt(&long, Reason::FirstRun, false);
-        assert!(prompt.contains("config inspect"), "{prompt}");
+        assert!(prompt.contains("review in full"), "{prompt}");
         assert!(prompt.contains("40 grants"), "{prompt}");
         // Interactively, the same case offers `l` rather than a command —
         // the entries were rolled up, so there has to be a way to see them.
