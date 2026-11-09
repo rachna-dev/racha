@@ -205,7 +205,10 @@ pub enum Command {
     /// Writes the guest's memory to disk and stops it. `02` §4 makes this
     /// compound — pause, save, stop — because the VM must be `Paused`
     /// before saving.
-    Suspend,
+    Suspend {
+        /// What to call it. [`None`] means `snapshots::DEFAULT_NAME`.
+        name: Option<String>,
+    },
     /// `rachna resume`
     ///
     /// Restores a suspended guest. Compound for the mirror reason: `02` §4
@@ -214,7 +217,14 @@ pub enum Command {
     /// **Goes through the policy gate**, like `start`. `00` §3.10c's
     /// correction: the summary prints on every resume, and a snapshot taken
     /// under grants the file no longer declares needs a keypress.
-    Resume,
+    Resume {
+        /// Which one to bring back. [`None`] means the default name.
+        name: Option<String>,
+    },
+    /// `rachna snapshots`
+    ///
+    /// What is parked, and which of it can be resumed.
+    Snapshots,
     /// `rachna status`
     Status,
     /// `rachna doctor`
@@ -265,8 +275,9 @@ impl Command {
             Self::Init { .. }
             | Self::Start { .. }
             | Self::Stop
-            | Self::Suspend
-            | Self::Resume
+            | Self::Suspend { .. }
+            | Self::Resume { .. }
+            | Self::Snapshots
             | Self::Status
             | Self::Version
             | Self::Help => false,
@@ -288,8 +299,9 @@ impl Command {
             Self::Init { .. } => "init",
             Self::Start { .. } => "start",
             Self::Stop => "stop",
-            Self::Suspend => "suspend",
-            Self::Resume => "resume",
+            Self::Suspend { .. } => "suspend",
+            Self::Resume { .. } => "resume",
+            Self::Snapshots => "snapshots",
             Self::Status => "status",
             Self::Doctor => "doctor",
             Self::Config { action } => match action {
@@ -550,10 +562,27 @@ fn split_equals(args: &[OsString]) -> Vec<OsString> {
 /// every one of these appears in `--help`. One list, so a verb cannot be
 /// added to the parser and missed by either.
 const COMMANDS: &[&str] = &[
-    "init", "start", "stop", "suspend", "resume", "status", "doctor", "config", "audit", "explain",
+    "init",
+    "start",
+    "stop",
+    "suspend",
+    "resume",
+    "snapshots",
+    "status",
+    "doctor",
+    "config",
+    "audit",
+    "explain",
     // The `rachna.nix`-editing verbs (`00` §5.3). `21` §2.5 found these
     // missing from step 10 while the backend verbs were correctly deferred.
-    "allow", "revoke", "expose", "unexpose", "add", "port", "set", "secret",
+    "allow",
+    "revoke",
+    "expose",
+    "unexpose",
+    "add",
+    "port",
+    "set",
+    "secret",
 ];
 
 fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
@@ -573,8 +602,9 @@ fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
         "init" => parse_init(rest),
         "start" => parse_start(rest),
         "stop" => expect_no_args("stop", rest, Command::Stop),
-        "suspend" => expect_no_args("suspend", rest, Command::Suspend),
-        "resume" => expect_no_args("resume", rest, Command::Resume),
+        "suspend" => parse_named("suspend", rest),
+        "resume" => parse_named("resume", rest),
+        "snapshots" => expect_no_args("snapshots", rest, Command::Snapshots),
         "status" => expect_no_args("status", rest, Command::Status),
         "doctor" => expect_no_args("doctor", rest, Command::Doctor),
         "config" => parse_config(rest),
@@ -646,6 +676,39 @@ fn parse_start(args: &[OsString]) -> Result<Command, CliError> {
         }
     }
     Ok(Command::Start { accept, supervise })
+}
+
+/// `suspend [name]` and `resume [name]`.
+///
+/// The name is POSITIONAL rather than a flag: it is the argument, and
+/// `rachna resume clean-db` reads the way a person says it. Validation
+/// happens in `snapshots::SnapshotName` rather than here, so the parser
+/// stays about shape and the name's rules live with the thing that uses
+/// them.
+fn parse_named(verb: &'static str, args: &[OsString]) -> Result<Command, CliError> {
+    let mut name: Option<String> = None;
+    for arg in args {
+        let text = arg.to_string_lossy();
+        if text.starts_with('-') {
+            return Err(CliError::UnexpectedFlag {
+                command: verb,
+                flag: text.into_owned(),
+            });
+        }
+        if name.is_some() {
+            // A second name is a mistake worth naming: silently ignoring it
+            // would resume something other than what was typed.
+            return Err(CliError::UnexpectedFlag {
+                command: verb,
+                flag: text.into_owned(),
+            });
+        }
+        name = Some(text.into_owned());
+    }
+    Ok(match verb {
+        "suspend" => Command::Suspend { name },
+        _ => Command::Resume { name },
+    })
 }
 
 fn parse_config(args: &[OsString]) -> Result<Command, CliError> {
@@ -1025,8 +1088,9 @@ ENVIRONMENT
                             new or wider. --accept is for CI only — at a
                             terminal it is ignored and you press `a`
   stop                      stop the environment, discarding its state
-  suspend                   write the guest's memory to disk and stop
-  resume                    bring a suspended environment back
+  suspend [name]            write the guest's memory to disk and stop
+  resume [name]             bring a suspended environment back
+  snapshots                 what is parked, and what can be resumed
   status                    what is running, and what it is allowed
   doctor                    check this host, and verify enforcement
 
@@ -1225,8 +1289,24 @@ mod tests {
         // verb the parser accepts whose name is absent from `COMMANDS` is
         // undiscoverable in `--help` and unsuggestable on a typo.
         for word in [
-            "init", "start", "stop", "suspend", "resume", "status", "doctor", "audit", "explain",
-            "allow", "revoke", "expose", "unexpose", "add", "port", "set", "secret",
+            "init",
+            "start",
+            "stop",
+            "suspend",
+            "resume",
+            "snapshots",
+            "status",
+            "doctor",
+            "audit",
+            "explain",
+            "allow",
+            "revoke",
+            "expose",
+            "unexpose",
+            "add",
+            "port",
+            "set",
+            "secret",
         ] {
             let Ok(Invocation::Rachna(command)) = parse(&["rachna", word]) else {
                 continue;

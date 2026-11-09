@@ -191,6 +191,34 @@ pub fn resume_request(paths: &ProjectPaths) -> PathBuf {
     paths.runtime_dir().join("resume")
 }
 
+/// The file a suspended supervisor leaves naming what it holds.
+///
+/// `02` §6.11 makes this necessary rather than convenient: only the
+/// process that saved a snapshot can restore it, so `rachna snapshots` has
+/// to say which one that is. The supervisor is the only thing that knows,
+/// and it is not reachable except through the filesystem.
+#[must_use]
+pub fn held_marker(paths: &ProjectPaths) -> PathBuf {
+    paths.runtime_dir().join("held")
+}
+
+/// Whether this project has a live supervisor.
+///
+/// Reads the state file and checks the pid, so a record left by a crash
+/// does not report a project as running.
+#[must_use]
+pub fn is_running_project(paths: &ProjectPaths) -> bool {
+    std::fs::read_to_string(state_file(paths))
+        .ok()
+        .and_then(|text| Running::from_text(&text).ok())
+        .is_some_and(|running| {
+            running
+                .processes
+                .iter()
+                .any(|process| is_running(process.pid))
+        })
+}
+
 /// Whether a pid names a process that still exists.
 ///
 /// `stop` needs this for a different reason than `start`: `stop` must not

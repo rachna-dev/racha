@@ -216,4 +216,5 @@ pub mod render;
 pub mod resources;
 pub mod run;
 pub mod snapshot;
+pub mod snapshots;
 pub mod store;

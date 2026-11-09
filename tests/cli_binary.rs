@@ -289,6 +289,70 @@ fn start_returns_rather_than_blocking_forever() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn snapshot_names_are_validated_before_anything_is_written() {
+    // A snapshot name becomes a FILENAME, so `../escape` is an attempt to
+    // write outside the project whether or not anyone meant it that way —
+    // the same reasoning `layout::ProjectId` applies to project
+    // directories.
+    //
+    // Checked at the binary because that is where a name arrives: the
+    // module's own tests prove the rule, and this proves the rule is
+    // reached before any work happens.
+    let dir = std::env::temp_dir().join(format!("rachna-snapname-{}", std::process::id()));
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&home).expect("scratch dirs");
+
+    let binary = env!("CARGO_BIN_EXE_rachna");
+    let run = |args: &[&str]| -> (String, i32) {
+        let out = Command::new(binary)
+            .args(args)
+            .current_dir(&dir)
+            .env("HOME", &home)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the binary runs");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.code().unwrap_or(-1),
+        )
+    };
+    assert_eq!(run(&["init"]).1, 0, "init failed");
+
+    // First assert a GOOD name gets past validation, or the refusals below
+    // would pass against a verb that refuses everything.
+    let (good, _) = run(&["resume", "a-fine-name"]);
+    assert!(
+        !good.contains("not a path") && !good.contains("typeable"),
+        "a valid name was refused as invalid: {good}"
+    );
+
+    for attempt in ["../escape", "a/b", ".."] {
+        let (text, code) = run(&["resume", attempt]);
+        assert_eq!(code, 77, "`{attempt}` was not refused: {text}");
+        assert!(
+            text.contains("not a path"),
+            "`{attempt}` was refused without saying why: {text}"
+        );
+    }
+
+    // `snapshots` runs anywhere and reports rather than failing — the same
+    // rule `status` follows (`00` §5.2).
+    let (listing, code) = run(&["snapshots"]);
+    assert_eq!(code, 0, "snapshots failed: {listing}");
+    assert!(
+        listing.contains("rachna suspend"),
+        "an empty listing should say how to make one: {listing}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn the_binary_carries_the_virtualization_entitlement() {

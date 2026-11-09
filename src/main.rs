@@ -87,8 +87,9 @@ fn run(command: Command) -> ExitCode {
         Command::Init { .. } => commands::init(),
         Command::Start { accept, supervise } => commands::start(accept, supervise),
         Command::Stop => commands::stop(),
-        Command::Suspend => commands::suspend(),
-        Command::Resume => commands::resume(),
+        Command::Suspend { name } => commands::suspend(name.as_deref()),
+        Command::Resume { name } => commands::resume(name.as_deref()),
+        Command::Snapshots => commands::snapshots(),
         Command::Status => commands::status(),
         // Everything below still needs work that has not landed. Naming them
         // individually rather than with a catch-all so adding one is a
@@ -591,15 +592,20 @@ mod commands {
         // A snapshot present here therefore means its supervisor has gone,
         // which `resume` reports and clears. Starting fresh is correct;
         // pretending to restore is not.
-        let snapshot = paths.snapshot_dir().join(SNAPSHOT_FILE);
-        if snapshot.exists() {
+        // Any snapshot here is ORPHANED: this is a fresh supervisor, and
+        // `02` §6.11 measured that only the process which saved a snapshot
+        // can restore it. Cleared rather than left, so `rachna snapshots`
+        // does not list something no process can bring back.
+        for orphan in rachna::snapshots::list(&paths) {
             eprintln!(
-                "rachna: a snapshot is present but its supervisor is gone, so it \
-                 cannot be restored (02 §6.11). Booting fresh — the state volume \
-                 is intact."
+                "rachna: snapshot `{}` cannot be restored — the process that \
+                 saved it is gone (02 §6.11). Clearing it; the state volume is \
+                 intact.",
+                orphan.name
             );
-            let _ = std::fs::remove_file(&snapshot);
+            let _ = std::fs::remove_file(orphan.name.path(&paths));
         }
+        let _ = std::fs::remove_file(rachna::supervise::held_marker(&paths));
 
         let guest = match Guest::new(&plan) {
             Ok(guest) => guest,
@@ -660,6 +666,10 @@ mod commands {
         // Holding costs no vCPU: the guest is stopped, and this process is
         // a sleeping loop plus one Objective-C object.
         let mut suspended = false;
+        // What this process is holding, if anything. `02` §6.11: only this
+        // process can restore what it saved, so the name lives here rather
+        // than being re-read from a request.
+        let mut held: Option<rachna::snapshots::SnapshotName> = None;
 
         loop {
             if suspended {
@@ -668,15 +678,26 @@ mod commands {
                 // restore it.
                 if resume.exists() {
                     let _ = std::fs::remove_file(&resume);
+                    // Whatever this process is holding. `resume` validated
+                    // the name and checked the file, and only this process
+                    // can restore it anyway — so the held one is the only
+                    // answer, and taking the request's name instead would
+                    // invite a restore of a snapshot we did not save.
+                    let Some(chosen) = held.clone() else {
+                        eprintln!("rachna: nothing is held, so there is nothing to resume");
+                        continue;
+                    };
+                    let snapshot = chosen.path(&paths);
                     // restore -> resume (`02` §4: restore lands Paused).
                     match guest.restore(&snapshot).and_then(|()| guest.resume()) {
                         Ok(()) => {
                             suspended = false;
                             // The snapshot is spent: leaving it would make
-                            // the next `start` try to restore a session
-                            // that is already running.
+                            // `snapshots` list a session that is running.
                             let _ = std::fs::remove_file(&snapshot);
-                            eprintln!("rachna: resumed from the snapshot");
+                            let _ = std::fs::remove_file(rachna::supervise::held_marker(&paths));
+                            held = None;
+                            eprintln!("rachna: resumed `{chosen}`");
                         }
                         Err(error) => {
                             // `02` §4: a macOS update can invalidate saved
@@ -699,8 +720,13 @@ mod commands {
                 } else if request.exists() {
                     // Stopped while suspended: nothing to shut down, but
                     // the snapshot goes, because `stop` means the session
-                    // is over.
-                    let _ = std::fs::remove_file(&snapshot);
+                    // is over — and a snapshot no live process can restore
+                    // is one `snapshots` would list and `resume` could not
+                    // honour.
+                    if let Some(name) = held.take() {
+                        let _ = std::fs::remove_file(name.path(&paths));
+                    }
+                    let _ = std::fs::remove_file(rachna::supervise::held_marker(&paths));
                     return ExitCode::from(OK);
                 } else {
                     std::thread::sleep(HOLD_TURN);
@@ -724,7 +750,25 @@ mod commands {
             // cannot be mistaken for a stop, and a guest asked to do both
             // should keep its state rather than discard it.
             if suspend.exists() {
+                // The NAME comes from the request: `suspend` wrote it there
+                // because this process does the saving and would otherwise
+                // have to guess which file to write.
+                let requested = std::fs::read_to_string(&suspend).unwrap_or_default();
                 let _ = std::fs::remove_file(&suspend);
+                let Ok(chosen) = rachna::snapshots::SnapshotName::new(requested.trim()) else {
+                    // Refused rather than defaulted: saving under a name the
+                    // user did not ask for is how a snapshot gets lost.
+                    eprintln!(
+                        "rachna: `{}` is not a usable snapshot name, so nothing \
+                         was saved",
+                        requested.trim()
+                    );
+                    continue;
+                };
+                let snapshot = chosen.path(&paths);
+                if let Some(parent) = snapshot.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
                 // pause -> save -> stop (`02` §4's compound suspend). The
                 // guest stops; THIS PROCESS DOES NOT.
                 let outcome = guest
@@ -740,7 +784,14 @@ mod commands {
                     let _ = std::fs::remove_file(&snapshot);
                     return ExitCode::from(FAILED);
                 }
-                eprintln!("rachna: suspended, holding the configuration for resume");
+                // Recorded so `rachna snapshots` can say which one is
+                // resumable — it has no other way to know.
+                let _ = std::fs::write(
+                    rachna::supervise::held_marker(&paths),
+                    format!("{chosen}\n"),
+                );
+                eprintln!("rachna: suspended as `{chosen}`, holding the configuration");
+                held = Some(chosen);
                 suspended = true;
                 continue;
             }
@@ -1003,7 +1054,7 @@ mod commands {
     /// stop. The supervisor does the work because it **holds the VM** — a
     /// VZ guest lives inside its creating process (`02` §6), so no other
     /// process can save it.
-    pub(crate) fn suspend() -> ExitCode {
+    pub(crate) fn suspend(name: Option<&str>) -> ExitCode {
         let context = match context() {
             Ok(context) => context,
             Err(why) => {
@@ -1027,14 +1078,21 @@ mod commands {
         }
 
         let paths = context.paths();
+        let chosen = match resolve_name(name) {
+            Ok(chosen) => chosen,
+            Err(code) => return code,
+        };
         let request = rachna::supervise::suspend_request(&paths);
-        let snapshot = paths.snapshot_dir().join(SNAPSHOT_FILE);
+        let snapshot = chosen.path(&paths);
         // Any previous snapshot goes first, so "the file appeared" below is
         // about THIS suspend. Without that, a stale snapshot would make
         // `suspend` report success instantly having done nothing.
         let _ = std::fs::remove_file(&snapshot);
 
-        if let Err(error) = std::fs::write(&request, b"suspend\n") {
+        // The request carries the NAME. The supervisor holds the VM and so
+        // does the saving; without the name in the file it would have to
+        // guess, and a guess here writes the wrong snapshot.
+        if let Err(error) = std::fs::write(&request, format!("{chosen}\n")) {
             eprintln!("rachna: cannot ask the supervisor to suspend: {error}");
             return ExitCode::from(FAILED);
         }
@@ -1054,8 +1112,8 @@ mod commands {
                 for _ in 0..SUSPEND_SETTLE_TURNS {
                     let size = std::fs::metadata(&snapshot).map_or(0, |m| m.len());
                     if size > 0 && size == last {
-                        println!("suspended ({} MiB)", size / 1024 / 1024);
-                        println!("  resume it with: rachna resume");
+                        println!("suspended as `{chosen}` ({} MiB)", size / 1024 / 1024);
+                        println!("  resume it with: rachna resume {chosen}");
                         return ExitCode::from(OK);
                     }
                     last = size;
@@ -1106,7 +1164,7 @@ mod commands {
     /// gate**, like `start`: `00` §3.10c's correction makes the summary
     /// unconditional on every resume, and a snapshot taken under grants
     /// `rachna.nix` no longer declares needs a keypress.
-    pub(crate) fn resume() -> ExitCode {
+    pub(crate) fn resume(name: Option<&str>) -> ExitCode {
         let context = match context() {
             Ok(context) => context,
             Err(why) => {
@@ -1116,16 +1174,25 @@ mod commands {
         };
 
         let paths = context.paths();
-        let snapshot = paths.snapshot_dir().join(SNAPSHOT_FILE);
+        let chosen = match resolve_name(name) {
+            Ok(chosen) => chosen,
+            Err(code) => return code,
+        };
+        let snapshot = chosen.path(&paths);
         if !snapshot.exists() {
-            // Names the alternative, per `00` §3.3 — a user with no
-            // snapshot wants to know what to type, not that a file is
-            // absent.
-            eprintln!(
-                "rachna: nothing to resume (no snapshot at {}). \
-                 `rachna start` boots a fresh environment",
-                snapshot.display()
-            );
+            // Shows WHAT IS there, not just that this one is not. A user who
+            // misremembered a name wants the list, and `00` §3.3's rule is
+            // that a message naming no action is not actionable.
+            let available = rachna::snapshots::list(&paths);
+            if available.is_empty() {
+                eprintln!(
+                    "rachna: nothing to resume. `rachna start` boots a fresh \
+                     environment, and `rachna suspend` parks one"
+                );
+            } else {
+                eprintln!("rachna: no snapshot called `{chosen}`. These exist:");
+                eprint!("{}", rachna::snapshots::render(&available, None));
+            }
             return ExitCode::from(FAILED);
         }
 
@@ -1157,7 +1224,7 @@ mod commands {
         }
 
         let request = rachna::supervise::resume_request(&paths);
-        if let Err(error) = std::fs::write(&request, b"resume\n") {
+        if let Err(error) = std::fs::write(&request, format!("{chosen}\n")) {
             eprintln!("rachna: cannot ask the supervisor to resume: {error}");
             return ExitCode::from(FAILED);
         }
@@ -1169,7 +1236,7 @@ mod commands {
         let deadline = std::time::Instant::now() + RESUME_BUDGET;
         while std::time::Instant::now() < deadline {
             if !snapshot.exists() {
-                println!("resumed");
+                println!("resumed `{chosen}`");
                 println!("  console: {}", paths.console_log().display());
                 println!("  stop it with: rachna stop");
                 return ExitCode::from(OK);
@@ -1208,12 +1275,46 @@ mod commands {
     /// the same order, so this is generous rather than tuned.
     const RESUME_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
-    /// The snapshot's filename, inside the project's `snapshots/`.
+    /// `rachna snapshots`.
+    pub(crate) fn snapshots() -> ExitCode {
+        let context = match context() {
+            Ok(context) => context,
+            Err(why) => {
+                eprintln!("rachna: {why}");
+                return ExitCode::from(FAILED);
+            }
+        };
+        let paths = context.paths();
+        let found = rachna::snapshots::list(&paths);
+
+        // WHICH ONE IS RESUMABLE. `02` §6.11: only the process that saved a
+        // snapshot can restore it, so a listing that did not say which is
+        // held would offer resumes that cannot work. A running supervisor
+        // holds whatever it last saved — read from the suspend marker it
+        // leaves beside the snapshot.
+        let held = if rachna::supervise::is_running_project(&paths) {
+            rachna::snapshots::held_by_supervisor(&paths)
+        } else {
+            None
+        };
+
+        print!("{}", rachna::snapshots::render(&found, held.as_ref()));
+        ExitCode::from(OK)
+    }
+
+    /// Validates a snapshot name, or explains why it cannot be one.
     ///
-    /// One name rather than a timestamped series: `00` §7's suspend/resume
-    /// is "close the laptop and come back", not a history. A named series
-    /// is `rachna snapshot`'s job if that verb is ever built.
-    pub(crate) const SNAPSHOT_FILE: &str = "memory.vzvmsave";
+    /// Returns the exit code to use on failure, so a caller can `return` it
+    /// — the alternative is every call site repeating the same eprintln.
+    fn resolve_name(name: Option<&str>) -> Result<rachna::snapshots::SnapshotName, ExitCode> {
+        match name {
+            None => Ok(rachna::snapshots::SnapshotName::default_name()),
+            Some(typed) => rachna::snapshots::SnapshotName::new(typed).map_err(|error| {
+                eprintln!("rachna: {error}");
+                ExitCode::from(REFUSED)
+            }),
+        }
+    }
 
     /// How long `suspend` waits for the memory to be written.
     ///
