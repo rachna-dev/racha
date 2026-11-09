@@ -115,6 +115,11 @@ echo rachna > "$ROOT/etc/hostname"
 # (02 §6.9).
 sed -e "s|@POSTGRES@|$POSTGRES|g" -e "s|@NODE@|$NODE|g" \
   "$(dirname "$0")/../guest/aarch64-init.sh" > "$ROOT/init"
+# CHECKED HERE, because a syntax error in the guest's init is a kernel
+# panic three minutes into a boot ("Attempted to kill init"), with the
+# reason nowhere in the output. Measured: an editing slip left a
+# duplicated `else`/`fi` and cost a full build-and-boot cycle to find.
+sh -n "$ROOT/init" || { echo "the guest init has a syntax error" >&2; exit 1; }
 chmod +x "$ROOT/init"
 cp "$(dirname "$0")/../guest/todos.js" "$ROOT/opt/rachna/todos.js"
 
