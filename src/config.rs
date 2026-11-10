@@ -71,6 +71,13 @@ pub enum ConfigError {
     Missing { at: String },
     /// A network endpoint could not be parsed.
     MalformedEndpoint { at: String, found: String },
+    /// The same value was declared twice in one list.
+    ///
+    /// Nix accepts `[ nodejs_22 nodejs_22 ]` silently — a list, two
+    /// elements, one closure. Reported because a user who wrote a package
+    /// twice either meant two versions and mistyped one, or is reading a
+    /// merged config they do not realise is merged.
+    Duplicate { at: String, found: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -87,6 +94,9 @@ impl fmt::Display for ConfigError {
             }
             Self::UnknownKey { at } => write!(f, "{at}: no such option"),
             Self::Missing { at } => write!(f, "{at}: required"),
+            Self::Duplicate { at, found } => {
+                write!(f, "{at}: {found:?} is declared more than once")
+            }
             Self::MalformedEndpoint { at, found } => write!(
                 f,
                 "{at}: {found:?} is not a host:port — try \"example.com:443\""
@@ -142,6 +152,16 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "resources",
 ];
 
+/// Every key `rachna.nix` may contain: the policy half plus the exec half.
+///
+/// Two lists rather than one, because the split is the architecture
+/// (`01` §2.3) — but the *check* has to see both, or declaring
+/// `environment.packages` fails with `no such option`, which is the exact
+/// defect `resources` had above.
+fn is_known(key: &str) -> bool {
+    TOP_LEVEL_KEYS.contains(&key) || crate::exec::EXEC_KEYS.contains(&key)
+}
+
 /// Parses evaluated config JSON into a [`Policy`].
 ///
 /// `capabilities` comes from the backend, not the config: what the host can
@@ -152,6 +172,24 @@ const TOP_LEVEL_KEYS: &[&str] = &[
 /// Returns every problem found. A config with any problem yields no policy at
 /// all — never a partially-applied one.
 pub fn parse(json: &str, capabilities: Capabilities) -> Result<Policy, ConfigErrors> {
+    parse_both(json, capabilities).map(|(policy, _)| policy)
+}
+
+/// Parses config JSON into **both** artifacts `01` §2.3 specifies.
+///
+/// The one to call from the lifecycle: an `ExecSpec` is what decides which
+/// guest image to build, and `parse` above discards it. Kept as a separate
+/// function rather than changing `parse`'s signature because the policy half
+/// is what most callers and every policy test want.
+///
+/// # Errors
+///
+/// Every problem in **either** half, collected. A config with any problem
+/// yields neither artifact — never a policy applied without its packages.
+pub fn parse_both(
+    json: &str,
+    capabilities: Capabilities,
+) -> Result<(Policy, crate::exec::ExecSpec), ConfigErrors> {
     let value: serde_json::Value = match serde_json::from_str(json) {
         Ok(value) => value,
         // A parse failure here is our bug or a Nix change, not a user error:
@@ -168,7 +206,7 @@ pub fn parse(json: &str, capabilities: Capabilities) -> Result<Policy, ConfigErr
     let mut errors = Vec::new();
 
     for key in root.keys() {
-        if !TOP_LEVEL_KEYS.contains(&key.as_str()) {
+        if !is_known(key.as_str()) {
             errors.push(ConfigError::UnknownKey { at: key.clone() });
         }
     }
@@ -176,6 +214,8 @@ pub fn parse(json: &str, capabilities: Capabilities) -> Result<Policy, ConfigErr
     let tier = enum_field(root, "tier", TIERS, &mut errors).unwrap_or(Tier::None);
     let profile = enum_field(root, "profile", PROFILES, &mut errors).unwrap_or(Profile::Sealed);
     let resources = resources(root, &mut errors);
+
+    let exec = crate::exec::exec_spec(root, &mut errors);
 
     let mut grants = Vec::new();
     network_grants(root, &mut grants, &mut errors);
@@ -185,13 +225,16 @@ pub fn parse(json: &str, capabilities: Capabilities) -> Result<Policy, ConfigErr
     secret_grants(root, &mut grants, &mut errors);
 
     if errors.is_empty() {
-        Ok(Policy {
-            tier,
-            profile,
-            grants,
-            resources,
-            capabilities,
-        })
+        Ok((
+            Policy {
+                tier,
+                profile,
+                grants,
+                resources,
+                capabilities,
+            },
+            exec,
+        ))
     } else {
         Err(ConfigErrors(errors))
     }
@@ -213,7 +256,7 @@ const PROFILES: &[(&str, Profile)] = &[
 ];
 
 /// The JSON type name, for an error message that names what was found.
-fn type_of(value: &serde_json::Value) -> &'static str {
+pub(crate) fn type_of(value: &serde_json::Value) -> &'static str {
     match value {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "a boolean",

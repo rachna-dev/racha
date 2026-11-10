@@ -545,6 +545,92 @@ mod tests {
         assert_eq!(output.exit_code, 3);
     }
 
+    // ---- the three properties mutation testing found unasserted ---------
+
+    #[test]
+    fn serve_keeps_going_until_the_host_closes_and_runs_every_command() {
+        // The PUBLIC loop, not `serve_one`. Every other test here drives
+        // `serve_one` directly, so `serve`'s body was never executed by the
+        // suite at all — replacing it with `Ok(())` was indistinguishable
+        // from serving a whole session. Found by cargo-mutants, which is
+        // exactly the class of gap it exists to find: `serve` is the entry
+        // point `rachna-agent`'s `main` calls, so "the agent serves nothing
+        // and exits zero" would have shipped silently.
+        let (mut host, mut agent) = joined();
+        for _ in 0..3 {
+            host.send(Kind::Exec, b"true").expect("send");
+        }
+        host.send(Kind::Ping, &[]).expect("ping");
+        drop(host);
+
+        let mut runs = 0;
+        serve(&mut agent, |_command: &str| {
+            runs += 1;
+            Ok(Output {
+                stdout: vec![],
+                stderr: vec![],
+                exit_code: 0,
+            })
+        })
+        .expect("a closed connection ends the session cleanly");
+        assert_eq!(runs, 3, "serve returned before running every command");
+    }
+
+    #[test]
+    fn a_chunk_is_thirty_two_kilobytes_stated_as_a_literal() {
+        // A LITERAL, deliberately not `CHUNK` — this is the one assertion in
+        // the file that must not be written in terms of the constant.
+        //
+        // `output_larger_than_one_message_is_chunked` sizes its payload as
+        // `CHUNK * 2 + 7` and bounds each chunk by `CHUNK`, so when a mutant
+        // turned `32 * 1024` into `32 + 1024` the payload, the bound and the
+        // expected message count all shrank together and the test still
+        // passed. A self-referential assertion cannot detect a change to the
+        // thing it refers to.
+        //
+        // The value matters because the transport caps a body: a CHUNK above
+        // that cap would make every large output fail to send.
+        assert_eq!(CHUNK, 32_768);
+        // Widened to `u64` rather than casting `MAX_BODY` down: a cast is
+        // the "I'll just convert this integer" bug `Cargo.toml` denies, and
+        // widening is exact on every target.
+        assert!(
+            CHUNK as u64 <= u64::from(crate::protocol::MAX_BODY),
+            "a chunk must fit in one message body"
+        );
+    }
+
+    #[test]
+    fn every_agent_error_says_what_went_wrong() {
+        // Nothing asserted any of this text, so `fmt` returning `Ok(())`
+        // without writing survived. These strings are what a user sees when
+        // a session dies, and an empty one is a bug report with no content.
+        assert_eq!(
+            AgentError::HostClosed.to_string(),
+            "the host closed the connection"
+        );
+        let spawn = AgentError::Spawn {
+            command: "npm run dev".to_owned(),
+            why: "no such file".to_owned(),
+        };
+        assert_eq!(
+            spawn.to_string(),
+            r#"could not run "npm run dev": no such file"#
+        );
+        // The transport variant must carry the inner cause through rather
+        // than flattening it to "transport error".
+        let inner = TransportError::from(std::io::Error::other("pipe went away"));
+        let wrapped = AgentError::from(inner).to_string();
+        assert!(
+            wrapped.starts_with("transport: "),
+            "expected a transport prefix, got {wrapped:?}"
+        );
+        assert!(
+            wrapped.contains("pipe went away"),
+            "the underlying cause was dropped: {wrapped:?}"
+        );
+    }
+
     #[test]
     fn a_shell_command_that_does_not_exist_is_127_not_an_error() {
         // `sh -c` itself succeeds; the command inside fails. So this is a

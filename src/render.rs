@@ -117,6 +117,7 @@ fn at_of(error: &ConfigError) -> &str {
         | ConfigError::NotOneOf { at, .. }
         | ConfigError::UnknownKey { at }
         | ConfigError::Missing { at }
+        | ConfigError::Duplicate { at, .. }
         | ConfigError::MalformedEndpoint { at, .. } => at,
     }
 }
@@ -162,6 +163,18 @@ fn describe(error: &ConfigError) -> (String, String, Vec<String>) {
             format!("`{found}` is not a valid {}", quoted(at)),
             "not one of the accepted values".to_owned(),
             vec![format!("accepted: {}", allowed.join(", "))],
+        ),
+
+        ConfigError::Duplicate { at, found } => (
+            format!("`{found}` is declared more than once"),
+            "already declared above".to_owned(),
+            vec![
+                format!("remove one of the two {} entries", quoted(at)),
+                "Nix would accept both silently — one list, two elements, one \
+                 closure — so writing a package twice usually means two \
+                 versions with one mistyped"
+                    .to_owned(),
+            ],
         ),
 
         ConfigError::MalformedEndpoint { at, found } => (
