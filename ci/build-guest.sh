@@ -69,6 +69,19 @@ POSTGRES=$(nix build --no-link --print-out-paths \
 NODE=$(nix build --no-link --print-out-paths \
   "$NODE_PIN#legacyPackages.${NIX_SYSTEM}.nodejs_22" | head -1)
 E2FS=$(nix build --no-link --print-out-paths "nixpkgs#e2fsprogs" | grep -- '-bin$' | head -1)
+# A GUEST-ARCH e2fsprogs as well, because busybox's `mke2fs` writes
+# **ext2** and ships no `mkfs.ext4` — and this kernel has no ext2 driver
+# at all. Measured on the second boot of a project:
+#
+#   ext4 = mount: mounting /dev/vdb on /data failed: Invalid argument
+#   ext2 = mount: mounting /dev/vdb on /data failed: No such device
+#
+# So the guest could not mount the filesystem it had just created, decided
+# the volume was unformatted, and reformatted it — losing the database on
+# every stop/start. The real mke2fs writes ext4, which the kernel mounts.
+GUEST_E2FS=$(nix build --no-link --print-out-paths \
+  "$PINNED#legacyPackages.${NIX_SYSTEM}.e2fsprogs" | grep -- '-bin$' | head -1)
+test -x "$GUEST_E2FS/bin/mke2fs" || { echo "no mke2fs in $GUEST_E2FS" >&2; exit 1; }
 
 # Everything must be a Linux binary, or it fetched the host's build by
 # mistake — which would fail at boot with no useful message.
@@ -160,8 +173,8 @@ test -f "$ROOT/lib/modules/$(basename "$MODULES/lib/modules"/*)/kernel/fs/fuse/v
   exit 1
 }
 
-say "copying closures ($(nix path-info -r "$NODE" "$POSTGRES" | wc -l | tr -d ' ') paths)"
-for path in $(nix path-info -r "$NODE" "$POSTGRES"); do
+say "copying closures ($(nix path-info -r "$NODE" "$POSTGRES" "$GUEST_E2FS" | wc -l | tr -d ' ') paths)"
+for path in $(nix path-info -r "$NODE" "$POSTGRES" "$GUEST_E2FS"); do
   cp -a "$path" "$ROOT/nix/store/" 2>/dev/null || true
 done
 
@@ -185,7 +198,7 @@ echo rachna > "$ROOT/etc/hostname"
 # The guest's init. Store paths are substituted in, because Postgres
 # resolves share/ and lib/ from argv[0] and a /bin symlink breaks it
 # (02 §6.9).
-sed -e "s|@POSTGRES@|$POSTGRES|g" -e "s|@NODE@|$NODE|g" \
+sed -e "s|@POSTGRES@|$POSTGRES|g" -e "s|@NODE@|$NODE|g" -e "s|@E2FS@|$GUEST_E2FS|g" \
   "$(dirname "$0")/../guest/aarch64-init.sh" > "$ROOT/init"
 # CHECKED HERE, because a syntax error in the guest's init is a kernel
 # panic three minutes into a boot ("Attempted to kill init"), with the
@@ -243,6 +256,30 @@ if [ -n "$missing" ]; then
   echo "add them to the busybox applet list above" >&2
   exit 1
 fi
+
+# THE STATE VOLUME MUST BE FORMATTED WITH A FILESYSTEM THE KERNEL CAN
+# MOUNT. busybox's `mke2fs` writes ext2 and this kernel has no ext2
+# driver, so the guest could not mount what it had just created, decided
+# the volume was blank, and reformatted it on EVERY boot — losing the
+# database on every `rachna stop` / `rachna start`.
+#
+# Asserted here because the failure is silent and expensive: the guest
+# prints RACHNA-STATE-FORMATTING either way, and only a second boot tells
+# you the data is gone.
+# The RENDERED init, where `@E2FS@` has already become a store path — so
+# the pattern matches the substituted form, not the template. Checking for
+# `@E2FS@` here failed on a correct build, which is the kind of false
+# positive that gets a check deleted rather than fixed.
+grep -qE '/bin/mke2fs -t ext4' "$ROOT/init" || {
+  echo "the guest init does not format /data as ext4 with the real mke2fs." >&2
+  echo "busybox mke2fs writes ext2, which this kernel cannot mount —" >&2
+  echo "the volume would be reformatted on every boot." >&2
+  exit 1
+}
+test -x "$ROOT/nix/store/$(basename "$GUEST_E2FS")/bin/mke2fs" || {
+  echo "e2fsprogs is not in the image, so the init's mke2fs will not exist" >&2
+  exit 1
+}
 
 chmod +x "$ROOT/init"
 cp "$(dirname "$0")/../guest/todos.js" "$ROOT/opt/rachna/todos.js"

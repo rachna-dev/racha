@@ -32,23 +32,26 @@ mkdir -p /data
 # fine for a state volume; the journal is what ext4 adds, and a snapshot
 # of a paused guest is consistent without it.
 mount_state() {
-  for fs in ext4 ext2; do
-    mount -t $fs /dev/vdb /data 2>/dev/null && return 0
-  done
-  return 1
+  mount -t ext4 /dev/vdb /data 2>/dev/null
 }
 if [ -b /dev/vdb ]; then
-  # WHY the mount failed, before deciding to format. Formatting destroys
-  # data, and this branch was taken on a volume that already held a good
-  # filesystem — the boot counter reset to 1 and Postgres re-ran initdb,
-  # so a stop/start lost everything. "mount failed" is not a reason to
-  # reformat unless we know WHY it failed.
   if ! mount_state; then
-    echo "RACHNA-STATE-MOUNT-FAILED: ext4=$(mount -t ext4 /dev/vdb /data 2>&1 | head -1)"
-    echo "RACHNA-STATE-MOUNT-FAILED: ext2=$(mount -t ext2 /dev/vdb /data 2>&1 | head -1)"
-    echo "RACHNA-STATE-BLKID: $(blkid /dev/vdb 2>&1 | head -1)"
+    # FORMATTED WITH REAL ext4, from e2fsprogs shipped in the image.
+    #
+    # busybox's `mke2fs` writes **ext2** and ships no `mkfs.ext4`, and this
+    # kernel has no ext2 driver at all. So the guest could not mount the
+    # filesystem it had just created:
+    #
+    #   ext4 = mount: /dev/vdb on /data failed: Invalid argument
+    #   ext2 = mount: /dev/vdb on /data failed: No such device
+    #
+    # It concluded the volume was unformatted and reformatted it — on every
+    # boot. The boot counter reset to 1, Postgres re-ran initdb, and the
+    # database was silently recreated each `rachna start`. A persistent
+    # volume that is wiped every boot is worse than no volume, because
+    # nothing says so.
     echo "RACHNA-STATE-FORMATTING"
-    mke2fs -q /dev/vdb 2>/dev/null
+    @E2FS@/bin/mke2fs -t ext4 -q -F /dev/vdb
     mount_state || {
       echo "RACHNA-STATE-EPHEMERAL: cannot use /dev/vdb, data will NOT persist"
       mount -t tmpfs tmpfs /data
