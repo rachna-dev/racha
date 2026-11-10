@@ -142,8 +142,12 @@ if [ -f "$guest_dir/root.img" ]; then
   say "guest image already present"
 else
   say "downloading the guest image (~600 MB)"
+  # The VERSIONED name, matching what `guest.yml` publishes. An unversioned
+  # one would hand this binary whatever image the latest release carries —
+  # and the binary only looks in `guests/$GUEST_VERSION-$arch`, so a newer
+  # image would be downloaded, unpacked, and never found.
   if curl -fsSL -o "$work/guest.tar.gz" \
-       "$base/rachna-guest-$arch.tar.gz" 2>/dev/null; then
+       "$base/rachna-guest-$GUEST_VERSION-$arch.tar.gz" 2>/dev/null; then
     mkdir -p "$guest_dir"
     tar -C "$guest_dir" -xzf "$work/guest.tar.gz"
     # The image ships its own SHA256SUMS, generated at build time.

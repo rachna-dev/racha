@@ -100,16 +100,32 @@ jobs:
           ls -la
           sha256sum Image initramfs.gz root.img | tee SHA256SUMS
 
+      # THE VERSION IS IN THE FILENAME, because the guest image and the
+      # binary are versioned together and the binary looks in a
+      # version-named directory (`08` §4.1.1).
+      #
+      # Without it: `v0.2.0` ships a new guest, the tarball is still called
+      # `rachna-guest-aarch64.tar.gz`, and a user on `v0.1.0` who re-runs
+      # the installer silently gets the NEWER image — which their binary
+      # never looks for, so `rachna start` reports "no guest image" on a
+      # machine that just downloaded one.
+      #
+      # Read from the build script so there is one source of truth; a test
+      # asserts the three copies agree.
       - name: package
         run: |
-          tar -C out -czf "rachna-guest-${{ matrix.arch }}.tar.gz" \
-            Image initramfs.gz root.img SHA256SUMS
-          ls -la rachna-guest-${{ matrix.arch }}.tar.gz
+          version=$(grep -oE '^GUEST_VERSION="\$\{GUEST_VERSION:-[^}]+\}"' \
+            ci/build-guest.sh | sed -E 's/.*:-([^}]+)\}.*/\1/')
+          test -n "$version" || { echo "could not read GUEST_VERSION" >&2; exit 1; }
+          name="rachna-guest-$version-${{ matrix.arch }}.tar.gz"
+          tar -C out -czf "$name" Image initramfs.gz root.img SHA256SUMS
+          ls -la "$name"
+          echo "GUEST_ARCHIVE=$name" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
           name: rachna-guest-${{ matrix.arch }}
-          path: rachna-guest-${{ matrix.arch }}.tar.gz
+          path: ${{ env.GUEST_ARCHIVE }}
           retention-days: 14
 
   # THE REAL GUEST, which cannot be built on a Mac and can be built here.
@@ -184,8 +200,13 @@ jobs:
           body: |
             Guest images for Rachna.
 
-            Download the one matching your host, unpack it into
-            `~/.rachna/guests/<version>-<arch>/`, and `rachna start` will
-            use it instead of building one locally.
+            The filename carries the guest version, and so does the
+            directory it belongs in — unpack
+            `rachna-guest-<version>-<arch>.tar.gz` into
+            `~/.rachna/guests/<version>-<arch>/` and `rachna start` finds
+            it. They must match: the binary looks in one version-named
+            directory and nowhere else.
+
+            `curl -fsSL .../ci/install.sh | sh` does this for you.
 
             Verify with the included `SHA256SUMS` before unpacking.
