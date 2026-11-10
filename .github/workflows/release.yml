@@ -5,22 +5,38 @@
 # can make an aarch64 image) while the CLI must be COMPILED on its target —
 # and on macOS it must be signed there too, because signing needs `codesign`.
 #
-# THE MACOS SIGNING FACT, measured rather than assumed. `02` §4 established
-# that without `com.apple.security.virtualization` VZVirtualMachine.init
-# THROWS, so an unsigned binary dies on first `rachna start`. Testing a
-# simulated download end to end:
+# WHY MACOS NEEDS MORE THAN OTHER CLI TOOLS DO, measured against real
+# releases rather than assumed — the first version of this comment got it
+# wrong twice.
 #
-#   tar/zip round-trip      entitlement survives, signature stays valid
-#   with com.apple.quarantine   `spctl: rejected`, process killed (exit 137)
-#   quarantine removed      runs, entitlement intact
+#   fzf      Developer ID + notarized   runs when quarantined
+#   lsd      ad-hoc signed              runs when quarantined
+#   rachna   ad-hoc signed              BLOCKED: "Apple could not verify…"
 #
-# So the signature is necessary and NOT sufficient: an ad-hoc signature
-# carries the entitlement but does not satisfy Gatekeeper, and a downloaded
-# file is quarantined. The user has to clear that attribute, which is why the
-# release notes say so in the same breath as the download.
+# So ad-hoc signing is NOT the problem — `lsd` ships exactly that and is
+# fine. Nor is it `codesign` stripping a "linker-signed" exemption: a fresh
+# `cargo build` is already plain adhoc before we touch it.
 #
-# Notarizing would remove that step and needs an Apple Developer account plus
-# secrets. Not done here, and the notes do not pretend otherwise.
+# The difference is what rachna LINKS:
+#
+#   AppKit  CoreFoundation  Foundation  **Virtualization**
+#
+# A 6.6 MB ad-hoc binary that links Virtualization.framework and claims
+# `com.apple.security.virtualization`, with no Team ID to vouch for it, is
+# exactly the shape Gatekeeper's malware check exists to stop. `lsd` lists
+# files and links none of that.
+#
+# Two separate things, which the earlier comment conflated:
+#
+#   the ENTITLEMENT is required for the VM to exist at all (`02` §4:
+#   VZVirtualMachine.init throws without it)
+#   GATEKEEPER is about whether a downloaded binary may run, and an ad-hoc
+#   signature does not satisfy it for a binary like this one
+#
+# Notarizing fixes the second and needs an Apple Developer account plus
+# secrets. Until then a downloaded `rachna` needs its quarantine attribute
+# cleared, and the release notes say so next to the download rather than
+# leaving someone to meet a dialog offering to Trash their binary.
 name: release
 
 on:
@@ -151,17 +167,24 @@ jobs:
             ./rachna --version
             ```
 
-            Without this macOS kills the process before it starts — anything
-            downloaded gets a quarantine attribute, and `rachna` is
-            ad-hoc signed rather than notarized. Measured:
-            `spctl` rejects it and the process exits 137 until the attribute
-            is removed.
+            Without this, macOS shows **"Apple could not verify 'rachna' is
+            free of malware"** and offers to move it to the Trash. The
+            process is killed before `main` runs.
 
-            The signature itself matters for a different reason and is
-            already in place: `rachna` needs the
-            `com.apple.security.virtualization` entitlement to create a VM
-            at all, and the release job verifies the packaged binary still
-            carries it.
+            Most CLI tools do not need this step — `lsd`, for instance, is
+            ad-hoc signed like `rachna` and runs straight from a download.
+            `rachna` is treated differently because it links
+            `Virtualization.framework` and claims the
+            `com.apple.security.virtualization` entitlement, which is
+            exactly the shape Gatekeeper's malware check exists to stop when
+            there is no Developer ID behind it.
+
+            That entitlement is not optional: without it
+            `VZVirtualMachine.init` throws and no VM can be created at all.
+            The release job verifies the packaged binary still carries it.
+
+            Notarizing would remove the `xattr` step. It needs an Apple
+            Developer account, and is not set up yet.
 
             ### The guest image
 
