@@ -526,8 +526,13 @@ mod commands {
         if !supervise {
             return spawn_supervisor(context, accepted);
         }
+        // Both discarded on Linux, for the same reason: there is no
+        // supervisor to spawn, so neither the flag nor the approval that
+        // would be forwarded to it has a consumer. Named rather than
+        // `_`-prefixed in the signature, because they ARE used on the
+        // platform the function exists for.
         #[cfg(not(target_os = "macos"))]
-        let _ = supervise;
+        let _ = (supervise, accepted);
         launch_approved(context, policy)
     }
 
@@ -1027,6 +1032,12 @@ mod commands {
     /// Not in `--help`: it is not for users, it is how `start` re-executes
     /// itself. `cli.rs` rejects unknown flags, so this is parsed there
     /// rather than sniffed from `argv` in two places.
+    // macOS ONLY. These three are used solely by the supervisor path, which
+    // exists because a VZ guest lives inside its creating process; Linux
+    // spawns `cloud-hypervisor` as its own process and needs none of it. On
+    // Linux they are dead code, and clippy denies warnings — so CI failed
+    // on a target my local gate cannot see.
+    #[cfg(target_os = "macos")]
     pub(crate) const SUPERVISE_FLAG: &str = "--supervise";
 
     /// Boots the guest for an approved policy.
@@ -1049,12 +1060,14 @@ mod commands {
     ///
     /// Matched against the console rather than inferred from the VM's
     /// state, per `02` §6.3.
+    #[cfg(target_os = "macos")]
     const GUEST_READY_MARKER: &str = "RACHNA-SERVICES-UP";
 
     /// How long to wait for that marker.
     ///
     /// Generous because a first boot runs `initdb`: `05` §5 measured 6.97 s
     /// to a bare NixOS userspace, and a database adds to that.
+    #[cfg(target_os = "macos")]
     const GUEST_BOOT_BUDGET_SECS: u64 = 180;
 
     /// `rachna suspend`.
