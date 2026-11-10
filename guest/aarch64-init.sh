@@ -61,26 +61,22 @@ mkdir -p /data/pgdata /data/run
 chown -R postgres:postgres /data
 echo "RACHNA-STATE-READY"
 
-# THE WORKSPACE is already mounted: the initramfs does it BEFORE
-# switch_root, because mounting virtiofs after the pivot gave a live
-# mount serving an empty tree (`02` §6.12). So this only reports what is
-# there, which is also the evidence that matters — "mounted" is the
-# mechanism's verdict on itself, and the file list is the user's.
-mkdir -p /workspace
-if mount -t virtiofs workspace /workspace 2>/dev/null; then
+# THE WORKSPACE IS ALREADY MOUNTED by the initramfs, before
+# `switch_root` — mounting virtiofs after the pivot gave a live mount
+# serving an empty tree (`02` §6.12). So this REPORTS; it does not mount.
+#
+# The previous version re-ran `mount -t virtiofs workspace /workspace`
+# here and printed "missing" when that failed — which it must, because
+# the share was mounted already. The comment above said "already
+# mounted" while the code below mounted it again: a comment and its code
+# disagreeing, and the code was wrong.
+#
+# Listed with the SHELL'S OWN GLOB, not `find` or `ls`. Both are busybox
+# applets that enumerate with `getdents`, which returns nothing on this
+# mount while reads, `stat` and `df` all work against the host's real
+# files (`02` §6.12).
+if grep -q " /workspace " /proc/mounts 2>/dev/null; then
   echo "RACHNA-WORKSPACE-MOUNTED"
-  # `find`, not `ls`: shellcheck is right that `ls` mishandles odd
-  # filenames, and a project directory is exactly where they appear.
-  # THE SHELL'S OWN GLOB, not `find` or `ls`. Both of those are busybox
-  # applets that enumerate with `getdents`, and on this virtiofs mount
-  # that returns nothing while every other operation works — reads,
-  # `stat`, `df` all succeed against the host's real files.
-  #
-  # That cost a long hunt: "mounted and empty" read as a broken share,
-  # and `02` §6.12 recorded `switch_root` as the cause on the strength of
-  # it. Wrong. The share was never broken; the tool I was listing with
-  # was. `cat /workspace/rachna.nix` returning the host's file is what
-  # settled it.
   echo "RACHNA-WORKSPACE-FILES: $(cd /workspace && echo *)"
 else
   echo "RACHNA-WORKSPACE-MISSING: no virtiofs share tagged 'workspace'"

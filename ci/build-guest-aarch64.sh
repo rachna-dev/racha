@@ -185,7 +185,16 @@ chmod -R u+w "$INITRAMFS/lib/modules"
 find "$INITRAMFS/lib/modules" -name '*.ko.xz' -exec "$XZ/bin/xz" -d {} \;
 
 ( cd "$INITRAMFS"
-  for c in sh mount echo switch_root sleep ls mkdir insmod tr; do
+  # `cat` is NOT optional: the declared-mount loop reads
+  # `/proc/cmdline`, and without it `$(cat /proc/cmdline)` expands to
+  # nothing with the error swallowed by command substitution. That cost a
+  # long detour — the guest looked like it was receiving no command line
+  # while demonstrably acting on `root=/dev/vda`, and I was about to write
+  # up a VZ device-tree theory to explain the contradiction.
+  #
+  # `02` §6.12 is the same lesson: check the measuring tool before
+  # blaming the mechanism.
+  for c in sh mount echo cat switch_root sleep ls mkdir insmod tr; do
     ln -sf busybox "bin/$c"
   done
   cat > init <<'INIT'
@@ -245,6 +254,11 @@ for param in $(cat /proc/cmdline); do
       mkdir -p "/mnt$dest" 2>/dev/null
       if mount -t virtiofs "$tag" "/mnt$dest" 2>/dev/null; then
         echo "RACHNA-MOUNT: $tag -> $dest"
+        # READ THROUGH IT, not just "mounted". `02` §6.12: this mount
+        # reports success while `find`/`ls` return nothing, so "mounted" is
+        # the mechanism's verdict on itself and the file list is the
+        # evidence a user cares about. The shell's own glob is what works.
+        echo "RACHNA-MOUNT-FILES: $tag -> $(cd "/mnt$dest" && echo *)"
       else
         echo "RACHNA-MOUNT-FAILED: $tag -> $dest"
       fi
