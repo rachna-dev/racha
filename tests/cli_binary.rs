@@ -153,6 +153,92 @@ fn no_invocation_panics() {
     }
 }
 
+#[test]
+fn a_command_that_cannot_work_exits_non_zero() {
+    // THE gap mutation testing found. `every_defined_exit_code_is_one_of_the_set`
+    // asserts the code is in `{0, 64, 70, 74, 77}` — and **0 is in that
+    // set**, so a mutant replacing any command's body with
+    // `Default::default()` (which is `ExitCode::SUCCESS`) satisfies it.
+    // Roughly a dozen survivors were exactly that shape.
+    //
+    // So this asserts the code is NOT zero where it must not be. Each case
+    // is a situation a user reaches by accident, and a script branching on
+    // success would do the wrong thing for every one of them.
+    let dir = std::env::temp_dir().join(format!("rachna-nonzero-{}", std::process::id()));
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&home).expect("scratch dirs");
+
+    let binary = env!("CARGO_BIN_EXE_rachna");
+    let run = |args: &[&str]| -> (String, i32) {
+        let out = Command::new(binary)
+            .args(args)
+            .current_dir(&dir)
+            .env("HOME", &home)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the binary runs");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.code().unwrap_or(-1),
+        )
+    };
+
+    // No `rachna.nix` at all. `start` must refuse — it has nothing to
+    // evaluate — and so must `resume`, which is asked to restore something
+    // that does not exist.
+    //
+    // `suspend` is NOT in this list, and that is the contract rather than
+    // an oversight: with nothing running it prints "nothing to suspend" and
+    // exits 0, because `00` §5.2 makes these commands safe to type when you
+    // are unsure what is going on. Asserting non-zero there failed, which
+    // is the test learning the contract rather than the contract being
+    // wrong.
+    for args in [vec!["start"], vec!["resume"], vec!["resume", "a-name"]] {
+        let (text, code) = run(&args);
+        assert_ne!(
+            code, 0,
+            "`{args:?}` succeeded with no rachna.nix, which it cannot have \
+             done:\n{text}"
+        );
+    }
+
+    // And `suspend` with nothing running SUCCEEDS, saying so. Asserted
+    // rather than merely excluded above, so the distinction is pinned: a
+    // future change making it refuse would be a behaviour change, not a
+    // silent one.
+    let (text, code) = run(&["suspend"]);
+    assert_eq!(
+        code, 0,
+        "`suspend` with nothing running should succeed:\n{text}"
+    );
+    assert!(
+        text.contains("nothing to suspend"),
+        "`suspend` succeeded without saying there was nothing to do:\n{text}"
+    );
+
+    // An unusable snapshot name is refused specifically, not merely
+    // non-zero: 77 is "the policy or the request is wrong".
+    let (text, code) = run(&["resume", "../escape"]);
+    assert_eq!(
+        code, 77,
+        "a path-shaped snapshot name was not refused:\n{text}"
+    );
+
+    // And the two that DO work without a config still work — otherwise this
+    // test would pass against a binary that refuses everything.
+    for args in [vec!["--version"], vec!["--help"], vec!["status"]] {
+        let (text, code) = run(&args);
+        assert_eq!(code, 0, "`{args:?}` should succeed anywhere:\n{text}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Whether `nix` is on PATH, and therefore whether the policy gate is
 /// reachable at all.
 ///

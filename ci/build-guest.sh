@@ -187,7 +187,7 @@ chmod +w "$ROOT/bin/busybox"
   for c in sh mount umount echo cat ls sleep poweroff mkdir chown su id ps \
            grep env ln date head tail cut printf touch ip ifconfig hostname \
            mke2fs mkfs.ext2 blkid sync halt reboot insmod lsmod find uname stat df \
-           ps tr wc; do
+           ps tr wc timeout; do
     ln -sf busybox "bin/$c"
   done )
 

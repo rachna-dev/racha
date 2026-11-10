@@ -139,8 +139,17 @@ BOOT=$((BOOT+1))
 echo $BOOT > /data/boot-count
 echo "RACHNA-BOOT-NUMBER: $BOOT"
 
+# A SHELL-LEVEL TIMEOUT around each node call, because the init BLOCKS on
+# them and a hung request stops the whole guest: the console goes silent,
+# no ticks appear, and `rachna status` reports a booted environment as
+# though nothing is wrong.
+#
+# `timeout` rather than node's own `setTimeout`. Both were tried: a bare
+# setTimeout keeps node's event loop alive past the response, and calling
+# process.exit from inside a callback left the init with nothing after it.
+# A timeout outside the process cannot be defeated by anything inside it.
 add_todo() {
-  @NODE@/bin/node -e "
+  timeout 15 @NODE@/bin/node -e "
     const http=require('http');
     const body=JSON.stringify({title:process.argv[1]});
     const r=http.request({host:'127.0.0.1',port:3000,path:'/todos',method:'POST',
@@ -150,7 +159,7 @@ add_todo() {
   " "$1"
 }
 list_todos() {
-  @NODE@/bin/node -e "
+  timeout 15 @NODE@/bin/node -e "
     require('http').get({host:'127.0.0.1',port:3000,path:'/todos'},(res)=>{
       let d='';res.on('data',c=>d+=c);res.on('end',()=>console.log('TODOS '+d));
     }).on('error',e=>console.log('LIST-FAILED '+e.message));
