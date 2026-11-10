@@ -466,6 +466,35 @@ mod tests {
     }
 
     #[test]
+    fn every_copy_of_the_guest_version_agrees() {
+        // THE VERSION IS WRITTEN IN THREE PLACES, and all three must say
+        // the same thing or the product silently breaks:
+        //
+        //   src/layout.rs      where the binary LOOKS for an image
+        //   ci/build-guest.sh  where a local build WRITES one
+        //   ci/install.sh      where the installer UNPACKS one
+        //
+        // A bump to one alone is not a build error. The installer would
+        // fetch the image into a directory the binary never reads, and
+        // `rachna start` would report "no guest image" on a machine that
+        // had just downloaded one — a failure that looks like a bad
+        // download and is a version mismatch.
+        //
+        // Read from the FILES rather than restated here: a constant
+        // compared against another constant tests nothing.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for script in ["ci/build-guest.sh", "ci/install.sh"] {
+            let text = std::fs::read_to_string(root.join(script))
+                .unwrap_or_else(|_| panic!("{script} is part of the repo"));
+            assert!(
+                text.contains(GUEST_VERSION),
+                "{script} does not mention GUEST_VERSION ({GUEST_VERSION}), so \
+                 it writes or reads a directory the binary will not look in"
+            );
+        }
+    }
+
+    #[test]
     fn the_guest_version_matches_the_flake_it_claims() {
         // `GUEST_VERSION` names the directory the image lands in, and the
         // image is built from `guest/flake.nix`'s pinned nixpkgs. If the
