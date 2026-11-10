@@ -33,19 +33,23 @@ jobs:
       matrix:
         include:
           - name: ubuntu 24.04 (x86_64)
+            key: ubuntu-2404
             os: ubuntu-24.04
           - name: ubuntu 22.04 (x86_64)
+            key: ubuntu-2204
             os: ubuntu-22.04
           # Arch is not a GitHub-hosted runner, so it comes as a container.
           # Worth having: it is a rolling release, so it catches breakage from
           # newer glibc/kernel/toolchain before the LTS distros do.
           - name: arch (rolling, x86_64)
+            key: arch-rolling
             os: ubuntu-latest
             container: archlinux:latest
           # Apple silicon only. Rachna does not support Intel Macs, so there
           # is no x86_64 macOS runner here — testing one would gate on a
           # platform we do not ship for.
           - name: macos (arm64)
+            key: macos-arm64
             os: macos-latest
     steps:
       - name: arch prerequisites
@@ -58,7 +62,16 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}
+          # An explicit comma-free `matrix.key`, not `matrix.name`: a cache
+          # key cannot contain a comma, and `arch (rolling, x86_64)` has
+          # one — so that platform failed the step with
+          #
+          #   ValidationError: Key Validation Error: … cannot contain commas
+          #
+          # The job still passed, because a cache miss is not a build
+          # failure. It just rebuilt everything from scratch, every run,
+          # silently.
+          key: ${{ matrix.key }}
       - run: ci/gate.sh gate
         shell: bash
 
