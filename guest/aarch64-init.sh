@@ -38,7 +38,15 @@ mount_state() {
   return 1
 }
 if [ -b /dev/vdb ]; then
+  # WHY the mount failed, before deciding to format. Formatting destroys
+  # data, and this branch was taken on a volume that already held a good
+  # filesystem — the boot counter reset to 1 and Postgres re-ran initdb,
+  # so a stop/start lost everything. "mount failed" is not a reason to
+  # reformat unless we know WHY it failed.
   if ! mount_state; then
+    echo "RACHNA-STATE-MOUNT-FAILED: ext4=$(mount -t ext4 /dev/vdb /data 2>&1 | head -1)"
+    echo "RACHNA-STATE-MOUNT-FAILED: ext2=$(mount -t ext2 /dev/vdb /data 2>&1 | head -1)"
+    echo "RACHNA-STATE-BLKID: $(blkid /dev/vdb 2>&1 | head -1)"
     echo "RACHNA-STATE-FORMATTING"
     mke2fs -q /dev/vdb 2>/dev/null
     mount_state || {
