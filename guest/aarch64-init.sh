@@ -14,13 +14,6 @@ hostname rachna 2>/dev/null || true
 ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up 2>/dev/null || true
 
 echo "RACHNA-GUEST-ALIVE"
-# The guest's own identity, on the console. Kept because "what operating
-# system is in there" is a fair question whose answer should come from the
-# guest rather than from a document about it — and because the answer is
-# NOT a distribution: there is no /etc/os-release, and pid 1 is this
-# script rather than systemd. `#1-NixOS` in the uname only means nixpkgs
-# compiled the kernel.
-echo "RACHNA-UNAME: $(uname -a)"
 
 # The state volume. THE guest formats it on first use: an unformatted
 # disk is what `provision_state` hands us (a sparse file), because mke2fs
@@ -60,21 +53,13 @@ fi
 mkdir -p /data/pgdata /data/run
 chown -R postgres:postgres /data
 echo "RACHNA-STATE-READY"
+echo "RACHNA-UNAME: $(uname -a)"
 
-# THE WORKSPACE IS ALREADY MOUNTED by the initramfs, before
-# `switch_root` — mounting virtiofs after the pivot gave a live mount
-# serving an empty tree (`02` §6.12). So this REPORTS; it does not mount.
-#
-# The previous version re-ran `mount -t virtiofs workspace /workspace`
-# here and printed "missing" when that failed — which it must, because
-# the share was mounted already. The comment above said "already
-# mounted" while the code below mounted it again: a comment and its code
-# disagreeing, and the code was wrong.
-#
-# Listed with the SHELL'S OWN GLOB, not `find` or `ls`. Both are busybox
-# applets that enumerate with `getdents`, which returns nothing on this
-# mount while reads, `stat` and `df` all work against the host's real
-# files (`02` §6.12).
+# THE WORKSPACE is mounted by the initramfs, before switch_root — virtiofs
+# after the pivot serves an empty tree (`02` §6.12). So this reports; it
+# does not mount. Listed with the shell's own glob, because `find` and
+# `ls` are busybox applets that enumerate with getdents, which returns
+# nothing on this mount while reads and stat work.
 if grep -q " /workspace " /proc/mounts 2>/dev/null; then
   echo "RACHNA-WORKSPACE-MOUNTED"
   echo "RACHNA-WORKSPACE-FILES: $(cd /workspace && echo *)"
@@ -117,10 +102,10 @@ fi
 # The todos app.
 # `|| exit` because running the app from the wrong directory would
 # look like a missing file rather than a failed cd.
-# `/opt/rachna`, NOT `/workspace`. The demo app ships in the image, and
-# the workspace is now the user's real project mounted over virtiofs —
-# running from there would mean the app vanishes the moment a real
-# project appears, which is the normal case rather than an edge one.
+# `/opt/rachna`, NOT `/workspace`. The demo app ships in the image and
+# `/workspace` is the user's real project over virtiofs — running from
+# there would mean the app vanishes the moment a real project appears,
+# which is the normal case rather than an edge one.
 cd /opt/rachna || exit 1
 @NODE@/bin/node todos.js >/data/todos.log 2>&1 &
 i=0
@@ -143,32 +128,13 @@ BOOT=$((BOOT+1))
 echo $BOOT > /data/boot-count
 echo "RACHNA-BOOT-NUMBER: $BOOT"
 
-# EXPLICIT process.exit, not just a timeout. A bare `setTimeout` keeps
-# node's event loop alive after the response has already arrived, so
-# `add_todo` printed ADDED and then never returned — the init blocked on a
-# node that had finished its work. Measured: the console stopped dead after
-# one todo, with no timeout firing, which is what "finished but not exited"
-# looks like from outside.
-#
-# A TIMEOUT on each request, because the init BLOCKS on these. Errors were
-# handled and a silent server was not: if the connection is accepted and no
-# response comes, node waits forever, the init never reaches its loop, and
-# the guest looks stopped while being perfectly alive — "rachna status"
-# then reports "stopped" for a booted environment.
-#
-# The comment lives HERE, not inside the node string. Put inside it, the
-# words were still in a double-quoted SHELL string, so a backtick pair
-# became command substitution and the guest died with
-# `/init: line 144: rachna: not found`. `sh -n` passed it, because valid
-# shell is not the same as intended shell.
 add_todo() {
   @NODE@/bin/node -e "
     const http=require('http');
     const body=JSON.stringify({title:process.argv[1]});
     const r=http.request({host:'127.0.0.1',port:3000,path:'/todos',method:'POST',
       headers:{'content-type':'application/json','content-length':body.length}},(res)=>{
-      let d='';res.on('data',c=>d+=c);res.on('end',()=>{console.log('ADDED '+d);process.exit(0);});});
-    r.setTimeout(5000,()=>{console.log('ADD-TIMEOUT');process.exit(1);});
+      let d='';res.on('data',c=>d+=c);res.on('end',()=>console.log('ADDED '+d));});
     r.on('error',e=>console.log('ADD-FAILED '+e.message));r.end(body);
   " "$1"
 }
@@ -176,13 +142,22 @@ list_todos() {
   @NODE@/bin/node -e "
     require('http').get({host:'127.0.0.1',port:3000,path:'/todos'},(res)=>{
       let d='';res.on('data',c=>d+=c);res.on('end',()=>console.log('TODOS '+d));
-    }).on('error',e=>{console.log('LIST-FAILED '+e.message);process.exit(1);})
-      .setTimeout(5000,function(){console.log('LIST-TIMEOUT');process.exit(1);});
+    }).on('error',e=>console.log('LIST-FAILED '+e.message));
   "
 }
 
 # On the FIRST boot, write some todos. On later boots, only read — so a
 # list that still has them proves the data survived.
+# THE APP'S OWN LOG, on the console, BEFORE the first request. It was
+# going to /data/todos.log, which nothing ever read — so every error the
+# app produced was invisible, and a POST that hung looked like a guest
+# problem for most of a session. A log nobody reads is not a log.
+#
+# Printed here rather than after the requests, because the hang happens
+# DURING them: a probe placed afterwards never runs, which is the mistake
+# that cost the previous build.
+echo "RACHNA-APP-LOG: $(tail -5 /data/todos.log 2>&1 | tr '\n' '|')"
+
 if [ "$BOOT" = "1" ]; then
   add_todo "write the VZ backend"; sleep 1
   add_todo "boot a guest with postgres"; sleep 1

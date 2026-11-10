@@ -94,8 +94,8 @@ cleanup() {
 }
 trap cleanup EXIT
 ROOT="$WORK/root"
-#  holds the shipped demo app;  is a MOUNT
-# POINT for the user's project, so it stays empty in the image.
+# "/opt/rachna" holds the shipped demo app; "/workspace" is a MOUNT POINT
+# for the user's project, so it stays empty in the image.
 mkdir -p "$ROOT"/{bin,sbin,dev,proc,sys,tmp,etc,var,run,workspace,data,opt/rachna,nix/store}
 
 # ONLY THE TWO MODULES THE GUEST LOADS. `cp -a` of the whole tree copied
@@ -147,7 +147,8 @@ chmod +w "$ROOT/bin/busybox"
   # host's e2fsprogs in the guest's boot path.
   for c in sh mount umount echo cat ls sleep poweroff mkdir chown su id ps \
            grep env ln date head tail cut printf touch ip ifconfig hostname \
-           mke2fs mkfs.ext2 blkid sync halt reboot insmod lsmod find uname stat df; do
+           mke2fs mkfs.ext2 blkid sync halt reboot insmod lsmod find uname stat df \
+           ps tr wc; do
     ln -sf busybox "bin/$c"
   done )
 
@@ -166,42 +167,57 @@ sed -e "s|@POSTGRES@|$POSTGRES|g" -e "s|@NODE@|$NODE|g" \
 # duplicated `else`/`fi` and cost a full build-and-boot cycle to find.
 sh -n "$ROOT/init" || { echo "the guest init has a syntax error" >&2; exit 1; }
 
-# The EMBEDDED JAVASCRIPT too. `sh -n` validates the shell and says nothing
-# about the `node -e "…"` bodies inside it — and a JS error there does not
-# print an error, it HANGS: the init blocks on node, never reaches its
-# loop, and the guest looks stopped while being perfectly alive. Measured
-# with a missing timeout, which wedged the init at a different todo on each
-# boot.
-# The HOST's node, not `$NODE` — that one is aarch64-linux for the guest
-# and cannot execute here ("Exec format error", measured). Any node will
-# do: this parses text, it does not run the guest's code.
-HOST_NODE=$(command -v node || true)
-if [ -z "$HOST_NODE" ]; then
-  HOST_NODE=$(nix build --no-link --print-out-paths "nixpkgs#nodejs_22")/bin/node
+# EVERY COMMAND THE INIT CALLS MUST EXIST IN THE IMAGE. busybox returns
+# nothing for an applet that was never linked, and command substitution
+# swallows the error — so `$(tail -5 /data/todos.log | tr '\n' '|')`
+# expands to an empty string and the console shows a probe that looks
+# like a measurement and is a blank.
+#
+# `tr` was missing for most of a session. Every diagnostic in this file
+# pipes through it, so every one of them read empty, and I diagnosed
+# against blanks: concluded the app had not started, then that /data was
+# gone, then that the filesystem had been truncated. The third time this
+# shape of bug has cost hours (`02` §6.12 is the other two).
+#
+# A diagnostic that silently produces nothing is worse than no
+# diagnostic, because it gets believed.
+# SHELL BUILTINS are excluded: `cd`, `echo` and friends are the shell
+# itself, not applets, and flagging them made this check fail its first
+# real run. A check whose false positives block the build gets disabled,
+# which is how a good check becomes no check.
+# Every word in a COMMAND POSITION: line start, after a pipe, after `&&`
+# or `||`, or just inside `$(`. The first version only looked at `$(`
+# openings — and `tr` is always reached through a pipe, so removing `tr`
+# deliberately did not trip the check. A check that cannot fail is not a
+# check, which is the same lesson as the test that passed with the gate
+# removed.
+#
+# Shell BUILTINS are excluded: flagging `cd` made this fail its first
+# real run, and a check whose false positives block the build gets
+# disabled.
+# Keywords and builtins are not applets. Also excluded: anything inside a
+# `node -e "…"` block, because that is JavaScript and `res.on` is not a
+# command the image is missing.
+BUILTINS=" cd echo read test printf set export trap exit eval shift true false \
+break continue return local if then else elif fi for while until do done case \
+esac in function select time "
+missing=""
+# shellcheck disable=SC2013  # word splitting is the point: one applet per word
+for applet in $(sed -E '/node -e "/,/^  "/d; s/#.*//' "$ROOT/init" \
+                | grep -ohE '(^|[|]|&&|[|][|]|[$][(]|;)[[:space:]]*[a-z][a-z0-9_-]*([[:space:]]|$)' \
+                | sed -E 's/^[^a-z]*//; s/[[:space:]]*$//' | sort -u); do
+  case "$BUILTINS" in *" $applet "*) continue ;; esac
+  # Only words that LOOK like tools we might have forgotten: anything
+  # already present, or defined as a function in the init, is fine.
+  grep -qE "^$applet\(\)" "$ROOT/init" && continue
+  test -e "$ROOT/bin/$applet" || missing="$missing $applet"
+done
+if [ -n "$missing" ]; then
+  echo "the guest init calls commands the image does not have:$missing" >&2
+  echo "add them to the busybox applet list above" >&2
+  exit 1
 fi
-ROOT_INIT="$ROOT/init" "$HOST_NODE" - <<'JSCHECK' || { echo "the guest init's embedded JS is broken" >&2; exit 1; }
-const fs = require('fs'), os = require('os'), path = require('path');
-const text = fs.readFileSync(process.env.ROOT_INIT || '/dev/stdin', 'utf8');
-const blocks = [...text.matchAll(/node -e "([\s\S]*?)\n  "/g)];
-if (blocks.length === 0) { console.error('no embedded JS found — did the shape change?'); process.exit(1); }
-for (const [i, m] of blocks.entries()) {
-  // BACKTICKS AND $(...) INSIDE THE NODE STRING are command
-  // substitution, because the JS lives in a double-quoted SHELL string.
-  // A comment containing `rachna status` made the shell run `rachna`,
-  // and the guest died with "/init: line 144: rachna: not found" — while
-  // `sh -n` passed it, since valid shell is not intended shell.
-  if (/[`]/.test(m[1])) {
-    console.error(`embedded JS block ${i}: contains a backtick, which the shell will run as a command. Use quotes instead.`);
-    process.exit(1);
-  }
-  const js = m[1].replace(/\$1/g, 'X');
-  const file = path.join(os.tmpdir(), `rachna-initjs-${i}.js`);
-  fs.writeFileSync(file, js);
-  try { new (require('vm').Script)(js, { filename: file }); }
-  catch (e) { console.error(`embedded JS block ${i}: ${e.message}`); process.exit(1); }
-}
-console.log(`  embedded JS: ${blocks.length} block(s) parse`);
-JSCHECK
+
 chmod +x "$ROOT/init"
 cp "$(dirname "$0")/../guest/todos.js" "$ROOT/opt/rachna/todos.js"
 
