@@ -79,7 +79,16 @@ WORK=$(mktemp -d)
 # the question.
 cleanup() {
   status=$?
-  chmod -R u+w "$WORK" 2>/dev/null || true
+  # `chmod -R` over the copied nix store paths took MINUTES on a tree of
+  # 55 closures and made the build look hung long after the image was
+  # written — I killed one mid-`install`, which left a root.img whose ext4
+  # superblock was valid and whose journal was not (`Could not load
+  # journal inode`). That is `24` §6's trap exactly: a partial artefact
+  # that inspects as complete.
+  #
+  # `find -exec chmod` on DIRECTORIES only is what `rm -rf` actually needs
+  # — a read-only file in a writable directory deletes fine.
+  find "$WORK" -type d -exec chmod u+w {} + 2>/dev/null || true
   rm -rf "$WORK" 2>/dev/null || true
   exit $status
 }
@@ -214,6 +223,8 @@ else
   echo "RACHNA-INITRAMFS-WORKSPACE-FAILED"
 fi
 
+echo "RACHNA-CMDLINE: $(cat /proc/cmdline)"
+
 # DECLARED MOUNTS, from `rachna.mount=tag:/path` on the kernel command
 # line. The host cannot tell VZ where a share belongs — a share is
 # identified by tag and the guest decides — so the command line carries
@@ -256,16 +267,46 @@ mkdir -p "$OUT"
 CONTENT_MB=$(du -sm "$ROOT" | cut -f1)
 IMAGE_MB=$(( CONTENT_MB + CONTENT_MB / 5 + 128 ))
 say "root image: ${CONTENT_MB}MB of content -> ${IMAGE_MB}MB image"
+# BUILT AT ITS DESTINATION, not built in $WORK and copied. The copy
+# needed the image's size TWICE — 1.2 GB of free disk for a 615 MB
+# artefact — and that is what ran out, three times on this machine.
+#
+# The trade is that a failed build leaves a partial file where the good
+# one belongs, so it is removed first and verified after: `$OUT/root.img`
+# existing is never by itself evidence that it is usable.
+mkdir -p "$OUT"
+rm -f "$OUT/root.img"
 python3 -c "
-import sys
-f = open('$WORK/root.img', 'wb')
+f = open('$OUT/root.img', 'wb')
 f.truncate($IMAGE_MB * 1024 * 1024)
 f.close()"
-"$E2FS/bin/mke2fs" -t ext4 -d "$ROOT" -F -L rachna-root -q "$WORK/root.img"
+"$E2FS/bin/mke2fs" -t ext4 -d "$ROOT" -F -L rachna-root -q "$OUT/root.img"
 
 install -m 0644 "$KERNEL" "$OUT/Image"
 install -m 0644 "$WORK/initramfs.gz" "$OUT/initramfs.gz"
-install -m 0644 "$WORK/root.img" "$OUT/root.img"
+chmod 0644 "$OUT/root.img"
+
+# VERIFY WHAT WAS INSTALLED, not what was built. A truncated copy leaves a
+# root.img whose ext4 superblock is intact and whose journal is not — the
+# guest then fails with `EXT4-fs (vda): Could not load journal inode` and
+# drops to an initramfs shell. Measured, after a build was interrupted
+# mid-`install`.
+#
+# That is `24` §6's finding again: a partial artefact that inspects as
+# complete. The superblock alone is not evidence, so the sizes are
+# compared and `e2fsck` is asked.
+for artefact in Image initramfs.gz root.img; do
+  test -s "$OUT/$artefact" || {
+    echo "$OUT/$artefact is missing or empty" >&2
+    exit 1
+  }
+done
+# `-n` is read-only, so this answers rather than repairs: a filesystem we
+# would have to repair is one we should rebuild.
+"$E2FS/bin/e2fsck" -n -f "$OUT/root.img" >/dev/null 2>&1 || {
+  echo "the installed root.img does not pass e2fsck — rebuild rather than ship it" >&2
+  exit 1
+}
 
 # A caller that pipes this script's output gets the PIPELINE's status, not
 # the script's — `… | tail -6` reports `tail`'s 0 over a failed build. That
