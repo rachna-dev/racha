@@ -281,6 +281,17 @@ pub fn check(
         )
     });
 
+    // `!summary.is_empty()` is the reason a config granting NOTHING starts
+    // without a keypress, and it is deliberate: there is nothing to accept.
+    // `00` §3.10c's gate exists so a user cannot accept permissions "in the
+    // same breath as asking to start", and a policy with no grants carries
+    // no permissions to accept.
+    //
+    // Worth stating because it looks like a bypass. Testing `--accept` at a
+    // TTY against an all-`none` config, I read "started" with no prompt and
+    // concluded the flag had defeated the gate — the test was too weak to
+    // exercise it. With one real grant the flag is ignored and `a` is
+    // required, which is the property §3.10c actually asks for.
     let needs_input = !summary.is_empty() && (!approved || snapshot_disagrees);
 
     // ONE reason drives both the header and the prompt's sentence, so the

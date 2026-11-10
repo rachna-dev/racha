@@ -71,7 +71,12 @@ serde_json = { version = "1.0.154", features = ["raw_value"] }
 #                     adds `bitflags`/`errno`/`libc`, all three already in
 #                     the tree via rusqlite.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process", "termios"] }
+# `pty` is for ONE test: `00` §3.10c's `--accept` must do nothing at a
+# terminal, and `interactive` comes from `stdin().is_terminal()` — so the
+# property is only reachable through a real pty. The first version shelled
+# out to python3, which does not exist in the devenv shell where tests run,
+# so it skipped silently forever.
+rustix = { version = "1", features = ["process", "termios", "pty"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-virtualization = { version = "0.3.2", features = [

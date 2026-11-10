@@ -290,6 +290,172 @@ fn start_returns_rather_than_blocking_forever() {
 }
 
 #[test]
+fn accept_is_ignored_at_a_terminal_and_required_in_a_pipeline() {
+    // `00` §3.10c, in bold: **"`--accept` does nothing at a TTY, and that
+    // is deliberate. It is the CI path and only the CI path."** A flag that
+    // worked interactively would let a user accept a cloned config's
+    // permissions in the same breath as asking to start it — never seeing
+    // the summary — which is the one outcome that section exists to
+    // prevent.
+    //
+    // **Nothing asserted this**, and I used `rachna start --accept` as my
+    // demo command throughout a session, presenting the forbidden shortcut
+    // as the normal way to use the tool. The enforcement was right; the
+    // habit was not, and an unasserted property is one nobody is told
+    // about when it breaks.
+    //
+    // BOTH halves are tested, and the TTY half needs a real pty: removing
+    // the `!context.interactive` guard left a pipe-only version of this
+    // test passing, because a pipe exercises the branch where the flag is
+    // SUPPOSED to work. A test that cannot fail when the property is
+    // removed is not testing it.
+    let dir = std::env::temp_dir().join(format!("rachna-accept-{}", std::process::id()));
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&home).expect("scratch dirs");
+    // A config with a REAL grant: an empty grant set needs no
+    // acknowledgement (there is nothing to accept), so testing against one
+    // would pass whatever the flag did. That is exactly the weak test that
+    // first made me think the gate had been defeated.
+    std::fs::write(
+        dir.join("rachna.nix"),
+        "{\n  tier = \"allowlist\";\n  profile = \"development\";\n           network.allow = [ \"registry.npmjs.org:443\" ];\n}\n",
+    )
+    .expect("config");
+
+    let binary = env!("CARGO_BIN_EXE_rachna");
+    let run = |args: &[&str]| -> (String, i32) {
+        let out = Command::new(binary)
+            .args(args)
+            .current_dir(&dir)
+            .env("HOME", &home)
+            // The pipe IS the condition under test: no terminal.
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the binary runs");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.code().unwrap_or(-1),
+        )
+    };
+
+    // WITHOUT the flag, piped: refused, and it says which refusal this is
+    // rather than leaving a pipeline to guess.
+    let (text, code) = run(&["start"]);
+    assert_eq!(code, 77, "a piped start was not refused: {text}");
+    assert!(
+        text.contains("not a terminal"),
+        "the refusal does not say why: {text}"
+    );
+    assert!(
+        text.contains("--accept"),
+        "the refusal does not name the action a pipeline can take: {text}"
+    );
+    // And the summary is shown BEFORE the refusal: `00` §3.10c wants the
+    // grants visible every time, not only when they are accepted.
+    assert!(
+        text.contains("registry.npmjs.org:443"),
+        "the grants were not shown: {text}"
+    );
+
+    // WITH the flag, piped: the CI path, so it gets past the gate. It may
+    // still fail later for want of a guest image — what matters is that it
+    // is no longer the GATE refusing.
+    let (accepted, _) = run(&["start", "--accept"]);
+    assert!(
+        !accepted.contains("not a terminal"),
+        "--accept did not satisfy the gate in a pipeline: {accepted}"
+    );
+
+    // AT A TERMINAL the flag must do nothing, and this is the half that
+    // matters: `interactive` comes from `stdin().is_terminal()`, so only a
+    // real pty reaches the branch `00` §3.10c cares about.
+    //
+    // Driven from RUST, via `rustix::pty`. The first version shelled out to
+    // `python3`, which does not exist in the devenv shell where tests run —
+    // so it captured nothing and skipped silently, forever. A test that
+    // cannot run in the project's own test environment is not a test.
+    // A SEPARATE HOME. The piped `--accept` above RECORDED an approval, so
+    // by this point the grant set is approved and there is nothing left to
+    // gate — the first version of this test asserted against "running
+    // under these grants" and failed for its own earlier side effect.
+    // Approval is per-project-per-machine state, and a test that shares it
+    // between cases is testing the order it happens to run them in.
+    let fresh_home = dir.join("home-tty");
+    std::fs::create_dir_all(&fresh_home).expect("a fresh home");
+
+    let pty =
+        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+            .expect("a pty");
+    rustix::pty::grantpt(&pty).expect("grantpt");
+    rustix::pty::unlockpt(&pty).expect("unlockpt");
+    let name = rustix::pty::ptsname(&pty, Vec::new()).expect("ptsname");
+    let slave_path =
+        std::path::PathBuf::from(String::from_utf8(name.into_bytes()).expect("a utf-8 tty name"));
+
+    // The child's stdin IS the pty slave, which is what makes
+    // `is_terminal()` true for it.
+    let slave_in = std::fs::File::open(&slave_path).expect("open the slave");
+    let slave_out = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&slave_path)
+        .expect("open the slave for writing");
+    let mut child = Command::new(binary)
+        .args(["start", "--accept"])
+        .current_dir(&dir)
+        .env("HOME", &fresh_home)
+        .stdin(std::process::Stdio::from(slave_in))
+        .stdout(std::process::Stdio::from(
+            slave_out.try_clone().expect("clone"),
+        ))
+        .stderr(std::process::Stdio::from(slave_out))
+        .spawn()
+        .expect("spawn under a pty");
+
+    // Read until the question appears, it starts anyway, or time runs out.
+    // No key is ever sent: the point is that it must WAIT.
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut buffer = [0_u8; 4096];
+    while std::time::Instant::now() < deadline {
+        match rustix::io::read(&pty, &mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                seen.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                if seen.contains("[a] accept") || seen.contains("started") {
+                    break;
+                }
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        !seen.trim().is_empty(),
+        "the pty captured nothing, so this asserted on no evidence"
+    );
+    assert!(
+        seen.contains("[a] accept"),
+        "`start --accept` at a TTY did not ask for the keypress, so the flag \
+         is a shortcut past the gate — `00` §3.10c forbids exactly this. \
+         Got:\n{seen}"
+    );
+    assert!(
+        !seen.contains("started"),
+        "`start --accept` STARTED at a TTY with no keypress:\n{seen}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn snapshot_names_are_validated_before_anything_is_written() {
     // A snapshot name becomes a FILENAME, so `../escape` is an attempt to
     // write outside the project whether or not anyone meant it that way —
