@@ -50,7 +50,23 @@ Early days: the CLI and the macOS backend work, the guest is assembled from
 prebuilt packages rather than the NixOS system it is designed around, and
 `guest/guest.nix` is where that is headed once a Linux builder is in the loop.
 
-## Trying it
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rachna-dev/racha/main/ci/install.sh | sh
+```
+
+Fetches the binary and the Linux guest image for your machine, verifies both
+against published checksums, and puts `rachna` in `~/.local/bin`. No Nix
+needed.
+
+Downloading the binary in a **browser** instead will get you a macOS malware
+dialog — `rachna` links Virtualization.framework, which Gatekeeper
+scrutinises when no Developer ID vouches for it. `curl` does not set the
+quarantine attribute, so the installer sidesteps that; if you do download it
+by hand, run `xattr -d com.apple.quarantine rachna` first.
+
+## Building from source
 
 Needs [Nix](https://nixos.org/download) with flakes, and macOS on Apple Silicon.
 
