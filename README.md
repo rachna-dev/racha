@@ -56,10 +56,14 @@ Needs [Nix](https://nixos.org/download) with flakes, and macOS on Apple Silicon.
 
 ```sh
 git clone git@github.com:rachna-dev/racha.git && cd racha
-devenv shell -- cargo build
-./ci/sign-macos.sh target/debug/rachna     # the VZ entitlement
-bash ci/build-guest.sh                     # the guest image, ~10 min, 615 MB
+devenv shell -- build          # compiles and signs it for Virtualization.framework
+bash ci/build-guest.sh         # the guest image, ~10 min, 615 MB
 ```
+
+Use `devenv shell -- build` rather than `cargo build` on macOS: the binary
+needs the `com.apple.security.virtualization` entitlement to create a VM at
+all, and every relink discards it. The signature is ad-hoc — no certificate
+or Apple account involved.
 
 Then in any project directory:
 

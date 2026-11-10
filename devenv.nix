@@ -74,16 +74,49 @@
     # the same checks — they cannot drift on what "passing" means.
     check.exec = "exec ./ci/gate.sh gate";
 
+    # BUILD AND SIGN, together, because the two cannot be separated on
+    # macOS and separating them is a trap I fell into repeatedly.
+    #
+    # `02` §4 measured that without `com.apple.security.virtualization`
+    # `VZVirtualMachine.init` THROWS — so an unsigned `rachna` does not
+    # degrade, it dies. And every `cargo build`, `cargo clippy --fix` and
+    # `cargo mutants` run relinks the binary and discards the signature,
+    # leaving a `rachna start` that fails with
+    #
+    #   this host cannot run that configuration: … doesn't have the
+    #   "com.apple.security.virtualization" entitlement
+    #
+    # which reads as a host or entitlement problem and is neither.
+    #
+    # Signing is ad-hoc (`codesign --sign -`): no certificate, no Apple
+    # account, nothing to configure. There was never a reason for it to be
+    # a separate step the caller has to remember.
+    build.exec = ''
+      set -euo pipefail
+      cargo build "$@"
+      ./ci/sign-macos.sh target/debug/rachna
+    '';
+
     fix.exec = ''
       set -euo pipefail
       cargo fmt --all
       cargo clippy --workspace --all-targets --fix --allow-dirty -- -D warnings
+      # Relinks, so it strips the signature. See `build` above.
+      ./ci/sign-macos.sh target/debug/rachna
     '';
 
     # Mutation testing is the honest measure for a security boundary: 100%
     # line coverage with assertion-free tests proves nothing. A surviving
     # mutant means the suite does not actually check that behaviour.
-    mutants.exec = "exec ./ci/gate.sh mutants";
+    # Not `exec`: mutation testing rebuilds the binary many times and
+    # leaves it unsigned, so the shell re-signs afterwards. A `mutants` run
+    # that leaves you unable to start a VM is a trap, and it caught me
+    # twice in one session.
+    mutants.exec = ''
+      set -euo pipefail
+      ./ci/gate.sh mutants
+      ./ci/sign-macos.sh target/debug/rachna
+    '';
 
     # Coverage is deliberately NOT in this shell.
     #
