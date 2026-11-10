@@ -21,7 +21,10 @@ description = "A declarative, isolated development environment you can pause, re
 #
 # Still 0.0.0 while there is no guest to pin to; becomes e.g. 0.1.0+26.11 at
 # the first release that ships one.
-version = "0.0.0"
+# `Major.Minor.Patch+<NixOS release>` per 08 §4.1.1: the guest version is
+# PART of the rachna version, because two people with the same rachna.nix
+# must get the same machine and the guest comes with the binary.
+version = "0.1.0+26.11"
 edition = "2021"
 # Raised from 1.82 on evidence, not preference. 1.82 silently capped `time` at
 # 0.3.44 — inside the range of RUSTSEC-2026-0009, a stack-exhaustion DoS whose

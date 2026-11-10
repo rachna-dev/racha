@@ -81,8 +81,8 @@ trap cleanup EXIT
 say "downloading the binary"
 curl -fsSL -o "$work/rachna.tar.gz" "$base/rachna-$target.tar.gz" \
   || die "could not download rachna-$target.tar.gz from $base.
-     If this is a fresh repository there may be no release yet — build from
-     source instead: https://github.com/$REPO#trying-it"
+     There may be no release published yet. Build from source instead:
+     https://github.com/$REPO#building-from-source"
 
 # VERIFIED, not trusted. The checksum is published beside the archive, so
 # this catches a truncated download and a mirror that serves something else.
