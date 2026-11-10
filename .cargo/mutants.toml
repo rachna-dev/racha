@@ -87,6 +87,24 @@ exclude_re = [
   "replace commands::status ->",
   "in commands::spawn_supervisor\\b",
   "replace commands::spawn_supervisor ->",
+  # `rachna-agent`'s entry point and its stdio adapter.
+  #
+  # `main` builds a `Connection` over the process's real stdin/stdout and
+  # serves until the socket closes — there is no return value a test can
+  # observe without a guest on the other end.
+  #
+  # `Stdio` is three one-line delegations to `std::io::stdin()` and
+  # `stdout()`, which `Stdio::new()` hardcodes. A test cannot inject a
+  # substitute, so `read`/`write`/`flush` returning `Ok(0)` is
+  # indistinguishable from correct behaviour at this level. The PROTOCOL
+  # they carry is tested: `transport.rs` has 21 tests over a pipe and
+  # `agent.rs` 14, which is where framing and dispatch actually live.
+  #
+  # The fix, if this is ever worth it, is for `Stdio::new` to take its two
+  # halves as parameters — then a pipe can stand in and these four die.
+  "rachna-agent.rs.*replace main ->",
+  "replace <impl Read for Stdio>",
+  "replace <impl Write for Stdio>",
   "in commands::launch_approved\\b",
   "replace commands::launch_approved ->",
   "in commands::launch_or_supervise\\b",
