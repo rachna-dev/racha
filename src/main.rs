@@ -1541,4 +1541,107 @@ mod commands {
     /// Re-exported so `start` can name the type in its own error path.
     #[allow(unused_imports, reason = "used by the match above")]
     use supervise as _;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // `main.rs` HAD NO UNIT TESTS, and mutation testing found ~68
+        // survivors here as a result — every one a condition the suite
+        // cannot distinguish when flipped.
+        //
+        // Most of this module does I/O: it spawns VMs, prints, and returns
+        // `ExitCode`. But not all of it. `project_slug`, `path_hash` and
+        // `now_millis` are pure, and the only reason their mutants survived
+        // is that nothing called them from a test. "Hard to test" was doing
+        // the work of "impossible", and these three were neither.
+
+        #[test]
+        fn a_project_slug_is_a_safe_single_path_component() {
+            // It names a directory under `~/.rachna`, so anything that is
+            // not alphanumeric, `-` or `_` must not survive into it —
+            // `ProjectId` refuses the rest, and refusing a directory whose
+            // name the user did not choose would be a poor trade.
+            // The shape is `<safe-name>-<hash>`, so the name is a PREFIX
+            // rather than the whole string — the hash suffix is what keeps
+            // two checkouts of the same project apart.
+            assert!(project_slug(Path::new("/x/todo-api")).starts_with("todo-api-"));
+            assert!(project_slug(Path::new("/x/my project")).starts_with("my-project-"));
+            assert!(project_slug(Path::new("/x/a.b/")).starts_with("a-b-"));
+            assert!(project_slug(Path::new("/x/wörk")).starts_with("w-rk-"));
+
+            // A path with no final component still yields something usable,
+            // because the alternative is a directory called "".
+            assert!(project_slug(Path::new("/")).starts_with("project-"));
+
+            // UNDERSCORE SURVIVES AS UNDERSCORE, and hyphen as hyphen.
+            // Both are in the safe set, and a mutant turning the `||`
+            // between them into `&&` is invisible for `-` (not `_`, so it
+            // maps to `-` either way) while mapping `_` to `-`. Only an
+            // input containing `_` tells the two apart — which is why
+            // every other case above left that mutant alive.
+            assert!(project_slug(Path::new("/x/my_app")).starts_with("my_app-"));
+            assert!(project_slug(Path::new("/x/a-b_c")).starts_with("a-b_c-"));
+
+            // SAME NAME, DIFFERENT PATH, DIFFERENT SLUG. This is the
+            // property the hash exists for: `08` §4.1 wants two checkouts
+            // of one project to keep separate state.
+            assert_ne!(
+                project_slug(Path::new("/Users/one/todo-api")),
+                project_slug(Path::new("/Users/two/todo-api")),
+                "two checkouts share a state directory"
+            );
+
+            // And every character of every result is in the safe set —
+            // asserted as a PROPERTY, so a future change to the mapping
+            // cannot quietly widen it.
+            for raw in ["/x/a b", "/x/../y", "/x/!@#", "/x/tab\there"] {
+                let slug = project_slug(Path::new(raw));
+                assert!(
+                    slug.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                    "{raw:?} produced {slug:?}, which is not a safe component"
+                );
+            }
+        }
+
+        #[test]
+        fn the_path_hash_distinguishes_paths_and_is_stable() {
+            // THE property that matters: two checkouts of the same project
+            // must not share state, so different paths must hash
+            // differently. A hash returning a constant would collapse them
+            // into one directory — which is what the surviving mutants did.
+            let a = path_hash(Path::new("/Users/one/todo-api"));
+            let b = path_hash(Path::new("/Users/two/todo-api"));
+            assert_ne!(a, b, "two checkouts hashed the same");
+
+            // Stable across calls, because the directory name must not move
+            // between runs.
+            assert_eq!(a, path_hash(Path::new("/Users/one/todo-api")));
+
+            // FNV-1a's offset basis, so an empty input is not zero — a
+            // mutant replacing the loop body would give 0x811c9dc5 for
+            // everything, and this pins the distinction.
+            assert_eq!(path_hash(Path::new("")), 0x811c_9dc5);
+            assert_ne!(path_hash(Path::new("a")), 0x811c_9dc5);
+
+            // One byte apart must not collide, which is the weakest thing a
+            // hash has to do and the thing an arithmetic mutant breaks.
+            assert_ne!(path_hash(Path::new("/a/b")), path_hash(Path::new("/a/c")));
+        }
+
+        #[test]
+        fn now_millis_is_a_plausible_wall_clock() {
+            // Three mutants replaced this with 0, 1 and -1. Each is caught
+            // by a bound rather than by a literal: the audit trail orders
+            // events by this value, so a constant makes every entry
+            // simultaneous.
+            let now = now_millis();
+            // 2020-01-01 in millis — any real clock is past it.
+            assert!(now > 1_577_836_800_000, "now_millis returned {now}");
+            // And monotonic across two calls, allowing equality because a
+            // fast machine can read the same millisecond twice.
+            assert!(now_millis() >= now, "time went backwards");
+        }
+    }
 }
