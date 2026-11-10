@@ -1,0 +1,171 @@
+# Builds the `rachna` binary users download, signed for the platform it runs on.
+#
+# WHY A SEPARATE WORKFLOW from `guest.yml`: the guest image is architecture-
+# independent to BUILD (it is assembled by substitution, so an x86_64 runner
+# can make an aarch64 image) while the CLI must be COMPILED on its target —
+# and on macOS it must be signed there too, because signing needs `codesign`.
+#
+# THE MACOS SIGNING FACT, measured rather than assumed. `02` §4 established
+# that without `com.apple.security.virtualization` VZVirtualMachine.init
+# THROWS, so an unsigned binary dies on first `rachna start`. Testing a
+# simulated download end to end:
+#
+#   tar/zip round-trip      entitlement survives, signature stays valid
+#   with com.apple.quarantine   `spctl: rejected`, process killed (exit 137)
+#   quarantine removed      runs, entitlement intact
+#
+# So the signature is necessary and NOT sufficient: an ad-hoc signature
+# carries the entitlement but does not satisfy Gatekeeper, and a downloaded
+# file is quarantined. The user has to clear that attribute, which is why the
+# release notes say so in the same breath as the download.
+#
+# Notarizing would remove that step and needs an Apple Developer account plus
+# secrets. Not done here, and the notes do not pretend otherwise.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'attach the binaries to a draft release'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: rachna · ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Compiled on its own target: a cross-compiled macOS binary could
+          # not be signed by the runner that built it, and `rusqlite` is
+          # bundled C.
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: build
+        run: cargo build --release --locked
+
+      # The entitlement, on macOS only. `ci/sign-macos.sh` verifies its own
+      # work — it re-reads the signature and fails if the entitlement is
+      # absent — because a `codesign` that silently produced an unentitled
+      # binary is the exact failure this guards.
+      - name: sign (macOS)
+        if: runner.os == 'macOS'
+        run: ./ci/sign-macos.sh target/release/rachna
+
+      # Asserted AFTER packaging rather than before, because the question is
+      # whether what we SHIP is signed. A zip round-trip was measured to
+      # preserve the entitlement; this proves it per build rather than
+      # trusting that measurement forever.
+      - name: package
+        run: |
+          mkdir -p dist
+          cp target/release/rachna dist/
+          tar -C dist -czf "rachna-${{ matrix.target }}.tar.gz" rachna
+          shasum -a 256 "rachna-${{ matrix.target }}.tar.gz" \
+            > "rachna-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: the shipped binary is signed (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rm -rf check && mkdir check
+          tar -C check -xzf "rachna-${{ matrix.target }}.tar.gz"
+          codesign -v check/rachna
+          codesign -d --entitlements - check/rachna 2>&1 \
+            | grep -q 'com.apple.security.virtualization' || {
+              echo "the packaged binary lost its entitlement — it would die" >&2
+              echo "on the user's first \`rachna start\`" >&2
+              exit 1
+            }
+          echo "  packaged binary carries the virtualization entitlement"
+
+      # It runs at all. A binary that builds and cannot execute on the
+      # runner that built it will not execute for a user either.
+      - name: it runs
+        run: ./target/release/rachna --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rachna-${{ matrix.target }}
+          path: |
+            rachna-${{ matrix.target }}.tar.gz
+            rachna-${{ matrix.target }}.tar.gz.sha256
+          retention-days: 14
+
+  release:
+    name: attach to a draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rachna-*
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            rachna-*.tar.gz
+            rachna-*.tar.gz.sha256
+          body: |
+            ## Install
+
+            Download the archive for your machine, then:
+
+            ```sh
+            tar -xzf rachna-<target>.tar.gz
+            shasum -a 256 -c rachna-<target>.tar.gz.sha256
+            ```
+
+            ### macOS: clear the quarantine flag
+
+            ```sh
+            xattr -d com.apple.quarantine rachna
+            ./rachna --version
+            ```
+
+            Without this macOS kills the process before it starts — anything
+            downloaded gets a quarantine attribute, and `rachna` is
+            ad-hoc signed rather than notarized. Measured:
+            `spctl` rejects it and the process exits 137 until the attribute
+            is removed.
+
+            The signature itself matters for a different reason and is
+            already in place: `rachna` needs the
+            `com.apple.security.virtualization` entitlement to create a VM
+            at all, and the release job verifies the packaged binary still
+            carries it.
+
+            ### The guest image
+
+            `rachna` also needs a Linux guest image, published separately by
+            the `guest` workflow. Unpack it into
+            `~/.rachna/guests/<version>-<arch>/`, or build one locally with
+            `bash ci/build-guest.sh`.
