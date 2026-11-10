@@ -196,7 +196,7 @@ pub const GUEST_HOME: &str = "/home/dev";
 ///
 /// `{ source = "~/.zshrc"; target = "~/.zshrc"; }` therefore reads exactly
 /// as intended and resolves to two different absolute paths. Requiring
-/// `/Users/shriyans/.zshrc` instead is both tedious and **not portable**: a
+/// `/Users/you/.zshrc` instead is both tedious and **not portable**: a
 /// teammate cloning the repo has a different username, so the config breaks
 /// for them — and `00` §3.2 makes the file the thing a team shares.
 ///
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn a_leading_tilde_resolves_and_nothing_else_does() {
         // `~/.zshrc` is how a person writes this, and requiring
-        // `/Users/shriyans/.zshrc` is not just tedious — it is NOT
+        // `/Users/you/.zshrc` is not just tedious — it is NOT
         // PORTABLE. A teammate cloning the repo has a different username,
         // so the config breaks for them, and `00` §3.2 makes the file the
         // thing a team shares.
