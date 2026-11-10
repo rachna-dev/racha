@@ -23,3 +23,17 @@ devenv.local.yaml
 # cargo-mutants working output
 /mutants.out
 /mutants.out.old
+
+# Internal working notes: kept on disk, never committed.
+#
+# "Don't add it in git but still keep them" — and the first attempt at that
+# DESTROYED them. `git-filter-repo` stripped them from all 185 commits and
+# rewrote every ref including the backup branch made beforehand, after which
+# the objects were garbage-collected. They were rebuilt from this session's
+# transcript, which had every heredoc that wrote them.
+#
+# So they are ignored rather than removed: present in the working tree,
+# absent from history. A master copy also lives in ~/rachna-design-docs.
+/design-docs/
+/AGENTS.md
+/idea.md

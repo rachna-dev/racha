@@ -139,17 +139,46 @@ BOOT=$((BOOT+1))
 echo $BOOT > /data/boot-count
 echo "RACHNA-BOOT-NUMBER: $BOOT"
 
-# A SHELL-LEVEL TIMEOUT around each node call, because the init BLOCKS on
-# them and a hung request stops the whole guest: the console goes silent,
-# no ticks appear, and `rachna status` reports a booted environment as
-# though nothing is wrong.
+# BOUNDED WITH A BACKGROUND JOB AND `kill`, not with `timeout`.
 #
-# `timeout` rather than node's own `setTimeout`. Both were tried: a bare
-# setTimeout keeps node's event loop alive past the response, and calling
-# process.exit from inside a callback left the init with nothing after it.
-# A timeout outside the process cannot be defeated by anything inside it.
+# `timeout` KILLS THIS INIT. Measured with a two-part probe, because the
+# one-line version died before printing anything and so could not
+# distinguish "timeout is broken" from "the probe is broken":
+#
+#   RACHNA-PROBE-1: before timeout      <- printed
+#   timeout 1 sleep 5                   <- init dies here
+#   RACHNA-PROBE-2: ...                 <- never printed
+#
+# The applet exists in the image, so this is not a missing-command error;
+# busybox's `timeout` as PID 1's child does something this shell does not
+# survive. Three earlier attempts at bounding these calls each made things
+# worse — node's `setTimeout` keeps the event loop alive past the response,
+# and `process.exit` from a callback left the init with nothing after it —
+# so this one is built from pieces already proven to work here: `&`, `$!`,
+# `sleep` and `kill`.
+#
+# The bound matters because the init BLOCKS on these calls: a hung request
+# silences the console, stops the tick loop, and leaves `rachna status`
+# reporting a booted environment as though nothing were wrong.
+run_bounded() {
+  limit=$1; shift
+  "$@" &
+  job=$!
+  i=0
+  while [ $i -lt "$limit" ]; do
+    kill -0 "$job" 2>/dev/null || break
+    sleep 1
+    i=$((i+1))
+  done
+  if kill -0 "$job" 2>/dev/null; then
+    echo "RACHNA-CALL-TIMEOUT after ${limit}s"
+    kill -9 "$job" 2>/dev/null
+  fi
+  wait "$job" 2>/dev/null
+}
+
 add_todo() {
-  timeout 15 @NODE@/bin/node -e "
+  run_bounded 15 @NODE@/bin/node -e "
     const http=require('http');
     const body=JSON.stringify({title:process.argv[1]});
     const r=http.request({host:'127.0.0.1',port:3000,path:'/todos',method:'POST',
@@ -159,7 +188,7 @@ add_todo() {
   " "$1"
 }
 list_todos() {
-  timeout 15 @NODE@/bin/node -e "
+  run_bounded 15 @NODE@/bin/node -e "
     require('http').get({host:'127.0.0.1',port:3000,path:'/todos'},(res)=>{
       let d='';res.on('data',c=>d+=c);res.on('end',()=>console.log('TODOS '+d));
     }).on('error',e=>console.log('LIST-FAILED '+e.message));
@@ -177,6 +206,13 @@ list_todos() {
 # DURING them: a probe placed afterwards never runs, which is the mistake
 # that cost the previous build.
 echo "RACHNA-APP-LOG: $(tail -5 /data/todos.log 2>&1 | tr '\n' '|')"
+
+# DOES `timeout` ACTUALLY WORK HERE? The demo hung on a build where the
+# applet was present and the wrapper was in place, which means the wrapper
+# did not fire — so the applet itself is the thing to doubt. busybox builds
+# can omit applets even when the symlink exists, and an absent applet
+# prints nothing and returns success-ish, which is indistinguishable from
+# working.
 
 if [ "$BOOT" = "1" ]; then
   add_todo "write the VZ backend"; sleep 1

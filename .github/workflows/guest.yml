@@ -112,6 +112,52 @@ jobs:
           path: rachna-guest-${{ matrix.arch }}.tar.gz
           retention-days: 14
 
+  # THE REAL GUEST, which cannot be built on a Mac and can be built here.
+  #
+  # `guest/guest.nix` is the NixOS system Rachna is designed around —
+  # systemd, declared services, devenv in the image. Building it wants 240
+  # derivations for aarch64-linux, which an aarch64-darwin host refuses by
+  # platform policy (nix will not run a Linux derivation on Darwin even when
+  # the work is writing a text file). That is why `ci/build-guest.sh` exists
+  # and assembles a stand-in by substitution instead.
+  #
+  # A NATIVE ARM LINUX RUNNER has no such problem, and GitHub now provides
+  # one. So the blocker was only ever local — stated as a platform limit for
+  # most of this project's life, and never actually tried in CI.
+  #
+  # `continue-on-error` while it is being proven: the stand-in is what ships
+  # today, and a red job on an unproven path would stop the pipeline that
+  # publishes a working image. Remove it once this is green.
+  real-guest:
+    name: the real NixOS guest (aarch64)
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          df -h / | tail -1
+
+      - name: build guest#boot-bundle
+        run: |
+          nix build --no-link --print-out-paths \
+            ./guest#packages.aarch64-linux.boot-bundle
+
+      # What it produced, because "the build succeeded" and "there is a
+      # bootable kernel and root" are different claims.
+      - name: what it produced
+        run: |
+          out=$(nix build --no-link --print-out-paths \
+            ./guest#packages.aarch64-linux.boot-bundle)
+          ls -la "$out"
+
   release:
     name: attach to a draft release
     needs: build

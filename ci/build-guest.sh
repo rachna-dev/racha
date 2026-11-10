@@ -187,7 +187,7 @@ chmod +w "$ROOT/bin/busybox"
   for c in sh mount umount echo cat ls sleep poweroff mkdir chown su id ps \
            grep env ln date head tail cut printf touch ip ifconfig hostname \
            mke2fs mkfs.ext2 blkid sync halt reboot insmod lsmod find uname stat df \
-           ps tr wc timeout; do
+           ps tr wc timeout kill; do
     ln -sf busybox "bin/$c"
   done )
 
@@ -237,7 +237,7 @@ sh -n "$ROOT/init" || { echo "the guest init has a syntax error" >&2; exit 1; }
 # Keywords and builtins are not applets. Also excluded: anything inside a
 # `node -e "…"` block, because that is JavaScript and `res.on` is not a
 # command the image is missing.
-BUILTINS=" cd echo read test printf set export trap exit eval shift true false \
+BUILTINS=" cd echo read test printf set export trap exit eval shift wait true false \
 break continue return local if then else elif fi for while until do done case \
 esac in function select time "
 missing=""
