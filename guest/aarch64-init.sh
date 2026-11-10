@@ -143,13 +143,32 @@ BOOT=$((BOOT+1))
 echo $BOOT > /data/boot-count
 echo "RACHNA-BOOT-NUMBER: $BOOT"
 
+# EXPLICIT process.exit, not just a timeout. A bare `setTimeout` keeps
+# node's event loop alive after the response has already arrived, so
+# `add_todo` printed ADDED and then never returned — the init blocked on a
+# node that had finished its work. Measured: the console stopped dead after
+# one todo, with no timeout firing, which is what "finished but not exited"
+# looks like from outside.
+#
+# A TIMEOUT on each request, because the init BLOCKS on these. Errors were
+# handled and a silent server was not: if the connection is accepted and no
+# response comes, node waits forever, the init never reaches its loop, and
+# the guest looks stopped while being perfectly alive — "rachna status"
+# then reports "stopped" for a booted environment.
+#
+# The comment lives HERE, not inside the node string. Put inside it, the
+# words were still in a double-quoted SHELL string, so a backtick pair
+# became command substitution and the guest died with
+# `/init: line 144: rachna: not found`. `sh -n` passed it, because valid
+# shell is not the same as intended shell.
 add_todo() {
   @NODE@/bin/node -e "
     const http=require('http');
     const body=JSON.stringify({title:process.argv[1]});
     const r=http.request({host:'127.0.0.1',port:3000,path:'/todos',method:'POST',
       headers:{'content-type':'application/json','content-length':body.length}},(res)=>{
-      let d='';res.on('data',c=>d+=c);res.on('end',()=>console.log('ADDED '+d));});
+      let d='';res.on('data',c=>d+=c);res.on('end',()=>{console.log('ADDED '+d);process.exit(0);});});
+    r.setTimeout(5000,()=>{console.log('ADD-TIMEOUT');process.exit(1);});
     r.on('error',e=>console.log('ADD-FAILED '+e.message));r.end(body);
   " "$1"
 }
@@ -157,7 +176,8 @@ list_todos() {
   @NODE@/bin/node -e "
     require('http').get({host:'127.0.0.1',port:3000,path:'/todos'},(res)=>{
       let d='';res.on('data',c=>d+=c);res.on('end',()=>console.log('TODOS '+d));
-    }).on('error',e=>console.log('LIST-FAILED '+e.message));
+    }).on('error',e=>{console.log('LIST-FAILED '+e.message);process.exit(1);})
+      .setTimeout(5000,function(){console.log('LIST-TIMEOUT');process.exit(1);});
   "
 }
 

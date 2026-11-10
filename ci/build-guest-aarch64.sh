@@ -165,6 +165,43 @@ sed -e "s|@POSTGRES@|$POSTGRES|g" -e "s|@NODE@|$NODE|g" \
 # reason nowhere in the output. Measured: an editing slip left a
 # duplicated `else`/`fi` and cost a full build-and-boot cycle to find.
 sh -n "$ROOT/init" || { echo "the guest init has a syntax error" >&2; exit 1; }
+
+# The EMBEDDED JAVASCRIPT too. `sh -n` validates the shell and says nothing
+# about the `node -e "…"` bodies inside it — and a JS error there does not
+# print an error, it HANGS: the init blocks on node, never reaches its
+# loop, and the guest looks stopped while being perfectly alive. Measured
+# with a missing timeout, which wedged the init at a different todo on each
+# boot.
+# The HOST's node, not `$NODE` — that one is aarch64-linux for the guest
+# and cannot execute here ("Exec format error", measured). Any node will
+# do: this parses text, it does not run the guest's code.
+HOST_NODE=$(command -v node || true)
+if [ -z "$HOST_NODE" ]; then
+  HOST_NODE=$(nix build --no-link --print-out-paths "nixpkgs#nodejs_22")/bin/node
+fi
+ROOT_INIT="$ROOT/init" "$HOST_NODE" - <<'JSCHECK' || { echo "the guest init's embedded JS is broken" >&2; exit 1; }
+const fs = require('fs'), os = require('os'), path = require('path');
+const text = fs.readFileSync(process.env.ROOT_INIT || '/dev/stdin', 'utf8');
+const blocks = [...text.matchAll(/node -e "([\s\S]*?)\n  "/g)];
+if (blocks.length === 0) { console.error('no embedded JS found — did the shape change?'); process.exit(1); }
+for (const [i, m] of blocks.entries()) {
+  // BACKTICKS AND $(...) INSIDE THE NODE STRING are command
+  // substitution, because the JS lives in a double-quoted SHELL string.
+  // A comment containing `rachna status` made the shell run `rachna`,
+  // and the guest died with "/init: line 144: rachna: not found" — while
+  // `sh -n` passed it, since valid shell is not intended shell.
+  if (/[`]/.test(m[1])) {
+    console.error(`embedded JS block ${i}: contains a backtick, which the shell will run as a command. Use quotes instead.`);
+    process.exit(1);
+  }
+  const js = m[1].replace(/\$1/g, 'X');
+  const file = path.join(os.tmpdir(), `rachna-initjs-${i}.js`);
+  fs.writeFileSync(file, js);
+  try { new (require('vm').Script)(js, { filename: file }); }
+  catch (e) { console.error(`embedded JS block ${i}: ${e.message}`); process.exit(1); }
+}
+console.log(`  embedded JS: ${blocks.length} block(s) parse`);
+JSCHECK
 chmod +x "$ROOT/init"
 cp "$(dirname "$0")/../guest/todos.js" "$ROOT/opt/rachna/todos.js"
 
