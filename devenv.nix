@@ -9,8 +9,8 @@
 {
   # Rachna — a declarative, isolated development environment manager.
   #
-  # Build order and the reasoning behind it: design-docs/01-ARCHITECTURE.md §7.
-  # Everything measured so far: design-docs/15-FINDINGS.md.
+  # The gate below is the contract: fmt, clippy, tests, and mutation testing
+  # as the real bar for policy and path code.
 
   # https://devenv.sh/languages/
   languages.rust = {
@@ -50,11 +50,11 @@
       shellcheck
     ]
     ++ lib.optionals pkgs.stdenv.isLinux [
-      # Chosen Linux backend (design-docs/03 §1), with virtiofsd for the
+      # The chosen Linux backend, with virtiofsd for the
       # workspace mount. On macOS the backend is Virtualization.framework,
       # which needs no package — but a macOS build MUST be ad-hoc codesigned
       # with com.apple.security.virtualization or it CRASHES rather than
-      # failing gracefully (design-docs/02 §5).
+      # failing gracefully.
       cloud-hypervisor
       virtiofsd
     ];

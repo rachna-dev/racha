@@ -304,20 +304,29 @@ fn every_start_prints_the_access_summary_even_when_approved() {
     assert_eq!(code, 0, "init failed");
     let config = dir.join("rachna.nix");
     let text = std::fs::read_to_string(&config).expect("rachna.nix");
-    // WIDENED WITH A MOUNT, not a network allowlist. A network grant is
-    // refused before the gate on any host that cannot enforce it — Linux
-    // reports "this host cannot enforce it: rachna-netd is not built yet"
-    // — so the gate never runs and the assertions below describe output
-    // that was never produced. This test passed on macOS and failed in the
-    // `devenv` job for that reason.
+    // `tier = "none"` AND a mount. Two separate things are needed and I
+    // only fixed one before:
     //
-    // The grant only has to be non-empty and enforceable everywhere.
+    //   the grant set must be NON-EMPTY, or `needs_input` is false and the
+    //   gate never asks — hence the mount
+    //
+    //   the tier must be `none`, because `needs_tap` requires an enforced
+    //   allowlist whenever `tier.permits_any_network()`, which is true for
+    //   EVERY tier except `none` — even `allowlist` with an empty list.
+    //   On Linux that capability is missing (`rachna-netd` is not built),
+    //   so `start` refuses before the gate and every assertion below
+    //   describes output that was never produced.
+    //
+    // Switching the grant to a mount while leaving `tier = "allowlist"`
+    // fixed neither test. The init template sets that tier, so it has to be
+    // replaced rather than appended to.
     std::fs::write(
         &config,
-        text.replace(
-            "network.allow = [ ];",
-            "network.allow = [ ];\n  filesystem.mounts = [ { source = \"/tmp\"; } ];",
-        ),
+        text.replace("tier = \"allowlist\";", "tier = \"none\";")
+            .replace(
+                "network.allow = [ ];",
+                "network.allow = [ ];\n  filesystem.mounts = [ { source = \"/tmp\"; } ];",
+            ),
     )
     .expect("widen");
 
@@ -450,7 +459,7 @@ fn accept_is_ignored_at_a_terminal_and_required_in_a_pipeline() {
         //
         // The grant only has to be non-empty: `needs_input` requires a
         // non-empty summary, and a mount is enforceable on every platform.
-        "{\n  tier = \"allowlist\";\n  profile = \"development\";\n  \
+        "{\n  tier = \"none\";\n  profile = \"development\";\n  \
          filesystem.mounts = [ { source = \"/tmp\"; } ];\n}\n",
     )
     .expect("config");

@@ -1,5 +1,6 @@
 # Rachna — ONE crate. Modules, not crates, until something forces a split.
-# See AGENTS.md "One crate until forced" and design-docs/01-ARCHITECTURE.md §1
+# One crate until forced apart: an earlier twelve-crate split cost more in
+# cross-crate plumbing than it bought in boundaries.
 # for why the previous twelve-crate workspace was deleted.
 
 [package]
@@ -7,7 +8,9 @@ name = "rachna"
 description = "A declarative, isolated development environment you can pause, resume, and throw away."
 # Major.Minor.Patch+<NixOS release> — the guest system version is carried in
 # the rachna version, so the pairing is visible wherever a version appears
-# (design-docs/08-POLICY-AND-STORE.md §4.1.1).
+# The guest version is PART of this version, because two people with the
+# same rachna.nix must get the same machine and the guest ships with the
+# binary.
 #
 # `+` not `-`: SemVer reads a hyphen as a PRE-RELEASE, which would sort before
 # 0.4.0 and make `cargo add` skip it. `+` is build metadata — ignored for
@@ -32,7 +35,7 @@ edition = "2021"
 # Edition-2024 crates need >=1.85 regardless of their declared MSRV, because
 # the resolver does not filter on edition: you get a version that resolves and
 # then fails to compile. 1.82 was buying nothing and costing a live advisory.
-# See design-docs/17-DEPENDENCIES.md.
+# Each dependency below is justified where it is declared.
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shriyans/rachna"
@@ -49,7 +52,7 @@ serde_json = { version = "1.0.154", features = ["raw_value"] }
 # existed and before any code used them. `time` and `uuid` were referenced
 # nowhere at all.
 #
-# The comparison lives in design-docs/17-DEPENDENCIES.md; each dependency is
+# Each dependency is
 # added in the commit that first uses it.
 
 # macOS only: Virtualization.framework is an Objective-C API, and a Linux
@@ -57,7 +60,7 @@ serde_json = { version = "1.0.154", features = ["raw_value"] }
 # surface is SAFE Rust, which is why this is a crate rather than a shim —
 # `Cargo.toml` denies unsafe_code, and a binding needing unsafe per call
 # would mean weakening that in the most security-sensitive module
-# (design-docs/17-DEPENDENCIES.md, "macOS VZ binding").
+# (the macOS VZ binding).
 # Signalling a process we did not spawn. `std` cannot: `Child::kill` needs
 # the `Child`, and `stop` runs in a *different process* from `start` — so the
 # PID comes from a file, not a handle. Measured the alternatives:
@@ -157,7 +160,7 @@ cast_sign_loss = "warn"
 
 [profile.release]
 # A shim binary is spawned per editor tool invocation, so startup cost matters
-# more than peak throughput (design-docs/00-PRODUCT.md §6.6).
+# more than peak throughput.
 lto = "thin"
 codegen-units = 1
 strip = true

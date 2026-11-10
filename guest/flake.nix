@@ -1,21 +1,24 @@
 {
   # The pinned NixOS guest.
   #
-  # `design-docs/05-SPIKE-NIXOS-GUEST.md` is the recipe, and it carries four
-  # bugs that cost real time. Each is fixed HERE rather than left to a caller,
-  # because three of the four fail silently or confusingly:
+  # Four bugs are fixed HERE rather than left to a caller, because three of
+  # the four fail silently or confusingly. Each was measured:
   #
-  #   §4.1  never mount a host share over a directory systemd owns —
-  #         `/var/lib` shadows `/var/lib/systemd` and logind fails
-  #         238/STATE_DIRECTORY on every boot
-  #   §4.2  two renamed options on this nixpkgs: `systemd.extraConfig` ->
-  #         `systemd.settings.Manager`, `services.journald.extraConfig` ->
-  #         `services.journald.settings.Journal`
-  #   §4.3  console wiring: `--serial file=` with `console=ttyS0`. The `hvc0`
-  #         variant produces ZERO output and ZERO errors
-  #   §4.4  nixpkgs ships only `bzImage`; Cloud Hypervisor needs a PVH-capable
-  #         ELF `vmlinux`. 05 §4.4 records this as a known gap "boot.nix
-  #         should do itself" — it does now, below.
+  #   never mount a host share over a directory systemd owns — `/var/lib`
+  #   shadows `/var/lib/systemd` and logind fails 238/STATE_DIRECTORY on
+  #   every boot
+  #
+  #   two options were renamed on this nixpkgs: `systemd.extraConfig` ->
+  #   `systemd.settings.Manager`, and `services.journald.extraConfig` ->
+  #   `services.journald.settings.Journal`
+  #
+  #   console wiring must be `--serial file=` with `console=ttyS0`; the
+  #   `hvc0` variant produces ZERO output and ZERO errors, which is the
+  #   worst way to be wrong
+  #
+  #   nixpkgs ships only `bzImage`, and Cloud Hypervisor needs a
+  #   PVH-capable ELF `vmlinux` — extracted below rather than left to the
+  #   caller to discover
   #
   # The rev is pinned deliberately and never bumped by accident: two people
   # with the same rachna.nix must get the same machine (`08` §4.1.1).
