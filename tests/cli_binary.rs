@@ -304,11 +304,19 @@ fn every_start_prints_the_access_summary_even_when_approved() {
     assert_eq!(code, 0, "init failed");
     let config = dir.join("rachna.nix");
     let text = std::fs::read_to_string(&config).expect("rachna.nix");
+    // WIDENED WITH A MOUNT, not a network allowlist. A network grant is
+    // refused before the gate on any host that cannot enforce it — Linux
+    // reports "this host cannot enforce it: rachna-netd is not built yet"
+    // — so the gate never runs and the assertions below describe output
+    // that was never produced. This test passed on macOS and failed in the
+    // `devenv` job for that reason.
+    //
+    // The grant only has to be non-empty and enforceable everywhere.
     std::fs::write(
         &config,
         text.replace(
             "network.allow = [ ];",
-            "network.allow = [ \"github.com:443\" ];",
+            "network.allow = [ ];\n  filesystem.mounts = [ { source = \"/tmp\"; } ];",
         ),
     )
     .expect("widen");
@@ -316,7 +324,7 @@ fn every_start_prints_the_access_summary_even_when_approved() {
     // First start: unapproved, so it refuses and names the commands.
     let (first, code) = run(&["start"]);
     assert_eq!(code, 77, "an unapproved start did not refuse:\n{first}");
-    assert!(first.contains("github.com"), "{first}");
+    assert!(first.contains("/tmp"), "{first}");
     // And it refuses for the RIGHT reason. Without this, a piped start that
     // wrongly tried to read stdin would hit EOF, abort, and exit 77 by a
     // different route — the same code, so the assertion above cannot tell
@@ -338,7 +346,7 @@ fn every_start_prints_the_access_summary_even_when_approved() {
     // THE ASSERTION. The second start must still say what it permits.
     let (second, _) = run(&["start"]);
     assert!(
-        second.contains("github.com"),
+        second.contains("/tmp"),
         "an approved start was SILENT about what it permits:\n{second}"
     );
     // And it must not claim this is the first run, which would be a lie the
@@ -433,7 +441,17 @@ fn accept_is_ignored_at_a_terminal_and_required_in_a_pipeline() {
     // first made me think the gate had been defeated.
     std::fs::write(
         dir.join("rachna.nix"),
-        "{\n  tier = \"allowlist\";\n  profile = \"development\";\n           network.allow = [ \"registry.npmjs.org:443\" ];\n}\n",
+        // A FILESYSTEM mount, not a network grant. A network allowlist is
+        // refused BEFORE the gate on a host that cannot enforce it — Linux
+        // says "this host cannot enforce it: rachna-netd is not built yet"
+        // — so the gate never runs and "not a terminal" never prints. The
+        // test passed on macOS and failed in the `devenv` job for exactly
+        // that reason.
+        //
+        // The grant only has to be non-empty: `needs_input` requires a
+        // non-empty summary, and a mount is enforceable on every platform.
+        "{\n  tier = \"allowlist\";\n  profile = \"development\";\n  \
+         filesystem.mounts = [ { source = \"/tmp\"; } ];\n}\n",
     )
     .expect("config");
 
@@ -491,10 +509,7 @@ fn accept_is_ignored_at_a_terminal_and_required_in_a_pipeline() {
     );
     // And the summary is shown BEFORE the refusal: `00` §3.10c wants the
     // grants visible every time, not only when they are accepted.
-    assert!(
-        text.contains("registry.npmjs.org:443"),
-        "the grants were not shown: {text}"
-    );
+    assert!(text.contains("/tmp"), "the grants were not shown: {text}");
 
     // WITH the flag, piped: the CI path, so it gets past the gate. It may
     // still fail later for want of a guest image — what matters is that it
