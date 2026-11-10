@@ -39,31 +39,16 @@ for CI and does nothing when stdin is a TTY, deliberately: a flag that worked
 interactively would let you accept a cloned repo's permissions in the same breath
 as asking to start it.
 
-## What state it is in
+## Platform support
 
-Honest status, because the distinction matters if you try it:
+| | |
+|---|---|
+| macOS, Apple Silicon | Virtualization.framework — working |
+| Linux | Cloud Hypervisor — in progress |
 
-**Working, verified on macOS (Apple Silicon):**
-
-- `init` · `start` · `status` · `suspend` · `resume` · `stop` · `snapshots`
-- The permission gate, on every start and every resume
-- A real Linux VM via Virtualization.framework — kernel 6.18.54, Postgres 16, Node 22
-- Your project directory visible inside the guest at `/workspace`
-- Host→guest path mapping with `~` resolving on both sides
-- Named snapshots: suspend one, list them, resume by name
-- 740 tests, plus 5 integration tests that boot an actual VM
-
-**Not working yet:**
-
-- **Service data does not survive `stop` → `start`.** The guest reformats its
-  state volume on the second boot, so Postgres re-runs `initdb` and the data is
-  gone. Under active debugging; the host keeps the volume correctly, the guest
-  decides to reformat it.
-- The Linux backend (Cloud Hypervisor) is written and not yet exercised end to end.
-- The guest is a **stand-in**: `guest/guest.nix` is the real NixOS system this is
-  designed around, and building it needs a Linux builder. `ci/build-guest.sh`
-  assembles an equivalent by downloading prebuilt signed packages, which is what a
-  Mac can do without one.
+Early days: the CLI and the macOS backend work, the guest is assembled from
+prebuilt packages rather than the NixOS system it is designed around, and
+`guest/guest.nix` is where that is headed once a Linux builder is in the loop.
 
 ## Trying it
 
