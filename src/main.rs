@@ -100,7 +100,7 @@ fn run(command: Command) -> ExitCode {
         | Command::Explain { .. } => {
             eprintln!(
                 "rachna: `{}` is not built yet \
-                 (design-docs/01-ARCHITECTURE.md §7)",
+                 the backend is not wired up on this platform yet",
                 verb
             );
             ExitCode::from(UNIMPLEMENTED)
@@ -1040,7 +1040,7 @@ mod commands {
         eprintln!(
             "rachna: the Linux launch path needs the guest bundle from \
              `guest/flake.nix` (01 §7.0c). On macOS this works today; see \
-             ci/build-guest-aarch64.sh for how the image is assembled."
+             ci/build-guest.sh for how the image is assembled."
         );
         ExitCode::from(UNIMPLEMENTED)
     }

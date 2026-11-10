@@ -2,10 +2,10 @@
 //!
 //! One crate, modules inside it. The seams that matter are enforced by module
 //! boundaries and visibility rather than by separate crates; see `AGENTS.md`
-//! and `design-docs/01-ARCHITECTURE.md` §1 for why an earlier twelve-crate
+//! One crate, not twelve: an earlier twelve-crate
 //! workspace was deleted.
 //!
-//! Build order is `design-docs/01-ARCHITECTURE.md` §7. Nothing here is
+//! Nothing here is
 //! implemented yet beyond the harness.
 
 // `unwrap_used`, `expect_used` and `panic` are warnings for product code: this
@@ -24,7 +24,7 @@
 /// version appears. Shown in full, including the patch component: a patch bump
 /// is the promise "bug fix only, same guest, snapshots still restore".
 ///
-/// See `design-docs/08-POLICY-AND-STORE.md` §4.1.1 for the release contract
+/// The release contract
 /// each component commits to.
 #[must_use]
 pub fn version() -> &'static str {

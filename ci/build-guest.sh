@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Builds a guest root image with Node and Postgres, for aarch64 VZ hosts.
+# Builds a guest root image with Node and Postgres.
+#
+# ARCH is a parameter: `aarch64` for Apple Silicon and ARM Linux hosts,
+# `x86_64` for Intel Linux. Pass it as $2 or set GUEST_ARCH; it defaults to
+# this machine's. The whole script was aarch64-only, which made "publish an
+# image users can download" impossible for half the hosts that can run one.
 #
 # WHY THIS EXISTS, and what it is not: `guest/flake.nix` is the real guest,
 # and it needs 240 derivations BUILT for aarch64-linux (02 §6.9) — which an
@@ -15,7 +20,15 @@ set -euo pipefail
 # version AND arch so an upgrade cannot overwrite an image that existing
 # snapshots still reference.
 GUEST_VERSION="${GUEST_VERSION:-26.11-3181085}"
-OUT="${1:-$HOME/.rachna/guests/$GUEST_VERSION-aarch64}"
+# The guest's architecture. `uname -m` on this host by default, since the
+# common case is building for the machine you are on.
+case "${2:-${GUEST_ARCH:-$(uname -m)}}" in
+  arm64|aarch64) ARCH=aarch64 ;;
+  x86_64|amd64)  ARCH=x86_64 ;;
+  *) echo "unsupported guest arch: ${2:-$(uname -m)}" >&2; exit 1 ;;
+esac
+NIX_SYSTEM="$ARCH-linux"
+OUT="${1:-$HOME/.rachna/guests/$GUEST_VERSION-$ARCH}"
 PINNED="nixpkgs/3181085bfd08663b6b9e60bc7a8395c2aaa741bd"
 # Node comes from a different pin DELIBERATELY: at the pinned rev, nodejs_22
 # needs building and nodejs_20 fails an end-of-life assertion (02 §6.9).
@@ -23,10 +36,16 @@ NODE_PIN="nixpkgs/nixos-25.05"
 
 say() { printf '\n▸ %s\n' "$*"; }
 
-say "fetching the guest kernel (aarch64-linux)"
+say "fetching the guest kernel ($NIX_SYSTEM)"
 KERNEL_DIR=$(nix build --no-link --print-out-paths \
-  "$PINNED#legacyPackages.aarch64-linux.linuxPackages.kernel")
-KERNEL="$KERNEL_DIR/Image"
+  "$PINNED#legacyPackages.${NIX_SYSTEM}.linuxPackages.kernel")
+# The kernel filename is ARCH-SPECIFIC: aarch64 ships `Image`, x86_64
+# ships `bzImage`. Measured — the first parameterised run fetched the
+# x86_64 kernel fine and then failed with "no Image in /nix/store/…".
+case "$ARCH" in
+  aarch64) KERNEL="$KERNEL_DIR/Image" ;;
+  x86_64)  KERNEL="$KERNEL_DIR/bzImage" ;;
+esac
 # VZLinuxBootLoader takes the uncompressed Image; the vmlinux extraction in
 # guest/flake.nix is a Cloud Hypervisor/x86 concern (02 §6.5).
 test -f "$KERNEL" || { echo "no Image in $KERNEL_DIR" >&2; exit 1; }
@@ -37,25 +56,32 @@ test -f "$KERNEL" || { echo "no Image in $KERNEL_DIR" >&2; exit 1; }
 # the workspace at all: measured as `no virtiofs share tagged 'workspace'`
 # with only two virtio devices in the guest, which looked host-side and
 # was not.
-say "fetching the kernel modules (virtiofs is CONFIG_VIRTIO_FS=m)"
+say "fetching the kernel modules for $NIX_SYSTEM (virtiofs is CONFIG_VIRTIO_FS=m)"
 MODULES=$(nix build --no-link --print-out-paths \
-  "$PINNED#legacyPackages.aarch64-linux.linuxPackages.kernel.modules")
+  "$PINNED#legacyPackages.${NIX_SYSTEM}.linuxPackages.kernel.modules")
 test -d "$MODULES/lib/modules" || { echo "no modules in $MODULES" >&2; exit 1; }
 
 say "fetching busybox, node, postgres, e2fsprogs"
 BUSYBOX=$(nix build --no-link --print-out-paths \
-  "$PINNED#legacyPackages.aarch64-linux.pkgsStatic.busybox")
+  "$PINNED#legacyPackages.${NIX_SYSTEM}.pkgsStatic.busybox")
 POSTGRES=$(nix build --no-link --print-out-paths \
-  "$PINNED#legacyPackages.aarch64-linux.postgresql_16" | grep -v -- '-man$' | head -1)
+  "$PINNED#legacyPackages.${NIX_SYSTEM}.postgresql_16" | grep -v -- '-man$' | head -1)
 NODE=$(nix build --no-link --print-out-paths \
-  "$NODE_PIN#legacyPackages.aarch64-linux.nodejs_22" | head -1)
+  "$NODE_PIN#legacyPackages.${NIX_SYSTEM}.nodejs_22" | head -1)
 E2FS=$(nix build --no-link --print-out-paths "nixpkgs#e2fsprogs" | grep -- '-bin$' | head -1)
 
 # Everything must be a Linux binary, or it fetched the host's build by
 # mistake — which would fail at boot with no useful message.
 for binary in "$NODE/bin/node" "$POSTGRES/bin/postgres"; do
-  file "$binary" | grep -q 'ELF.*aarch64' || {
-    echo "$binary is not an aarch64 Linux ELF — wrong system fetched" >&2
+  # The ELF's own architecture, not the one we asked for: a wrong `nix
+  # build` system silently fetches the host's build, which then fails at
+  # boot with no useful message.
+  case "$ARCH" in
+    aarch64) want='ELF.*aarch64' ;;
+    x86_64)  want='ELF.*x86-64' ;;
+  esac
+  file "$binary" | grep -qE "$want" || {
+    echo "$binary is not an $ARCH Linux ELF — wrong system fetched" >&2
     exit 1
   }
 done
@@ -349,6 +375,9 @@ f.truncate($IMAGE_MB * 1024 * 1024)
 f.close()"
 "$E2FS/bin/mke2fs" -t ext4 -d "$ROOT" -F -L rachna-root -q "$OUT/root.img"
 
+# Installed as `Image` whatever the source was called: the host code
+# looks for one name, and which kernel format it is is the guest's
+# business.
 install -m 0644 "$KERNEL" "$OUT/Image"
 install -m 0644 "$WORK/initramfs.gz" "$OUT/initramfs.gz"
 chmod 0644 "$OUT/root.img"

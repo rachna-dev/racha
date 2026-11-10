@@ -60,7 +60,7 @@ impl std::fmt::Display for BootError {
             Self::NoImage { looked_in } => write!(
                 f,
                 "no guest image in {}. Build one:\n    \
-                 ./ci/build-guest-aarch64.sh",
+                 ./ci/build-guest.sh",
                 looked_in.display()
             ),
             // Specific, per `24` §6: a partial image must not be treated as
@@ -68,7 +68,7 @@ impl std::fmt::Display for BootError {
             Self::Incomplete { missing } => write!(
                 f,
                 "the guest image is incomplete: {} is missing. Rebuild it:\n    \
-                 ./ci/build-guest-aarch64.sh",
+                 ./ci/build-guest.sh",
                 missing.display()
             ),
         }
@@ -402,7 +402,7 @@ mod tests {
         let root = scratch("missing");
         let error = Image::find(&root).expect_err("no image is installed");
         let text = error.to_string();
-        assert!(text.contains("build-guest-aarch64.sh"), "{text}");
+        assert!(text.contains("build-guest.sh"), "{text}");
         assert!(text.contains("guests/"), "{text}");
         let _ = std::fs::remove_dir_all(&root);
     }

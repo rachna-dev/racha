@@ -11,7 +11,7 @@
 # choice: Forgejo runners are typically self-hosted Linux, with no macOS
 # available. So this provider covers the Linux variants and GitHub covers
 # macOS. Tests that encode macOS-specific behaviour — APFS case-insensitivity
-# especially (design-docs/12 §3) — are therefore gated by GitHub, not here.
+# especially — are therefore gated by GitHub, not here.
 name: ci
 
 on:

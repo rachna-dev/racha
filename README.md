@@ -61,7 +61,7 @@ Honest status, because the distinction matters if you try it:
   decides to reformat it.
 - The Linux backend (Cloud Hypervisor) is written and not yet exercised end to end.
 - The guest is a **stand-in**: `guest/guest.nix` is the real NixOS system this is
-  designed around, and building it needs a Linux builder. `ci/build-guest-aarch64.sh`
+  designed around, and building it needs a Linux builder. `ci/build-guest.sh`
   assembles an equivalent by downloading prebuilt signed packages, which is what a
   Mac can do without one.
 
@@ -73,7 +73,7 @@ Needs [Nix](https://nixos.org/download) with flakes, and macOS on Apple Silicon.
 git clone git@github.com:rachna-dev/racha.git && cd racha
 devenv shell -- cargo build
 ./ci/sign-macos.sh target/debug/rachna     # the VZ entitlement
-bash ci/build-guest-aarch64.sh             # the guest image, ~10 min, 615 MB
+bash ci/build-guest.sh                     # the guest image, ~10 min, 615 MB
 ```
 
 Then in any project directory:

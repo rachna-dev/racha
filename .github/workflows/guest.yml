@@ -1,0 +1,125 @@
+# Builds the guest images users download, and attaches them to a release.
+#
+# WHY THIS EXISTS: a Linux VM needs a Linux OS inside it, and that image has
+# to exist on the user's machine before the first VM can start. Building it
+# locally costs ~10 minutes and a working Nix install; downloading a signed
+# one costs neither. This is the difference between "clone, build, wait" and
+# "install, run".
+#
+# Both architectures, because a guest image is only useful to a host that
+# can run it: aarch64 for Apple Silicon and ARM Linux, x86_64 for Intel
+# Linux. An aarch64-only pipeline leaves half the hosts that can run a
+# guest with nothing to download.
+name: guest
+
+on:
+  push:
+    tags: ['v*']
+  # Buildable on demand, because a guest image is expensive and a tag is a
+  # bad place to discover that the build is broken.
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'attach the images to a draft release'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: guest · ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The image is assembled by SUBSTITUTION — every package is
+          # fetched prebuilt and signed from cache.nixos.org, nothing is
+          # compiled — so the builder's own architecture does not have to
+          # match the guest's. Both run on x86_64 runners, which are the
+          # ones the free tier reliably provides.
+          - arch: aarch64
+            runner: ubuntu-24.04
+          - arch: x86_64
+            runner: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      # The build needs ~2 GB of free disk for a 615 MB image plus its
+      # work tree, and GitHub runners start with the disk fairly full.
+      # Measured locally: the build failed three times on a machine with a
+      # few hundred MB spare, which is a confusing failure to debug in CI.
+      - name: reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h / | tail -1
+
+      - name: build the guest image
+        run: bash ci/build-guest.sh "$PWD/out" ${{ matrix.arch }}
+
+      # The script verifies the image itself (e2fsck on the installed
+      # file, an ELF-architecture check on every binary), so this asserts
+      # the ARTEFACTS rather than re-checking the filesystem: a job that
+      # uploads an empty file is worse than one that fails.
+      - name: check what was produced
+        run: |
+          cd out
+          for f in Image initramfs.gz root.img; do
+            test -s "$f" || { echo "$f is missing or empty" >&2; exit 1; }
+          done
+          ls -la
+          sha256sum Image initramfs.gz root.img | tee SHA256SUMS
+
+      - name: package
+        run: |
+          tar -C out -czf "rachna-guest-${{ matrix.arch }}.tar.gz" \
+            Image initramfs.gz root.img SHA256SUMS
+          ls -la rachna-guest-${{ matrix.arch }}.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rachna-guest-${{ matrix.arch }}
+          path: rachna-guest-${{ matrix.arch }}.tar.gz
+          retention-days: 14
+
+  release:
+    name: attach to a draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rachna-guest-*
+          merge-multiple: true
+
+      # DRAFT, deliberately. A guest image is the thing a user's
+      # environment boots from, so publishing one should be a decision
+      # somebody makes rather than a side effect of pushing a tag.
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: rachna-guest-*.tar.gz
+          body: |
+            Guest images for Rachna.
+
+            Download the one matching your host, unpack it into
+            `~/.rachna/guests/<version>-<arch>/`, and `rachna start` will
+            use it instead of building one locally.
+
+            Verify with the included `SHA256SUMS` before unpacking.

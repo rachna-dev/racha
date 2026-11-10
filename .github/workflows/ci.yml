@@ -5,7 +5,7 @@
 # WHY A PLATFORM MATRIX MATTERS HERE, rather than being thoroughness theatre:
 # the spikes found behaviour that differs per platform and would be missed by
 # a Linux-only run. APFS is case-insensitive by default, which defeats a
-# name-based exclusion check (design-docs/12 §3); macOS has no cgroups, so
+# name-based exclusion check; macOS has no cgroups, so
 # resource limits are advisory there (12 §4); and Linux needs CAP_NET_ADMIN
 # where macOS needs nothing (04 §3.2). Tests covering those paths must run on
 # the platform whose behaviour they encode.
