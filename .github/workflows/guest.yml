@@ -13,10 +13,27 @@
 name: guest
 
 on:
+  # A TAG BUILDS UNCONDITIONALLY, in its own trigger. Putting `tags` and
+  # `paths` under one `push` applies the path filter to tags too, so `v1.0`
+  # would build images only if that commit happened to touch `guest/` —
+  # which a release tag usually does not. Releases would have silently
+  # shipped no images.
   push:
     tags: ['v*']
-  # Buildable on demand, because a guest image is expensive and a tag is a
-  # bad place to discover that the build is broken.
+
+  # And a change to what the image is MADE of rebuilds it. A tag is a bad
+  # place to discover the image build is broken, and so is a user's first
+  # `rachna start`: the ext4 bug that wiped the state volume on every boot
+  # would be caught here, now that the build asserts the filesystem it
+  # writes is one the kernel can mount.
+  pull_request:
+    paths:
+      - 'ci/build-guest.sh'
+      - 'guest/**'
+      - '.github/workflows/guest.yml'
+
+  # Buildable on demand, because a guest image is expensive and nobody
+  # should have to push to find out whether it still builds.
   workflow_dispatch:
     inputs:
       publish:
@@ -98,6 +115,9 @@ jobs:
   release:
     name: attach to a draft release
     needs: build
+    # A tag or an explicit request only. A push to `main` that touches the
+    # guest should BUILD the image — that is the regression check — without
+    # creating a release for it.
     if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
     runs-on: ubuntu-24.04
     permissions:

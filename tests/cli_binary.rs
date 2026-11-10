@@ -153,6 +153,28 @@ fn no_invocation_panics() {
     }
 }
 
+/// Whether `nix` is on PATH, and therefore whether the policy gate is
+/// reachable at all.
+///
+/// The gate EVALUATES `rachna.nix` before showing it, so without `nix` the
+/// binary exits 74 ("could not run `nix`") long before any gate behaviour
+/// happens. Two tests asserted gate exit codes and both failed that way in
+/// the `mutants` job, whose container has no nix — and the second only
+/// surfaced after the first was fixed, which is why this is one helper
+/// rather than two copies of the same check.
+///
+/// The property is still covered in CI: the `devenv` job runs the full gate
+/// inside a shell that has nix. "Skips in some jobs" and "unchecked in CI"
+/// are different claims.
+fn nix_is_available() -> bool {
+    std::process::Command::new("nix")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[test]
 fn every_start_prints_the_access_summary_even_when_approved() {
     // THE user-reported defect, at the binary. `00` §3.10c once said
@@ -185,6 +207,12 @@ fn every_start_prints_the_access_summary_even_when_approved() {
             output.status.code().unwrap_or(-1),
         )
     };
+
+    if !nix_is_available() {
+        println!("SKIP: no `nix` on PATH, so the gate is never reached");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
 
     let (_, code) = run(&["init"]);
     assert_eq!(code, 0, "init failed");
@@ -342,6 +370,26 @@ fn accept_is_ignored_at_a_terminal_and_required_in_a_pipeline() {
             out.status.code().unwrap_or(-1),
         )
     };
+
+    // THE GATE NEEDS `nix`, because the policy is evaluated before it is
+    // shown. Without `nix` on PATH `rachna` exits 74 (cannot evaluate)
+    // long before reaching the gate, which is correct behaviour and not
+    // what this test is about — it failed exactly that way in the
+    // `mutants` job, whose container has no nix.
+    //
+    // Said out loud rather than passing quietly: a green run that silently
+    // checked nothing is the failure mode this whole test exists to
+    // prevent.
+    //
+    // The property is still checked in CI — the `devenv` job runs the full
+    // gate inside a shell that HAS nix, so this skips only in the jobs
+    // that could never reach the gate. Worth stating, because "it skips in
+    // CI" and "it is unchecked in CI" are different claims.
+    if !nix_is_available() {
+        println!("SKIP: no `nix` on PATH, so the gate is never reached");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
 
     // WITHOUT the flag, piped: refused, and it says which refusal this is
     // rather than leaving a pipeline to guess.
