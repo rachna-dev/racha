@@ -60,6 +60,19 @@ Fetches the binary and the Linux guest image for your machine, verifies both
 against published checksums, and puts `rachna` in `~/.local/bin`. No Nix
 needed.
 
+Two guest images are published per architecture, and they are different
+things:
+
+| | size | what it is |
+|---|---|---|
+| default | ~143 MB | A busybox root. Proven on real hardware, and what `rachna start` boots today. Runs a fixed demo rather than a declared service set. |
+| `RACHNA_GUEST=real` | ~637 MB | `guest/guest.nix` built for real — a NixOS system with systemd, `services.postgresql` as a declared service, and `devenv` in the image. **Built and verified, not yet booted.** |
+
+The real guest is the one Rachna is designed around; it is opt-in only until
+it has been booted on real hardware, because shipping an unbooted image as
+the default makes a user's first `rachna start` the thing that discovers it
+does not work.
+
 Downloading the binary in a **browser** instead will get you a macOS malware
 dialog — `rachna` links Virtualization.framework, which Gatekeeper
 scrutinises when no Developer ID vouches for it. `curl` does not set the

@@ -28,6 +28,36 @@ VERSION="${RACHNA_VERSION:-latest}"
 PREFIX="${RACHNA_PREFIX:-$HOME/.local/bin}"
 GUEST_VERSION="26.11-3181085"
 
+# WHICH GUEST: the stand-in by default, the real NixOS one on request.
+#
+# Two images are published per architecture and they are genuinely
+# different things:
+#
+#   rachna-guest-…       a busybox root assembled by substitution. ~143 MB.
+#                        What `rachna start` has been booting and the only
+#                        one proven on real hardware. It runs a fixed demo
+#                        (a Node app on Postgres) rather than a declared
+#                        service set.
+#
+#   rachna-real-guest-…  `guest/guest.nix` built for real: a NixOS system
+#                        with systemd, `services.postgresql` as a DECLARED
+#                        service, and `devenv` in the image. ~637 MB. This
+#                        is the guest Rachna is designed around — and it has
+#                        never been booted, only built and verified
+#                        structurally.
+#
+# So the default stays the proven one. `RACHNA_GUEST=real` opts in, because
+# the alternative — shipping an unbooted image as the default — is how a
+# user's first `rachna start` becomes the thing that discovers it does not
+# work.
+GUEST_KIND="${RACHNA_GUEST:-standin}"
+case "$GUEST_KIND" in
+  standin) GUEST_ARCHIVE_PREFIX="rachna-guest" ;;
+  real)    GUEST_ARCHIVE_PREFIX="rachna-real-guest" ;;
+  *) printf '\nrachna: RACHNA_GUEST must be standin or real, got %s\n' \
+       "$GUEST_KIND" >&2; exit 1 ;;
+esac
+
 say() { printf '\n▸ %s\n' "$*"; }
 die() { printf '\nrachna: %s\n' "$*" >&2; exit 1; }
 
@@ -141,13 +171,20 @@ guest_dir="$HOME/.rachna/guests/$GUEST_VERSION-$arch"
 if [ -f "$guest_dir/root.img" ]; then
   say "guest image already present"
 else
-  say "downloading the guest image (~600 MB)"
+  if [ "$GUEST_KIND" = real ]; then
+    say "downloading the REAL NixOS guest image (~637 MB)"
+    printf '  this image is built and verified but has not been booted;\n'
+    # shellcheck disable=SC2016  # literal backticks, naming a variable
+    printf '  `RACHNA_GUEST=standin` installs the proven one instead.\n'
+  else
+    say "downloading the guest image (~143 MB)"
+  fi
   # The VERSIONED name, matching what `guest.yml` publishes. An unversioned
   # one would hand this binary whatever image the latest release carries —
   # and the binary only looks in `guests/$GUEST_VERSION-$arch`, so a newer
   # image would be downloaded, unpacked, and never found.
   if curl -fsSL -o "$work/guest.tar.gz" \
-       "$base/rachna-guest-$GUEST_VERSION-$arch.tar.gz" 2>/dev/null; then
+       "$base/$GUEST_ARCHIVE_PREFIX-$GUEST_VERSION-$arch.tar.gz" 2>/dev/null; then
     mkdir -p "$guest_dir"
     tar -C "$guest_dir" -xzf "$work/guest.tar.gz"
     # The image ships its own SHA256SUMS, generated at build time.
@@ -158,8 +195,14 @@ else
       say "guest image verified"
     fi
   else
-    printf '  no guest image published for %s yet.\n' "$arch"
-    printf '  build one locally:  bash ci/build-guest.sh\n'
+    printf '  no %s guest image published for %s yet.\n' \
+      "$GUEST_KIND" "$arch"
+    if [ "$GUEST_KIND" = real ]; then
+      printf '  build one:  nix build ./guest#packages.%s-linux.vz-image\n' \
+        "$arch"
+    else
+      printf '  build one locally:  bash ci/build-guest.sh\n'
+    fi
   fi
 fi
 
