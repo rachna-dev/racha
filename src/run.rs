@@ -181,6 +181,21 @@ impl core::error::Error for StartError {}
 /// [`StartError::NoConfig`], [`StartError::Evaluation`] or
 /// [`StartError::Config`].
 pub fn evaluate(context: &Context) -> Result<Policy, StartError> {
+    evaluate_both(context).map(|(policy, _)| policy)
+}
+
+/// Evaluates `rachna.nix` into **both** artifacts `01` §2.3 specifies.
+///
+/// The one `start` calls: an `ExecSpec` is what decides which guest image
+/// to boot (`Image::find_for`), and [`evaluate`] discards it. Kept as a
+/// separate function because the policy half is what the gate and the
+/// policy tests want.
+///
+/// # Errors
+///
+/// The same as [`evaluate`]. A config broken in either half yields
+/// neither artifact — never a policy applied without its packages.
+pub fn evaluate_both(context: &Context) -> Result<(Policy, crate::exec::ExecSpec), StartError> {
     let config_file = context.config_file();
     if !config_file.exists() {
         return Err(StartError::NoConfig {
@@ -208,7 +223,7 @@ pub fn evaluate(context: &Context) -> Result<Policy, StartError> {
     }
 
     let json = String::from_utf8_lossy(&output.stdout).into_owned();
-    config::parse(&json, context.capabilities.clone())
+    config::parse_both(&json, context.capabilities.clone())
         .map_err(|errors| StartError::Config { errors })
 }
 

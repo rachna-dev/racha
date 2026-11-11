@@ -365,8 +365,12 @@ mod commands {
             }
         }
 
-        let policy = match run::evaluate(&context) {
-            Ok(policy) => policy,
+        // BOTH artifacts (`01` §2.3). The exec half decides which guest
+        // image to boot — a project declaring `environment.packages` gets
+        // one built for them — and discarding it is why that declaration
+        // had no effect for as long as it did.
+        let (policy, exec) = match run::evaluate_both(&context) {
+            Ok(both) => both,
             Err(error) => return report(&error),
         };
 
@@ -439,7 +443,7 @@ mod commands {
                     print!("{why}");
                 }
                 println!("  accepted by --accept");
-                return launch_or_supervise(&context, &policy, supervise, true);
+                return launch_or_supervise(&context, &policy, &exec, supervise, true);
             }
             print!("{prompt}");
             if !context.interactive {
@@ -511,7 +515,7 @@ mod commands {
         // `start` spawns one and returns. The gate above runs either way,
         // so a supervisor cannot be a way around it.
         // `true`: the gate is behind us, by keypress or by flag.
-        launch_or_supervise(&context, &policy, supervise, true)
+        launch_or_supervise(&context, &policy, &exec, supervise, true)
     }
 
     /// Either holds the guest or spawns something that does.
@@ -523,9 +527,28 @@ mod commands {
     fn launch_or_supervise(
         context: &run::Context,
         policy: &rachna::decide::Policy,
+        exec: &rachna::exec::ExecSpec,
         supervise: bool,
         accepted: bool,
     ) -> ExitCode {
+        // WARNED HERE, ON THE USER'S TERMINAL, before anything forks.
+        //
+        // `launch_approved` also reports this, but it runs in the SUPERVISOR
+        // — a different process whose stderr goes to `supervisor.log`. So
+        // the warning was written somewhere nobody reads, which is the same
+        // silent-downgrade failure it exists to prevent. Verified by
+        // running it: the message appeared only in
+        // `~/.rachna/projects/<id>/run/supervisor.log`.
+        //
+        // A `Provenance` lookup here is a filesystem check and nothing
+        // more, so asking twice is cheaper than plumbing the answer into
+        // the child.
+        if let Ok((_, provenance)) = rachna::boot::Image::find_for(&context.rachna_root, exec) {
+            if let Some(warning) = provenance.warning() {
+                eprintln!("rachna: {warning}");
+            }
+        }
+
         // On Linux there is nothing to detach from — `supervise.rs` spawns
         // `cloud-hypervisor` as its own process, which already outlives the
         // CLI — so the flag only matters on macOS.
@@ -540,7 +563,7 @@ mod commands {
         // platform the function exists for.
         #[cfg(not(target_os = "macos"))]
         let _ = (supervise, accepted);
-        launch_approved(context, policy)
+        launch_approved(context, policy, exec)
     }
 
     /// Boots the guest for an approved policy.
@@ -549,12 +572,29 @@ mod commands {
     /// and a gate whose function also owns the launch is one where a future
     /// edit can reach the launch without passing the gate.
     #[cfg(target_os = "macos")]
-    fn launch_approved(context: &run::Context, policy: &rachna::decide::Policy) -> ExitCode {
+    fn launch_approved(
+        context: &run::Context,
+        policy: &rachna::decide::Policy,
+        exec: &rachna::exec::ExecSpec,
+    ) -> ExitCode {
         use rachna::backend::macos_vm::Guest;
         use rachna::boot::{launch_for, provision_root, provision_state, Image};
 
-        let image = match Image::find(&context.rachna_root) {
-            Ok(image) => image,
+        // `find_for`, not `find`: a project declaring `environment.packages`
+        // boots the image built for them. A bare spec gets the shared base,
+        // which is the common case and must not need a build.
+        let image = match Image::find_for(&context.rachna_root, exec) {
+            Ok((image, provenance)) => {
+                // SAID OUT LOUD when the declared packages are not there.
+                // `idea.md` §16.2 forbids a silent downgrade, and booting
+                // the base image for a project that asked for packages is
+                // exactly that unless it is stated — a user would otherwise
+                // debug a missing `node` as though the image were broken.
+                if let Some(warning) = provenance.warning() {
+                    eprintln!("rachna: {warning}");
+                }
+                image
+            }
             Err(error) => {
                 eprintln!("rachna: {error}");
                 return ExitCode::from(FAILED);
@@ -1054,7 +1094,11 @@ mod commands {
     /// macOS entirely (`02` §6), which is why these are separate functions
     /// rather than one with a `cfg` inside it.
     #[cfg(not(target_os = "macos"))]
-    fn launch_approved(_context: &run::Context, _policy: &rachna::decide::Policy) -> ExitCode {
+    fn launch_approved(
+        _context: &run::Context,
+        _policy: &rachna::decide::Policy,
+        _exec: &rachna::exec::ExecSpec,
+    ) -> ExitCode {
         eprintln!(
             "rachna: the Linux launch path needs the guest bundle from \
              `guest/flake.nix` (01 §7.0c). On macOS this works today; see \
