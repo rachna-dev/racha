@@ -94,12 +94,28 @@ The build is a one-time cost — the guest image is shared across every project
 
 ```nix
 {
-  tier = "allowlist";                              # network: allowlist | isolated
-  profile = "development";                         # fs, devices, credentials
+  # ── what is in the environment ──────────────────────────────────────────
+  environment.packages  = [ "nodejs_22" "postgresql_16" ];   # any nixpkgs name
+  environment.variables = { NODE_ENV = "development"; };
+
+  services.postgres = { enable = true; port = 5432; };
+  entrypoints       = { dev = "npm run dev"; };              # rachna run dev
+
+  # ── what it is allowed to do ────────────────────────────────────────────
+  tier = "allowlist";                              # open | internet | allowlist | none
+  profile = "development";                         # sealed | development | online
 
   network.allow = [ "registry.npmjs.org:443" ];    # empty list = no network
 
-  resources.disk = "500MB";                        # default 20GB, sparse
+  ports = [ { guest = 3000; host = 3000; } ];
+
+  tools = [                                        # a tool is its own principal
+    { kind = "lsp"; name = "rust-analyzer";
+      network = false; }                           # defaults to false
+  ];
+
+  resources = { cpus = 4; memory = "2GB";
+                disk = "500MB"; processes = 512; }; # disk default 20GB, sparse
 
   filesystem.mounts = [
     { source = "~/.gitconfig";                     # ~ = your home
@@ -108,6 +124,16 @@ The build is a one-time cost — the guest image is shared across every project
   ];
 }
 ```
+
+Every field is optional. An empty `rachna.nix` is valid and gives you the base
+guest, which ships `devenv`, `direnv`, `git`, `fzf`, `ripgrep`, `fd`, `jq`,
+`neovim` and `tmux` — a shell worth being in, with no language runtime.
+
+`environment.packages` takes **any nixpkgs attribute name**, and Rachna does not
+check the list: Nix does, against the pinned revision, and it gives a better
+answer than a copy of the package set would. A project that declares packages
+gets its own guest image, keyed by the package set — so two projects declaring
+the same thing share one image and the second one's first start is a cache hit.
 
 Deleting a line makes the environment **stricter**, never looser. An empty
 allowlist denies all network rather than permitting it.

@@ -109,13 +109,65 @@ impl Image {
         if !dir.is_dir() {
             return Err(BootError::NoImage { looked_in: dir });
         }
+        // Every file, not just the first — and reported one at a time so
+        // the message names a specific thing to fix.
+        Self::in_dir(dir)
+    }
+
+    /// Finds the image for a project, preferring one built for its packages.
+    ///
+    /// # The two cases, and why a fallback rather than an error
+    ///
+    /// A spec declaring no packages and no services ([`ExecSpec::is_bare`])
+    /// wants the shared base image, and gets it — that is the common case
+    /// and it must not require a build.
+    ///
+    /// A spec that DOES declare packages wants an image built for them. If
+    /// that image is not installed yet, this falls back to the base rather
+    /// than refusing: the base guest ships `devenv` and `direnv`
+    /// (`guest/guest.nix`), so a project can still work in it while the
+    /// build is arranged. The caller is told which it got, because "your
+    /// packages are not here yet" is information a user needs — silently
+    /// booting the base image is the kind of quiet downgrade `idea.md`
+    /// §16.2 forbids.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Image::find`], and for the same reasons: a project
+    /// directory that exists but is incomplete names its missing file
+    /// rather than silently falling back, because an incomplete image is a
+    /// broken install rather than an absent one.
+    pub fn find_for(
+        rachna_root: &Path,
+        exec: &crate::exec::ExecSpec,
+    ) -> Result<(Self, Provenance), BootError> {
+        if exec.is_bare() {
+            return Ok((Self::find(rachna_root)?, Provenance::Base));
+        }
+        let dir = crate::layout::project_guest_dir(
+            rachna_root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+            &exec.closure_key(),
+        );
+        if dir.is_dir() {
+            return Ok((Self::in_dir(dir)?, Provenance::Project));
+        }
+        // Not built yet. The base still boots, and the caller says so.
+        Ok((Self::find(rachna_root)?, Provenance::BaseNotYetBuilt))
+    }
+
+    /// The three files, verified, in one directory.
+    ///
+    /// Factored out of [`Image::find`] so the project path checks the same
+    /// three names in the same order — a second copy is how the two would
+    /// drift on which file is reported first.
+    fn in_dir(dir: PathBuf) -> Result<Self, BootError> {
         let image = Self {
             kernel: dir.join("Image"),
             initramfs: dir.join("initramfs.gz"),
             root: dir.join("root.img"),
         };
-        // Every file, not just the first — and reported one at a time so
-        // the message names a specific thing to fix.
         for required in [&image.kernel, &image.initramfs, &image.root] {
             if !required.is_file() {
                 return Err(BootError::Incomplete {
@@ -124,6 +176,39 @@ impl Image {
             }
         }
         Ok(image)
+    }
+}
+
+/// Which image a project got, so the CLI can say so.
+///
+/// Reported rather than inferred: `idea.md` §16.2 forbids a silent
+/// downgrade, and booting the base image when a project asked for packages
+/// is exactly that unless it is stated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// The project declared no packages, so the shared base image is right.
+    Base,
+    /// An image built for this project's package set.
+    Project,
+    /// The project declared packages, but no image is built for them yet.
+    ///
+    /// The base guest boots and ships `devenv`, so this is usable — but the
+    /// declared packages are NOT present, and the user must be told.
+    BaseNotYetBuilt,
+}
+
+impl Provenance {
+    /// What to tell the user, or nothing when there is nothing to say.
+    #[must_use]
+    pub const fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::Base | Self::Project => None,
+            Self::BaseNotYetBuilt => Some(
+                "this project declares packages, but no image is built for \
+                 them yet — booting the base guest, where `devenv shell` \
+                 still works",
+            ),
+        }
     }
 }
 
@@ -393,6 +478,245 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
         dir
+    }
+
+    #[test]
+    fn the_host_arch_is_the_name_the_guest_images_are_published_under() {
+        // A LITERAL, not `host_arch()` on both sides. Every other use in
+        // this file passes it to the path builder AND to the expectation,
+        // so `host_arch` returning `""` cancelled out and the mutant
+        // survived — the same self-referential trap as sizing a chunking
+        // test by the chunk constant.
+        //
+        // The value is a published contract, not an internal detail:
+        // `ci/build-guest.sh` names its output `<version>-<arch>` and the
+        // release archives are `rachna-guest-<version>-<arch>.tar.gz`. A
+        // different spelling here means the binary looks in a directory
+        // the installer never wrote — reported as "no guest image" on a
+        // machine that just downloaded one.
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(host_arch(), "aarch64");
+        #[cfg(not(target_arch = "aarch64"))]
+        assert_eq!(host_arch(), "x86_64");
+
+        // Non-empty and path-safe whatever the target, because this
+        // becomes one component of a directory name.
+        assert!(!host_arch().is_empty());
+        assert!(!host_arch().contains('/'));
+        assert!(
+            ["aarch64", "x86_64"].contains(&host_arch()),
+            "{} is not an arch the build script publishes",
+            host_arch()
+        );
+    }
+
+    // ---- which image a project gets -------------------------------------
+
+    /// Writes the three files `Image::find` requires into `dir`.
+    fn install_image(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("dirs");
+        for name in ["Image", "initramfs.gz", "root.img"] {
+            std::fs::write(dir.join(name), name.as_bytes()).expect(name);
+        }
+    }
+
+    /// An `ExecSpec` declaring `packages`.
+    fn spec_with(packages: &[&str]) -> crate::exec::ExecSpec {
+        crate::exec::ExecSpec {
+            packages: packages.iter().map(|p| (*p).to_owned()).collect(),
+            ..crate::exec::ExecSpec::default()
+        }
+    }
+
+    #[test]
+    fn a_project_with_no_packages_uses_the_shared_base_image() {
+        // The COMMON case, and it must not require a build. `08` §4.1.1
+        // calls the shared guest directory the only shared thing — 493 MB
+        // per guest version rather than per project.
+        let root = scratch("bare-spec");
+        install_image(&crate::layout::guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+        ));
+
+        let (image, provenance) =
+            Image::find_for(&root, &crate::exec::ExecSpec::default()).expect("the base image");
+        assert_eq!(provenance, Provenance::Base);
+        assert_eq!(provenance.warning(), None, "nothing to warn about");
+        assert!(image.kernel.ends_with("Image"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_project_with_packages_gets_the_image_built_for_them() {
+        // THE case this wiring exists for. Before it, packages had nowhere
+        // to go and the image shipped Node and Postgres baked in — so every
+        // project booted with someone else's dependencies.
+        let root = scratch("project-spec");
+        let exec = spec_with(&["nodejs_22", "postgresql_16"]);
+        // Both installed, so the test proves a PREFERENCE rather than
+        // merely the absence of the base.
+        install_image(&crate::layout::guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+        ));
+        let project_dir = crate::layout::project_guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+            &exec.closure_key(),
+        );
+        install_image(&project_dir);
+
+        let (image, provenance) = Image::find_for(&root, &exec).expect("the project image");
+        assert_eq!(provenance, Provenance::Project);
+        assert_eq!(provenance.warning(), None);
+        assert!(
+            image.kernel.starts_with(&project_dir),
+            "{:?} is not in the project's image directory",
+            image.kernel
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_declared_package_set_with_no_image_yet_says_so_rather_than_booting_quietly() {
+        // `idea.md` §16.2 forbids a silent downgrade. The base guest ships
+        // `devenv`, so booting it is usable — but the declared packages are
+        // NOT there, and a user who is not told will debug a missing `node`
+        // as though the image were broken.
+        let root = scratch("not-built");
+        install_image(&crate::layout::guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+        ));
+
+        let (_, provenance) =
+            Image::find_for(&root, &spec_with(&["nodejs_22"])).expect("the base image still boots");
+        assert_eq!(provenance, Provenance::BaseNotYetBuilt);
+        let warning = provenance.warning().expect("this case must warn");
+        assert!(warning.contains("no image is built"), "{warning}");
+        assert!(
+            warning.contains("devenv"),
+            "say what still works: {warning}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_projects_with_the_same_packages_share_one_image() {
+        // The cache-hit property, end to end: the second project's first
+        // `rachna start` must find the image the first one built. Keying by
+        // project id instead would build the same image once per project,
+        // which for a team sharing a stack is the cost this avoids.
+        let root = scratch("shared-image");
+        let one = spec_with(&["nodejs_22", "postgresql_16"]);
+        // Written in the other order, which `ExecSpec` preserves and
+        // `closure_key` must not.
+        let other = spec_with(&["postgresql_16", "nodejs_22"]);
+        install_image(&crate::layout::guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+        ));
+        install_image(&crate::layout::project_guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+            &one.closure_key(),
+        ));
+
+        let (first, _) = Image::find_for(&root, &one).expect("built for one");
+        let (second, provenance) = Image::find_for(&root, &other).expect("a hit for the other");
+        assert_eq!(provenance, Provenance::Project, "the second must HIT");
+        assert_eq!(first.kernel, second.kernel);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_different_package_set_does_not_reuse_another_projects_image() {
+        // The other half: a hit must require the SAME packages. Reusing an
+        // image built for a different set would boot a guest missing what
+        // the project declared, with nothing saying so.
+        let root = scratch("no-false-hit");
+        install_image(&crate::layout::guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+        ));
+        install_image(&crate::layout::project_guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+            &spec_with(&["nodejs_22"]).closure_key(),
+        ));
+
+        let (_, provenance) = Image::find_for(&root, &spec_with(&["python3"]))
+            .expect("the base image is the fallback");
+        assert_eq!(provenance, Provenance::BaseNotYetBuilt);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_incomplete_project_image_is_an_error_not_a_quiet_fallback() {
+        // A directory that exists and is missing a file is a BROKEN install,
+        // not an absent one. Falling back would hide it, and the user would
+        // keep booting the base image wondering why their packages never
+        // appear.
+        let root = scratch("incomplete-project");
+        let exec = spec_with(&["nodejs_22"]);
+        install_image(&crate::layout::guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+        ));
+        let project_dir = crate::layout::project_guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+            &exec.closure_key(),
+        );
+        std::fs::create_dir_all(&project_dir).expect("dirs");
+        std::fs::write(project_dir.join("Image"), b"k").expect("k");
+        // initramfs.gz and root.img deliberately absent.
+
+        let error = Image::find_for(&root, &exec).expect_err("an incomplete image must be refused");
+        let text = error.to_string();
+        assert!(text.contains("initramfs.gz"), "{text}");
+        assert!(text.contains("incomplete"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_service_alone_is_enough_to_need_a_project_image() {
+        // `services.postgres.enable` with no `environment.packages` still
+        // changes the closure, so `is_bare` must not look only at packages.
+        let root = scratch("service-only");
+        install_image(&crate::layout::guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+        ));
+        let exec = crate::exec::ExecSpec {
+            services: vec![crate::exec::Service {
+                name: "postgres".to_owned(),
+                enable: true,
+                port: Some(5432),
+            }],
+            ..crate::exec::ExecSpec::default()
+        };
+        assert!(!exec.is_bare());
+
+        let (_, provenance) = Image::find_for(&root, &exec).expect("falls back");
+        assert_eq!(
+            provenance,
+            Provenance::BaseNotYetBuilt,
+            "a declared service needs its own image too"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

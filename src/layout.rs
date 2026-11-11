@@ -275,6 +275,40 @@ pub fn guest_dir(rachna_root: &Path, guest_version: &str, arch: &str) -> PathBuf
         .join(format!("{guest_version}-{arch}"))
 }
 
+/// Where a PROJECT'S OWN guest image lives, keyed by its package set.
+///
+/// `00-PRODUCT.md` §1 promises an isolated Linux computer that `rachna.nix`
+/// configures, so a project declaring `environment.packages` gets an image
+/// built for it. That image cannot live in [`guest_dir`]: that directory is
+/// `08` §4.1.1's **only shared thing** — 493 MB per guest version rather
+/// than per project — and writing a project's packages into it would make
+/// every other project boot with them.
+///
+/// # Why keyed by the closure key rather than by project
+///
+/// Two projects declaring the same packages get the SAME directory, so the
+/// second one's first `rachna start` is a cache hit. Keying by project id
+/// would build the same image once per project, which for a team sharing a
+/// stack is the cost this exists to avoid. `ExecSpec::closure_key` is the
+/// key, and it deliberately excludes environment variables and entrypoints
+/// — those are read at run time, so changing `NODE_ENV` must not invalidate
+/// a built image.
+///
+/// The guest version stays in the path because a project image is still
+/// built against one base guest: an upgrade must not reuse an image whose
+/// packages were resolved against the old one.
+#[must_use]
+pub fn project_guest_dir(
+    rachna_root: &Path,
+    guest_version: &str,
+    arch: &str,
+    closure_key: &str,
+) -> PathBuf {
+    rachna_root
+        .join("guests")
+        .join(format!("{guest_version}-{arch}-{closure_key}"))
+}
+
 /// The default Rachna root for a given home directory.
 ///
 /// Takes `home` rather than reading `$HOME` — same reason as
@@ -287,6 +321,57 @@ pub fn default_root(home: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_image_directory_is_the_base_one_plus_its_key() {
+        let root = Path::new("/r");
+        let base = guest_dir(root, "26.11-abc", "aarch64");
+        let project = project_guest_dir(root, "26.11-abc", "aarch64", "deadbeef12345678");
+        assert_eq!(base, Path::new("/r/guests/26.11-abc-aarch64"));
+        assert_eq!(
+            project,
+            Path::new("/r/guests/26.11-abc-aarch64-deadbeef12345678")
+        );
+        // THE INVARIANT: never the same directory. `08` §4.1.1 calls the
+        // base directory the only shared thing, so writing a project's
+        // packages into it would make every other project boot with them.
+        assert_ne!(base, project);
+        assert!(project.starts_with(base.parent().unwrap()));
+    }
+
+    #[test]
+    fn the_shell_build_script_names_the_same_directory() {
+        // `ci/build-guest.sh` composes this path itself, as
+        // `$GUEST_VERSION-$ARCH-$RACHNA_CLOSURE_KEY`, because it runs
+        // before any Rust does. Two spellings of one path is how the host
+        // looks somewhere the builder never wrote — so the script is read
+        // and compared rather than trusted.
+        let script = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("ci/build-guest.sh"),
+        )
+        .expect("ci/build-guest.sh is part of the repo");
+        assert!(
+            script.contains("$GUEST_VERSION-$ARCH-$RACHNA_CLOSURE_KEY"),
+            "the build script no longer composes the keyed path this \
+             function produces"
+        );
+        assert!(
+            script.contains("guests/$GUEST_VERSION-$ARCH}"),
+            "the build script no longer composes the base path"
+        );
+    }
+
+    #[test]
+    fn a_project_directory_distinguishes_guest_versions() {
+        // A project image is built against ONE base guest, so an upgrade
+        // must not reuse an image whose packages were resolved against the
+        // old one.
+        let root = Path::new("/r");
+        assert_ne!(
+            project_guest_dir(root, "26.11-abc", "aarch64", "k"),
+            project_guest_dir(root, "27.05-def", "aarch64", "k")
+        );
+    }
 
     fn paths() -> ProjectPaths {
         let project = ProjectId::new("orders-api-a3f2").expect("a valid id");

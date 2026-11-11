@@ -28,11 +28,54 @@ case "${2:-${GUEST_ARCH:-$(uname -m)}}" in
   *) echo "unsupported guest arch: ${2:-$(uname -m)}" >&2; exit 1 ;;
 esac
 NIX_SYSTEM="$ARCH-linux"
-OUT="${1:-$HOME/.rachna/guests/$GUEST_VERSION-$ARCH}"
+# The default output directory. With a closure key it is a PROJECT image —
+# `layout::project_guest_dir` names it `<version>-<arch>-<key>` and
+# `Image::find_for` looks there first — and without one it is the shared base
+# image that `Image::find` loads. The two must not collide: writing a
+# project's packages into the shared directory would make every other project
+# boot with them.
+# The image's identity, when the caller supplies one.
+# `ExecSpec::closure_key` computes it host-side and
+# `layout::project_guest_dir` names the directory after it, so two projects
+# with the same packages share one image. Passed in rather than recomputed
+# here: a second implementation of the same hash is how the host and the
+# build would disagree about which image is which.
+#
+# Defined HERE rather than beside `RACHNA_PACKAGES` below, because `OUT`
+# reads it on the next line — the first version set it afterwards, where
+# the assignment was dead and the default path silently never carried a key.
+RACHNA_CLOSURE_KEY="${RACHNA_CLOSURE_KEY:-}"
+
+if [ -n "$RACHNA_CLOSURE_KEY" ]; then
+  OUT="${1:-$HOME/.rachna/guests/$GUEST_VERSION-$ARCH-$RACHNA_CLOSURE_KEY}"
+else
+  OUT="${1:-$HOME/.rachna/guests/$GUEST_VERSION-$ARCH}"
+fi
 PINNED="nixpkgs/3181085bfd08663b6b9e60bc7a8395c2aaa741bd"
 # Node comes from a different pin DELIBERATELY: at the pinned rev, nodejs_22
 # needs building and nodejs_20 fails an end-of-life assertion (02 §6.9).
 NODE_PIN="nixpkgs/nixos-25.05"
+
+# THE PROJECT'S PACKAGES, from `rachna.nix`.
+#
+# `ExecSpec` (`src/exec.rs`) parses `environment.packages` into a list of
+# nixpkgs attribute names, and this is where that list becomes files in an
+# image. Before this existed the image had Node and Postgres baked in with
+# their store paths substituted into the init as `@NODE@`/`@POSTGRES@` —
+# so every project booted with someone else's dependencies, and a project
+# needing anything else could not say so. `00-PRODUCT.md` §1 promises an
+# isolated Linux computer that `rachna.nix` configures, which a fixed
+# package set is not.
+#
+# Space-separated attribute names, e.g. `RACHNA_PACKAGES="ripgrep fd jq"`.
+# Each is fetched for the GUEST's system and symlinked into `/opt/packages`,
+# with its `bin` added to the guest's PATH.
+#
+# The default is the demo set, so an unparameterised build still produces
+# the image `guest/aarch64-init.sh` expects. A caller passing an empty
+# string gets a guest with no project packages, which is valid — `19` §4.5's
+# property is that an empty `rachna.nix` works.
+RACHNA_PACKAGES="${RACHNA_PACKAGES-${3-nodejs_22 postgresql_16}}"
 
 say() { printf '\n▸ %s\n' "$*"; }
 
@@ -61,13 +104,49 @@ MODULES=$(nix build --no-link --print-out-paths \
   "$PINNED#legacyPackages.${NIX_SYSTEM}.linuxPackages.kernel.modules")
 test -d "$MODULES/lib/modules" || { echo "no modules in $MODULES" >&2; exit 1; }
 
-say "fetching busybox, node, postgres, e2fsprogs"
+say "fetching busybox, e2fsprogs"
 BUSYBOX=$(nix build --no-link --print-out-paths \
   "$PINNED#legacyPackages.${NIX_SYSTEM}.pkgsStatic.busybox")
-POSTGRES=$(nix build --no-link --print-out-paths \
-  "$PINNED#legacyPackages.${NIX_SYSTEM}.postgresql_16" | grep -v -- '-man$' | head -1)
-NODE=$(nix build --no-link --print-out-paths \
-  "$NODE_PIN#legacyPackages.${NIX_SYSTEM}.nodejs_22" | head -1)
+
+# THE PROJECT'S PACKAGES, each fetched for the guest's system.
+#
+# One loop over `$RACHNA_PACKAGES` instead of a named variable per package.
+# The previous version had `POSTGRES=` and `NODE=` as separate lines, which
+# is why the image could only ever contain those two: adding a third meant
+# editing this script, so `environment.packages` had nowhere to go.
+#
+# `-man` outputs are dropped. `nix build` on `postgresql_16` prints several
+# store paths — the package and its `man`/`doc` outputs — and taking the
+# first was already wrong once: the measured failure was an image whose
+# `$POSTGRES/bin/postgres` did not exist because `-man` sorted first.
+PACKAGE_PATHS=""
+POSTGRES=""
+NODE=""
+for attr in $RACHNA_PACKAGES; do
+  # nodejs comes from a DIFFERENT pin deliberately: at the pinned rev
+  # `nodejs_22` needs building and `nodejs_20` fails an end-of-life
+  # assertion (`02` §6.9). Substitution-only is the whole premise of this
+  # script, so a package that would compile is fetched from a rev where it
+  # does not.
+  case "$attr" in
+    nodejs*) pin="$NODE_PIN" ;;
+    *)       pin="$PINNED" ;;
+  esac
+  say "fetching $attr"
+  path=$(nix build --no-link --print-out-paths \
+    "$pin#legacyPackages.${NIX_SYSTEM}.$attr" \
+    | grep -v -- '-man$' | grep -v -- '-doc$' | head -1)
+  test -n "$path" || { echo "no store path for $attr" >&2; exit 1; }
+  test -d "$path" || { echo "$attr: $path is not a directory" >&2; exit 1; }
+  PACKAGE_PATHS="$PACKAGE_PATHS $path"
+  # The two the stand-in's init substitutes by name. Recorded as they go
+  # past rather than fetched separately, so the demo keeps working while
+  # the list is general.
+  case "$attr" in
+    postgresql*) POSTGRES="$path" ;;
+    nodejs*)     NODE="$path" ;;
+  esac
+done
 E2FS=$(nix build --no-link --print-out-paths "nixpkgs#e2fsprogs" | grep -- '-bin$' | head -1)
 # A GUEST-ARCH e2fsprogs as well, because busybox's `mke2fs` writes
 # **ext2** and ships no `mkfs.ext4` — and this kernel has no ext2 driver
@@ -83,16 +162,32 @@ GUEST_E2FS=$(nix build --no-link --print-out-paths \
   "$PINNED#legacyPackages.${NIX_SYSTEM}.e2fsprogs" | grep -- '-bin$' | head -1)
 test -x "$GUEST_E2FS/bin/mke2fs" || { echo "no mke2fs in $GUEST_E2FS" >&2; exit 1; }
 
-# Everything must be a Linux binary, or it fetched the host's build by
-# mistake — which would fail at boot with no useful message.
-for binary in "$NODE/bin/node" "$POSTGRES/bin/postgres"; do
-  # The ELF's own architecture, not the one we asked for: a wrong `nix
-  # build` system silently fetches the host's build, which then fails at
-  # boot with no useful message.
-  case "$ARCH" in
-    aarch64) want='ELF.*aarch64' ;;
-    x86_64)  want='ELF.*x86-64' ;;
-  esac
+# EVERY fetched package must be a GUEST-arch Linux binary, or `nix build`
+# silently gave us the host's build — which fails at boot with no useful
+# message.
+#
+# Generalised from a hardcoded `$NODE/bin/node` and `$POSTGRES/bin/postgres`:
+# with packages coming from `rachna.nix`, neither is guaranteed to be in the
+# list, and a check naming absent files would either error on a valid build
+# or be deleted. So it checks one real executable from each package that has
+# any.
+case "$ARCH" in
+  aarch64) want='ELF.*aarch64' ;;
+  x86_64)  want='ELF.*x86-64' ;;
+esac
+for path in $PACKAGE_PATHS $GUEST_E2FS; do
+  # The first actual ELF in the package's `bin`, if it has one. A package
+  # may legitimately ship no executables (a library, a font) — that is not
+  # an error, so an empty `bin` is skipped rather than failing.
+  binary=""
+  for candidate in "$path"/bin/*; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ] \
+         && file "$candidate" | grep -q 'ELF'; then
+      binary="$candidate"
+      break
+    fi
+  done
+  test -n "$binary" || continue
   file "$binary" | grep -qE "$want" || {
     echo "$binary is not an $ARCH Linux ELF — wrong system fetched" >&2
     exit 1
@@ -173,8 +268,15 @@ test -f "$ROOT/lib/modules/$(basename "$MODULES/lib/modules"/*)/kernel/fs/fuse/v
   exit 1
 }
 
-say "copying closures ($(nix path-info -r "$NODE" "$POSTGRES" "$GUEST_E2FS" | wc -l | tr -d ' ') paths)"
-for path in $(nix path-info -r "$NODE" "$POSTGRES" "$GUEST_E2FS"); do
+# EVERY package's closure, not a fixed pair. `nix path-info -r` is given the
+# whole list so a package's own dependencies come too — a binary without its
+# libc fails at exec with "not found", which reads like a missing file rather
+# than a missing closure.
+CLOSURE_ROOTS="$PACKAGE_PATHS $GUEST_E2FS"
+# shellcheck disable=SC2086  # word splitting is the point: a LIST of roots
+say "copying closures ($(nix path-info -r $CLOSURE_ROOTS | wc -l | tr -d ' ') paths)"
+# shellcheck disable=SC2086  # as above
+for path in $(nix path-info -r $CLOSURE_ROOTS); do
   cp -a "$path" "$ROOT/nix/store/" 2>/dev/null || true
 done
 
@@ -198,6 +300,37 @@ echo rachna > "$ROOT/etc/hostname"
 # The guest's init. Store paths are substituted in, because Postgres
 # resolves share/ and lib/ from argv[0] and a /bin symlink breaks it
 # (02 §6.9).
+#
+# THE STAND-IN'S INIT NEEDS NODE AND POSTGRES SPECIFICALLY. It runs a demo
+# app and a database, so it is not package-agnostic the way the rest of this
+# script now is — and if they are absent, `$NODE` is empty and `@NODE@`
+# becomes `/bin/node`, a path that does not exist. The init would then boot,
+# report a dead app, and look like a runtime bug.
+#
+# So an absent package is refused HERE, with the reason, rather than
+# producing an image that fails confusingly three minutes into a boot. The
+# real guest (`guest/guest.nix` via `guest#vz-image`) has no such
+# constraint: it declares services properly and ships `devenv`, which is
+# why it is what should eventually replace this.
+for required in POSTGRES NODE; do
+  eval "value=\$$required"
+  if [ -z "$value" ]; then
+    cat >&2 <<MSG
+this stand-in image's init runs a Node demo app on Postgres, so both must be
+in RACHNA_PACKAGES — $required is missing.
+
+  got:  RACHNA_PACKAGES="$RACHNA_PACKAGES"
+  need: at least "nodejs_22 postgresql_16"
+
+Building an image without them produces an init pointing at /bin/node, which
+boots and then reports a dead app. For a package set of your own, build the
+real guest instead:
+
+  nix build ./guest#packages.$NIX_SYSTEM.vz-image
+MSG
+    exit 1
+  fi
+done
 sed -e "s|@POSTGRES@|$POSTGRES|g" -e "s|@NODE@|$NODE|g" -e "s|@E2FS@|$GUEST_E2FS|g" \
   "$(dirname "$0")/../guest/aarch64-init.sh" > "$ROOT/init"
 # CHECKED HERE, because a syntax error in the guest's init is a kernel

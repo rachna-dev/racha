@@ -141,13 +141,35 @@ jobs:
   # one. So the blocker was only ever local — stated as a platform limit for
   # most of this project's life, and never actually tried in CI.
   #
-  # `continue-on-error` while it is being proven: the stand-in is what ships
-  # today, and a red job on an unproven path would stop the pipeline that
-  # publishes a working image. Remove it once this is green.
+  # It builds `vz-image`, NOT `boot-bundle`. Both exist and they are
+  # different shapes on purpose: `boot-bundle` is for Cloud Hypervisor,
+  # which needs a PVH-capable ELF extracted from the bzImage nixpkgs ships
+  # (`05` §4.4), while Apple's `VZLinuxBootLoader` takes the kernel AS
+  # SHIPPED. `vz-image` also names its files `Image`/`initramfs.gz`/
+  # `root.img`, which is a CONTRACT with `boot.rs`'s `Image::find` — it
+  # looks for exactly those three in one version-named directory. The old
+  # version of this job built `boot-bundle` and would have produced an
+  # image `rachna start` reports as "incomplete" even on success.
+  #
+  # It also UPLOADS what it built. The old version ran `nix build` twice
+  # and threw the result away, so a green run shipped nothing — proving the
+  # build works is not the same as producing an image a user can download.
   real-guest:
-    name: the real NixOS guest (aarch64)
-    runs-on: ubuntu-24.04-arm
-    continue-on-error: true
+    name: the real NixOS guest · ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # NATIVE RUNNERS, unlike the stand-in's matrix above. The
+          # stand-in is pure substitution so any host can assemble it;
+          # this one BUILDS ~240 derivations for the guest's architecture,
+          # and nix refuses a foreign-platform derivation even when the
+          # work is writing a text file. So each arch builds on its own.
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
@@ -156,27 +178,78 @@ jobs:
             experimental-features = nix-command flakes
             accept-flake-config = true
 
+      # More aggressive than the stand-in's: that one fetches a 615 MB
+      # image, this one builds a system whose closure measured 758 MB of
+      # downloads for 2.3 GiB unpacked, plus a squashfs of the result and
+      # the work tree to make it.
       - name: reclaim disk
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache || true
           df -h / | tail -1
 
-      - name: build guest#boot-bundle
-        run: |
-          nix build --no-link --print-out-paths \
-            ./guest#packages.aarch64-linux.boot-bundle
-
-      # What it produced, because "the build succeeded" and "there is a
-      # bootable kernel and root" are different claims.
-      - name: what it produced
+      # ONE build, its path captured. `--print-out-paths` with `--no-link`
+      # gives the store path without writing a `result` symlink into the
+      # checkout.
+      - name: build the real guest
         run: |
           out=$(nix build --no-link --print-out-paths \
-            ./guest#packages.aarch64-linux.boot-bundle)
+            "./guest#packages.${{ matrix.arch }}-linux.vz-image")
+          test -n "$out" || { echo "nix build printed no path" >&2; exit 1; }
+          echo "GUEST_OUT=$out" >> "$GITHUB_ENV"
           ls -la "$out"
+
+      # The derivation already asserts non-empty files and the kernel
+      # magic, so this checks the ARTEFACT SHAPE: the three names
+      # `Image::find` requires, present and non-empty in one directory.
+      # A job that uploads an incomplete image is worse than one that
+      # fails.
+      - name: check what was produced
+        run: |
+          for f in Image initramfs.gz root.img; do
+            test -s "$GUEST_OUT/$f" \
+              || { echo "$f is missing or empty" >&2; exit 1; }
+          done
+          file -b "$GUEST_OUT/Image"
+          du -h "$GUEST_OUT"/* | sort -h
+
+      # Named `rachna-real-guest-…` so it cannot be confused with the
+      # stand-in's archive, which carries the same version and arch. Both
+      # are published while the real one is being proven on real hardware;
+      # the stand-in goes away once it is.
+      - name: package
+        run: |
+          version=$(grep -oE '^GUEST_VERSION="\$\{GUEST_VERSION:-[^}]+\}"' \
+            ci/build-guest.sh | sed -E 's/.*:-([^}]+)\}.*/\1/')
+          test -n "$version" || { echo "could not read GUEST_VERSION" >&2; exit 1; }
+          name="rachna-real-guest-$version-${{ matrix.arch }}.tar.gz"
+          # Dereferenced: the store output holds a `system` SYMLINK into
+          # /nix/store, and a tar of that link is useless on a machine
+          # with no such store. `-h` also makes the archive self-contained
+          # rather than silently arch-specific.
+          install -d pack
+          cp -L "$GUEST_OUT"/Image "$GUEST_OUT"/initramfs.gz \
+            "$GUEST_OUT"/root.img "$GUEST_OUT"/cmdline pack/
+          ( cd pack && sha256sum Image initramfs.gz root.img cmdline \
+              > SHA256SUMS && cat SHA256SUMS )
+          tar -C pack -czf "$name" \
+            Image initramfs.gz root.img cmdline SHA256SUMS
+          ls -la "$name"
+          echo "REAL_ARCHIVE=$name" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rachna-real-guest-${{ matrix.arch }}
+          path: ${{ env.REAL_ARCHIVE }}
+          retention-days: 14
 
   release:
     name: attach to a draft release
-    needs: build
+    # BOTH builds, so a release carries the real guest as well as the
+    # stand-in. With `needs: build` alone a tag could publish while the
+    # real-guest job was still running, and the release would be missing
+    # exactly the image it is meant to start shipping.
+    needs: [build, real-guest]
     # A tag or an explicit request only. A push to `main` that touches the
     # guest should BUILD the image — that is the regression check — without
     # creating a release for it.
@@ -185,9 +258,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Both patterns. `rachna-guest-*` would not match
+      # `rachna-real-guest-*`, so the real images would be built, uploaded
+      # as workflow artefacts, and then silently left out of the release.
       - uses: actions/download-artifact@v4
         with:
-          pattern: rachna-guest-*
+          pattern: rachna-*guest-*
           merge-multiple: true
 
       # DRAFT, deliberately. A guest image is the thing a user's
@@ -196,7 +272,9 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           draft: true
-          files: rachna-guest-*.tar.gz
+          files: |
+            rachna-guest-*.tar.gz
+            rachna-real-guest-*.tar.gz
           body: |
             Guest images for Rachna.
 

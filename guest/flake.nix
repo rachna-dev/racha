@@ -148,9 +148,123 @@
                 # The cmdline, written here so the backend does not reconstruct
                 # it. `console=ttyS0` is §4.3's measured requirement: the hvc0
                 # variant produces zero output AND zero errors.
-                cat > $out/cmdline <<EOF
-                init=${guest.config.system.build.toplevel}/init console=ttyS0 8250.nr_uarts=1 panic=1 nomodeset loglevel=4
-                EOF
+                # `printf` rather than a heredoc, for the reason recorded on
+                # `vz-image` below: an indented `<<EOF` terminator is never
+                # matched and the heredoc eats the rest of the script, as a
+                # warning rather than an error.
+                printf '%s\n' \
+                  'init=${guest.config.system.build.toplevel}/init console=ttyS0 8250.nr_uarts=1 panic=1 nomodeset loglevel=4' \
+                  > $out/cmdline
+              '';
+
+          # THE IMAGE `rachna start` LOADS, which is a different shape from
+          # `boot-bundle` above and deliberately so.
+          #
+          # `boot-bundle` targets Cloud Hypervisor: a PVH-capable ELF
+          # `vmlinux`, because CH cannot boot the bzImage nixpkgs ships
+          # (§4.4). Apple's Virtualization.framework wants the opposite —
+          # `VZLinuxBootLoader` takes the kernel AS SHIPPED, and an extracted
+          # ELF is not what it expects.
+          #
+          # The filenames are a contract with `boot.rs`, not a preference:
+          # `Image::find` looks for exactly `Image`, `initramfs.gz` and
+          # `root.img` in one version-named directory and reports a specific
+          # missing file otherwise. A bundle with the right contents under
+          # other names fails as "incomplete", which is why this exists
+          # rather than the CLI learning a second layout.
+          vz-image =
+            pkgs.runCommand "rachna-vz-image"
+              {
+                nativeBuildInputs = with pkgs; [
+                  gzip
+                  e2fsprogs
+                  squashfsTools
+                ];
+              }
+              ''
+                                mkdir -p $out
+
+                                # The kernel UNMODIFIED. aarch64 nixpkgs ships `Image`;
+                                # x86_64 ships `bzImage`, and VZ accepts that too — so the
+                                # file is copied under the name `boot.rs` expects rather
+                                # than converted.
+                                if [ -f ${kernel}/Image ]; then
+                                  cp ${kernel}/Image $out/Image
+                                else
+                                  cp ${kernel}/bzImage $out/Image
+                                fi
+
+                                # `initramfs.gz`, gzipped because that is the name the host
+                                # looks for. NixOS's `initialRamdisk` is already compressed,
+                                # so this is a copy under the contracted name — verified
+                                # with `file` below rather than assumed from the extension.
+                                cp ${guest.config.system.build.initialRamdisk}/initrd \
+                                  $out/initramfs.gz
+
+                                # The closure as the ROOT DISK. `guest.nix` mounts
+                                # `/dev/vda` as a squashfs at `/nix/.ro-store` and overlays
+                                # it, so `root.img` IS that squashfs — the name says "root"
+                                # because that is the disk the guest roots from, not because
+                                # it holds a conventional root filesystem.
+                                mksquashfs \
+                                  $(cat ${pkgs.writeClosure [ guest.config.system.build.toplevel ]}) \
+                                  $out/root.img \
+                                  -no-hardlinks -keep-as-directory -all-root -b 1048576 \
+                                  -comp zstd -Xcompression-level 6 -no-progress >/dev/null
+
+                                # The cmdline the host passes. `init=` must name the closure's
+                                # own init or the guest switch-roots into nothing — measured
+                                # in §4.3 as 15 targets reached then emergency mode.
+                                # `printf`, NOT a heredoc. Measured: an indented `<<EOF`
+                                # terminator is never matched — a Nix multi-line string's body is
+                                # indented, and the shell wants the terminator at column 0 — so
+                                # the heredoc swallows the REST OF THE SCRIPT. bash reports that
+                                # as a *warning* and exits 0, so every verification after it is
+                                # silently skipped on a build that looks fine. `printf` has no
+                                # terminator to indent.
+                                printf '%s\n' \
+                                  'init=${guest.config.system.build.toplevel}/init console=ttyS0 8250.nr_uarts=1 panic=1 nomodeset loglevel=4' \
+                                  > $out/cmdline
+
+                                # EVERY FILE NON-EMPTY, named one at a time. A 0-byte kernel
+                                # or root is the silent failure shape this project keeps
+                                # hitting: the build exits 0, the image looks present, and
+                                # the guest dies with no output.
+                                for f in Image initramfs.gz root.img cmdline; do
+                                  if [ ! -s $out/$f ]; then
+                                    echo "vz-image: $f is empty or missing" >&2
+                                    exit 1
+                                  fi
+                                done
+
+                                # The kernel must be a kernel, checked at the MEASURED magic
+                                # offsets rather than by scanning the head of the file.
+                                #
+                                # A first version grepped the first 64 bytes for `ARM64` or
+                                # `HdrS` and rejected a real x86_64 kernel: `HdrS` sits at
+                                # offset **514**, not in the header prologue. Measured on the
+                                # images this project actually ships —
+                                #
+                                #   aarch64:  `ARMd` at offset 56  (41 52 4d 64 — the
+                                #             documented `ARM\\x64`, whose fourth byte is
+                                #             the ASCII `d`, so it compares as text)
+                                #   x86_64:   `HdrS` at offset 514
+                                #
+                                # — so each is read where it lives. Worth the care because
+                                # copying the wrong file yields an image that boots to
+                                # nothing on the console (`02` §4), which is the failure
+                                # shape that costs the most time to diagnose.
+                                arm=$(dd if=$out/Image bs=1 skip=56 count=4 2>/dev/null)
+                                x86=$(dd if=$out/Image bs=1 skip=514 count=4 2>/dev/null)
+                                if [ "$arm" != "ARMd" ] && [ "$x86" != "HdrS" ]; then
+                                  echo "vz-image: Image carries neither the aarch64 nor the \
+                x86_64 kernel magic" >&2
+                                  exit 1
+                                fi
+
+                                # Checksums, so `install.sh` can verify what it fetched.
+                                ( cd $out && sha256sum Image initramfs.gz root.img cmdline \
+                                    > SHA256SUMS )
               '';
 
           default = self.packages.${system}.boot-bundle;
