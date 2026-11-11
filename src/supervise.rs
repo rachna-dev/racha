@@ -1380,6 +1380,90 @@ mod tests {
     }
 
     #[test]
+    fn signalling_actually_stops_a_process_and_escalates_if_ignored() {
+        // `signal_term` returning `Ok(())` WITHOUT SIGNALLING survived every
+        // test: the suite checked what `stop` reported, never whether the
+        // process died. A `rachna stop` that reports success and leaves the
+        // VM running is `24` §6a's measured leak — a guest holding ~1 GiB
+        // for hours — with a mechanism instead of an accident.
+        //
+        // Two processes, because the function has two paths and only the
+        // first is reached in the happy case.
+
+        // 1. A process that takes SIGTERM. `sleep` does.
+        let mut polite = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep spawns");
+        let polite_pid = polite.id();
+        assert!(is_alive(polite_pid), "the child did not start");
+        signal_term(polite_pid).expect("signalling a live process succeeds");
+        // `try_wait`, NOT `wait`.
+        //
+        // The first version called `wait()` here and the mutant SURVIVED:
+        // `wait` reaps the child unconditionally, a reaped pid stops
+        // answering `test_kill_process`, and so `!is_alive` passed even
+        // when nothing had been signalled — the assertion was measuring my
+        // own reap. `wait()` would also have blocked for the full `sleep 30`
+        // under the stub.
+        //
+        // `try_wait` asks without blocking, so a process that was never
+        // signalled is still running and still alive. Polled briefly
+        // because exiting is not instantaneous.
+        let exited = (0..40).any(|_| {
+            std::thread::sleep(GRACE_POLL);
+            matches!(polite.try_wait(), Ok(Some(_)))
+        });
+        assert!(
+            exited,
+            "signal_term returned Ok and the process never exited"
+        );
+        assert!(
+            !is_alive(polite_pid),
+            "signal_term returned Ok and the process is still running"
+        );
+
+        // 2. A process that IGNORES SIGTERM, which must still die. The
+        // escalation to SIGKILL is not a nicety: without it a hypervisor
+        // trapping TERM would hold the guest's memory indefinitely.
+        let mut stubborn = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 30"])
+            .spawn()
+            .expect("sh spawns");
+        let stubborn_pid = stubborn.id();
+        assert!(is_alive(stubborn_pid), "the stubborn child did not start");
+        let started = std::time::Instant::now();
+        signal_term(stubborn_pid).expect("signalling succeeds");
+        let killed = (0..40).any(|_| {
+            std::thread::sleep(GRACE_POLL);
+            matches!(stubborn.try_wait(), Ok(Some(_)))
+        });
+        assert!(
+            killed,
+            "a process ignoring SIGTERM survived signal_term — the SIGKILL \
+             escalation did not happen"
+        );
+        assert!(
+            !is_alive(stubborn_pid),
+            "the stubborn process is still alive"
+        );
+        // It waited out the grace period before insisting, rather than
+        // reaching for SIGKILL immediately — `24` §6 measured a hypervisor
+        // killed mid-write producing a snapshot that restores with NO ERROR
+        // AT ALL, so the grace is the point.
+        assert!(
+            started.elapsed() >= GRACE_POLL,
+            "SIGKILL came with no grace at all"
+        );
+
+        // 3. A pid that is already gone is SUCCESS, not failure: the goal is
+        // "not running", not "I was the one who stopped it". A stop that
+        // failed because the VM had already crashed would leave a user
+        // unable to start again.
+        signal_term(polite_pid).expect("an already-dead process is not an error");
+    }
+
+    #[test]
     fn a_failure_halfway_leaves_nothing_running() {
         // `24` §6a measured a VM outliving its shell for hours, holding ~1
         // GiB. A `start` that failed on step two and left step one running
@@ -1399,8 +1483,19 @@ mod tests {
         // killed process stops writing", which is what is being tested.
         let dir = scratch("partial");
         let log = dir.join("heartbeat");
+        // BOUNDED, not `while true`. An endless loop makes
+        // `Children::reap`'s `child.wait()` block FOREVER when
+        // `signal_term` is stubbed — which mutation testing does — so that
+        // mutant was reported as a TIMEOUT rather than CAUGHT, failing the
+        // build while saying nothing about test quality. Shortening the
+        // SLEEPERS alone did not fix it, because this test has its own
+        // process and this is the one that never exits.
+        //
+        // 20 ticks at 0.5s is 10s of writing: far longer than the 1.5s this
+        // test observes, and a hard ceiling on how long any wait can block.
         let script = format!(
-            "while true; do echo tick >> {}; sleep 0.5; done",
+            "i=0; while [ $i -lt 20 ]; do echo tick >> {}; sleep 0.5; \
+             i=$((i+1)); done",
             log.to_str().expect("utf8 temp path")
         );
         let plan = StartPlan {
