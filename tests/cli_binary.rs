@@ -262,6 +262,81 @@ fn nix_is_available() -> bool {
 }
 
 #[test]
+fn init_writes_a_config_that_is_valid_and_denies_by_default() {
+    // `init` RETURNING SUCCESS IS NOT THE PROPERTY. `ExitCode::default()`
+    // is success, so a mutant that wrote no file at all exited 0 and
+    // survived every test — the suite only checked the exit code, and
+    // `rachna init` printing "wrote rachna.nix" without writing one is the
+    // first thing a new user hits.
+    //
+    // So this asserts the FILE: that it exists, that it parses, and that
+    // what it grants is nothing.
+    let dir = std::env::temp_dir().join(format!("rachna-init-{}", std::process::id()));
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&home).expect("scratch dirs");
+
+    let binary = env!("CARGO_BIN_EXE_rachna");
+    let output = Command::new(binary)
+        .arg("init")
+        .current_dir(&dir)
+        .env("HOME", &home)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary runs");
+    assert_eq!(output.status.code(), Some(0), "init must succeed");
+
+    let config = dir.join("rachna.nix");
+    assert!(
+        config.is_file(),
+        "init exited zero and wrote no rachna.nix — the exact mutant that \
+         survived"
+    );
+    let text = std::fs::read_to_string(&config).expect("rachna.nix is readable");
+    assert!(!text.trim().is_empty(), "rachna.nix is empty");
+
+    // DENY BY DEFAULT, which is the product's central claim (`00` §1): the
+    // starter config must grant nothing. An `init` that wrote a permissive
+    // config would hand every new project network access nobody asked for.
+    assert!(
+        text.contains("network.allow = [ ]"),
+        "the starter config must grant no network: {text}"
+    );
+    assert!(
+        text.contains("environment.packages = [ ]"),
+        "the starter config must declare no packages: {text}"
+    );
+
+    // It must also be REAL NIX. A template that parses as text and fails
+    // to evaluate turns `init` straight into an error on the next command.
+    if nix_is_available() {
+        let evaluated = Command::new("nix")
+            .args(["eval", "--json", "-f"])
+            .arg(&config)
+            .current_dir(&dir)
+            .env("HOME", &home)
+            .output()
+            .expect("nix runs");
+        assert!(
+            evaluated.status.success(),
+            "the starter rachna.nix does not evaluate: {}",
+            String::from_utf8_lossy(&evaluated.stderr)
+        );
+        let json = String::from_utf8_lossy(&evaluated.stdout);
+        // The keys the parser reads, in the shape it expects. A template
+        // that evaluates to the wrong SHAPE fails at `start` instead, where
+        // the message is about a config the user did not write.
+        for key in ["tier", "profile", "network", "environment"] {
+            assert!(json.contains(key), "{key} missing from {json}");
+        }
+    } else {
+        println!("SKIP: no `nix`, so the template is checked as text only");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn every_start_prints_the_access_summary_even_when_approved() {
     // THE user-reported defect, at the binary. `00` §3.10c once said
     // "thereafter start is silent", the implementation followed it, and a

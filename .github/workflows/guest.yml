@@ -13,19 +13,33 @@
 name: guest
 
 on:
-  # A TAG BUILDS UNCONDITIONALLY, in its own trigger. Putting `tags` and
-  # `paths` under one `push` applies the path filter to tags too, so `v1.0`
-  # would build images only if that commit happened to touch `guest/` —
-  # which a release tag usually does not. Releases would have silently
-  # shipped no images.
+  # MAIN AND TAGS, WITH NO `paths` FILTER — deliberately, and the absence is
+  # the load-bearing part.
+  #
+  # GitHub allows one `push:` key, and a `paths:` filter inside it applies
+  # to TAG pushes as well: `v1.0` would then build images only if that
+  # commit happened to touch `guest/`, which a release tag usually does
+  # not, and the release would silently ship no images.
+  #
+  # And without `branches: [main]` the build never ran outside a tag at
+  # all. Measured: a commit rewriting `guest/flake.nix` AND
+  # `ci/build-guest.sh` triggered no guest run, because this project pushes
+  # straight to main and only `pull_request` carried the path filter. A tag
+  # was therefore the first place a broken image build could surface —
+  # exactly the case the filter was meant to prevent.
+  #
+  # So the trade is explicit: every push to main builds the images, doc-only
+  # commits included, in exchange for never discovering at tag time that
+  # the thing a user boots does not build.
   push:
+    branches: [main]
     tags: ['v*']
 
-  # And a change to what the image is MADE of rebuilds it. A tag is a bad
-  # place to discover the image build is broken, and so is a user's first
-  # `rachna start`: the ext4 bug that wiped the state volume on every boot
-  # would be caught here, now that the build asserts the filesystem it
-  # writes is one the kernel can mount.
+  # A change to what the image is MADE of rebuilds it on a PR too. Path
+  # filters are safe here, because a pull request has no tag to mis-filter:
+  # the ext4 bug that wiped the state volume on every boot would be caught
+  # before merge, now that the build asserts the filesystem it writes is
+  # one the kernel can mount.
   pull_request:
     paths:
       - 'ci/build-guest.sh'

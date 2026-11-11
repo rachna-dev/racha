@@ -1082,6 +1082,129 @@ mod tests {
         assert!(!file.starts_with(paths.snapshot_dir()));
     }
 
+    #[test]
+    fn each_request_file_has_its_own_distinct_name() {
+        // THE CROSS-PROCESS CONTRACT. `rachna stop` creates one of these
+        // files and a supervisor in a DIFFERENT PROCESS polls for it, so
+        // the two agree only by both calling these functions. A wrong or
+        // empty path means `stop` writes somewhere nothing watches: the
+        // supervisor keeps running, the guest is never asked to stop, and
+        // the signal that follows is the destructive path `02` §6 measured
+        // as leaving the state volume unflushed.
+        //
+        // Asserted as LITERAL NAMES, not just `starts_with` the runtime
+        // directory. The existing state-file test checks only the prefix,
+        // which is why `Default::default()` survived here — an empty path
+        // fails no prefix check that an absent file would pass.
+        let project = crate::layout::ProjectId::new("app-a3f2").expect("valid");
+        let paths = ProjectPaths::new(Path::new("/home/dev/.rachna"), &project);
+        let runtime = paths.runtime_dir();
+
+        for (path, name) in [
+            (shutdown_request(&paths), "shutdown"),
+            (suspend_request(&paths), "suspend"),
+            (resume_request(&paths), "resume"),
+            (held_marker(&paths), "held"),
+        ] {
+            assert_eq!(
+                path,
+                runtime.join(name),
+                "the {name} request moved — a supervisor polling the old \
+                 name would never see it"
+            );
+            assert_eq!(path.file_name().expect("a filename"), name);
+            // In the runtime directory, because `layout.rs`'s rule is that
+            // everything there dies with the VM. A request file surviving a
+            // stop would ask the NEXT boot to shut down.
+            assert!(path.starts_with(&runtime), "{path:?}");
+            assert!(!path.starts_with(paths.snapshot_dir()), "{path:?}");
+        }
+
+        // ALL FOUR DISTINCT. The three requests mean "keep your state",
+        // "discard it" and "bring it back" — confusing any pair loses
+        // work, which is the reason there are three files rather than one
+        // with a payload.
+        let all = [
+            shutdown_request(&paths),
+            suspend_request(&paths),
+            resume_request(&paths),
+            held_marker(&paths),
+        ];
+        for (i, one) in all.iter().enumerate() {
+            for other in all.iter().skip(i + 1) {
+                assert_ne!(one, other, "two request files share a path");
+            }
+        }
+    }
+
+    #[test]
+    fn every_role_describes_itself_differently_and_readably() {
+        // `describe` is what a user reads when a process dies, so an empty
+        // string is a failure report naming nothing. Nothing asserted the
+        // wording, so returning `""` survived.
+        assert_eq!(Role::Virtiofsd.describe(), "virtiofsd");
+        assert_eq!(Role::Hypervisor.describe(), "cloud-hypervisor");
+        assert_eq!(Role::Supervisor.describe(), "rachna, holding the guest");
+
+        for role in [Role::Virtiofsd, Role::Hypervisor, Role::Supervisor] {
+            assert!(!role.describe().is_empty(), "{role} describes nothing");
+            // The description may contain spaces where the TOKEN may not —
+            // that distinction is the whole reason the two differ, and a
+            // `describe` that merely returned `as_str` would make the
+            // separate method pointless.
+            assert!(
+                role.describe().contains(role.as_str()) || role == Role::Supervisor,
+                "{role}'s description does not mention it"
+            );
+        }
+        // Distinct, or a user cannot tell which process died.
+        assert_ne!(Role::Virtiofsd.describe(), Role::Hypervisor.describe());
+        assert_ne!(Role::Hypervisor.describe(), Role::Supervisor.describe());
+    }
+
+    #[test]
+    fn a_project_with_no_state_file_is_not_running() {
+        // `is_running_project` returning a CONSTANT survived both ways,
+        // which means nothing distinguished a running project from a
+        // stopped one. Both answers are load-bearing: a false positive
+        // makes `start` refuse forever after a crash, and a false negative
+        // starts a second VM over a live one.
+        let dir = scratch("not-running");
+        let project = crate::layout::ProjectId::new("app-a3f2").expect("valid");
+        let paths = ProjectPaths::new(&dir, &project);
+        assert!(
+            !is_running_project(&paths),
+            "no state file must mean not running"
+        );
+
+        // A record naming a pid that cannot be alive. 0x7FFF_FFFF is above
+        // every platform's pid_max, so it is reliably absent rather than
+        // merely unlikely — picking a plausible pid would make this test
+        // flaky on a busy machine.
+        std::fs::create_dir_all(paths.runtime_dir()).expect("runtime dir");
+        std::fs::write(
+            state_file(&paths),
+            format!("{} 2147483647\n", Role::Supervisor.as_str()),
+        )
+        .expect("write a stale record");
+        assert!(
+            !is_running_project(&paths),
+            "a record left by a crash must not report the project as running"
+        );
+
+        // THIS process, which is certainly alive.
+        std::fs::write(
+            state_file(&paths),
+            format!("{} {}\n", Role::Supervisor.as_str(), std::process::id()),
+        )
+        .expect("write a live record");
+        assert!(
+            is_running_project(&paths),
+            "a record naming a live pid must report the project as running"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- waiting for a socket ----------------------------------------
 
     #[test]
@@ -1154,19 +1277,37 @@ mod tests {
     /// test is the supervisor, not what it supervises. A test needing a real
     /// Cloud Hypervisor would not run in CI, and `01` §7's whole structure
     /// is that the layers below the backend are testable without one.
+    /// Two stand-in processes, long-lived enough to be observed and short
+    /// enough that no test can block on one.
+    ///
+    /// # Why `5` rather than `30`
+    ///
+    /// `Children::reap` calls `child.wait()`, which blocks until the
+    /// process exits — correct, because the signal has already been sent.
+    /// But mutation testing stubs `signal_term` to `Ok(())`, and then
+    /// nothing was signalled and every `wait()` blocks for the full sleep.
+    /// At 30s that pushed the suite past cargo-mutants' 110s timeout, so
+    /// the mutant was reported as a TIMEOUT rather than CAUGHT — which
+    /// fails the build while saying nothing about the test's quality.
+    ///
+    /// 5s is still far longer than any assertion here needs (the processes
+    /// are signalled within milliseconds), and bounds the worst case at a
+    /// few seconds per test instead of half a minute.
+    const SLEEP_SECS: &str = "5";
+
     fn sleeper_plan(socket: Option<PathBuf>) -> StartPlan {
         StartPlan {
             steps: vec![
                 Step {
                     role: Role::Virtiofsd,
                     program: "sleep".to_owned(),
-                    args: args(&["30"]),
+                    args: args(&[SLEEP_SECS]),
                     then_await: socket,
                 },
                 Step {
                     role: Role::Hypervisor,
                     program: "sleep".to_owned(),
-                    args: args(&["30"]),
+                    args: args(&[SLEEP_SECS]),
                     then_await: None,
                 },
             ],
