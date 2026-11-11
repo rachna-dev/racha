@@ -71,8 +71,49 @@ additional_cargo_test_args = ["-E", "not binary(eval_sandbox)"]
 # deliberate pause so a release is not blocked on a refactor, and recorded
 # here rather than as a silent file-level skip.
 #
+# A LEAKED SUPERVISOR PER MUTANT, which is a resource bug not a test bug.
+#
+# Measured: a mutation run left **18 orphaned `rachna start --supervise`
+# processes**, each holding a VM, and the machine ran out of memory and
+# killed every background task including the run itself. `24` §6a measured
+# one such process at ~1 GiB held for hours.
+#
+# The mechanism: `cli_binary`'s tests all point `HOME` at a scratch
+# directory, so they find no guest image and `start` refuses before
+# spawning — verified by running one and counting 0 orphans afterwards.
+# But a mutant inside the image-lookup path can make `start` believe an
+# image IS present, and it then spawns a supervisor the test never stops
+# (no `cli_binary` test runs `rachna stop`, because none of them expects to
+# have started anything).
+#
+# `timeout_multiplier` does not help: the supervisor is DETACHED, so
+# killing the test leaves it running.
+#
+# So the image lookup is excluded. It is not untestable — `boot.rs` has
+# nine tests over `find` and `find_for`, including every provenance case
+# and an incomplete directory — it is that MUTATING it costs the machine
+# rather than the suite. The alternative is a `stop` in every binary test,
+# which would hide the leak instead of preventing it.
+
 # All exclusions merged — TOML permits one key per table.
 exclude_re = [
+  # `in <fn>` AND `replace <fn> ->`, because cargo-mutants names a mutation
+  # two ways and only matching one leaves the rest live: with just the
+  # `replace` forms, `delete ! in Image::find` and `delete ! in
+  # Image::in_dir` were still listed. Verified with `--list`, which now
+  # reports none of these three.
+  # `\\b`, NOT `\b`. In a TOML basic string `\b` is an escape for the
+  # BACKSPACE character, so the pattern reached the regex engine as
+  # `in Image::find\x08` and matched nothing. Verified by parsing the file
+  # and printing the strings. The `commands::*` entries below already use
+  # `\\b` for this reason; mine did not, and `--list` still showed
+  # `delete ! in Image::find`.
+  "in Image::find\\b",
+  "in Image::find_for\\b",
+  "in Image::in_dir\\b",
+  "replace Image::find ->",
+  "replace Image::find_for ->",
+  "replace Image::in_dir ->",
   "replace > with >= in days_between",
   "replace binary_has_entitlement -> bool with true",
   "in commands::start\\b",

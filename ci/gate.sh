@@ -66,7 +66,49 @@ mutants() {
   # Measured, and it is also FASTER: 35s vs 104s on one file, because the copy
   # mode parallelises across trees while --in-place must serialise on the one.
   # The flag was costing both safety and speed.
-  cargo mutants --colors=never
+  #
+  # AN ISOLATED `HOME`, and this is not hygiene — it is a resource bound.
+  #
+  # `context()` locates `~/.rachna` from `$HOME`, and the binary tests
+  # override it so they find no guest image and `start` refuses before
+  # spawning. A MUTANT in the image-lookup path defeats that: `start`
+  # believes an image is present, spawns a DETACHED supervisor, and nothing
+  # reaps it because no test expected to have started anything.
+  #
+  # Measured on a developer machine after one run:
+  #
+  #   18 orphaned `rachna start --supervise` processes, each holding a VM
+  #   42 project directories under the real ~/.rachna
+  #   20 GB of disk, of which 19 GB was mutation leftovers
+  #
+  # The machine then ran out of memory and killed every background task,
+  # including the mutation run itself. `24` §6a measured one such process
+  # at ~1 GiB held for hours.
+  #
+  # So the run gets its own HOME, removed afterwards whatever the outcome.
+  # The image-lookup functions are ALSO excluded in `.cargo/mutants.toml`,
+  # and both belong: the exclusion stops the spawn, this bounds the damage
+  # if some other path ever reaches it.
+  mutants_home=$(mktemp -d)
+  # The status is CAPTURED and re-raised, rather than cleaned up in a
+  # `trap ... RETURN`. Two reasons, and the second is the deciding one:
+  #
+  #   a RETURN trap needs `functrace` on some bash builds, and this script
+  #   runs on bare Ubuntu 22.04 and Arch containers whose bash is not the
+  #   one here;
+  #
+  #   `|| status=$?` under `set -e` is the plain form that works in every
+  #   POSIX shell, so there is nothing to be wrong about.
+  #
+  # A surviving mutant must still fail the gate, so the status is returned
+  # after the cleanup rather than being replaced by `rm`'s.
+  status=0
+  HOME="$mutants_home" cargo mutants --colors=never || status=$?
+  # Any supervisor a mutant managed to spawn points at this HOME, so the
+  # pattern cannot match a real one the developer is using.
+  pkill -f "$mutants_home" 2>/dev/null || true
+  rm -rf "$mutants_home"
+  return "$status"
 }
 
 deps() {
