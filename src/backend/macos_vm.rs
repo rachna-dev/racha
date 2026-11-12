@@ -92,6 +92,45 @@ const POLL: Duration = Duration::from_millis(100);
 type Completion = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
 
 /// What went wrong, in the order a user can act on it.
+/// Why a declared mount cannot be shared with the guest.
+///
+/// Separate from [`VmError`] so each case carries its own fix. `00` §3.3:
+/// an error that names no action is not actionable, and a mount is the one
+/// part of `rachna.nix` a user is most likely to get wrong — it is the only
+/// field naming a path on their own machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountProblem {
+    /// The path does not exist on the host.
+    Absent,
+    /// The path is a file, and VZ shares only directories.
+    ///
+    /// Not a limitation worth hiding behind a shim. Sharing the parent
+    /// directory would widen the grant the user wrote — `~/.gitconfig`
+    /// becoming `~` — which is the opposite of deny-by-default, so this
+    /// refuses and says what to write instead.
+    NotADirectory,
+}
+
+impl std::fmt::Display for MountProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str(
+                "no such path on this machine. Check the spelling, or remove \
+                 the entry from `filesystem.mounts`",
+            ),
+            // The ALTERNATIVE, not just the refusal. A user who wrote
+            // `source = "~/.gitconfig"` wants their git identity in the
+            // guest, and "VZ shares directories" alone leaves them stuck.
+            Self::NotADirectory => f.write_str(
+                "Virtualization.framework shares a directory, never a single \
+                 file. Put the file in a directory of its own and share that \
+                 — e.g. `source = \"~/.config/git\"; target = \"~/.config/git\"`, \
+                 which is where git already looks",
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum VmError {
     /// The configuration is not valid for this host.
@@ -100,8 +139,36 @@ pub enum VmError {
     StartFailed(String),
     /// `start` never called back.
     StartTimedOut,
-    /// A path the configuration names does not exist.
+    /// A path the GUEST IMAGE needs does not exist.
+    ///
+    /// A broken or incomplete install — the kernel, initramfs or root image
+    /// that `ci/build-guest.sh` writes. Distinct from
+    /// [`Self::UnusableMount`] because the two have nothing in common but
+    /// the word "missing": one is fixed by re-fetching the image, the other
+    /// by editing `rachna.nix`, and a single variant forced one message to
+    /// advise both.
     Missing(std::path::PathBuf),
+    /// A `filesystem.mounts` entry cannot be shared.
+    ///
+    /// Virtualization.framework shares a **directory**, never a single
+    /// file, so `source = "~/.gitconfig"` cannot work however the host
+    /// spells it. Measured: with the two cases sharing one variant, that
+    /// mount reported
+    ///
+    /// ```text
+    /// the guest image is incomplete: /Users/you/.gitconfig is missing.
+    ///   Run `rachna doctor` to re-fetch it
+    /// ```
+    ///
+    /// — wrong on all three counts. The file EXISTS, the guest image is
+    /// fine, and `rachna doctor` cannot fix a config. `00` §3.3's rule is
+    /// that an error names the action; this one named the wrong one.
+    UnusableMount {
+        /// The host path as the config named it, after `~` expansion.
+        path: std::path::PathBuf,
+        /// Why it cannot be shared.
+        why: MountProblem,
+    },
     /// Save or restore failed.
     SaveRestore(String),
     /// This configuration cannot be snapshotted at all.
@@ -130,7 +197,13 @@ impl std::fmt::Display for VmError {
             // or how to get it.
             Self::Missing(path) => write!(
                 f,
-                "the guest image is incomplete: {} is missing.                  Run `rachna doctor` to re-fetch it",
+                "the guest image is incomplete: {} is missing. \
+                 Run `rachna doctor` to re-fetch it",
+                path.display()
+            ),
+            Self::UnusableMount { path, why } => write!(
+                f,
+                "filesystem.mounts cannot share {}: {why}",
                 path.display()
             ),
             Self::SaveRestore(why) => write!(f, "the snapshot could not be used: {why}"),
@@ -382,8 +455,26 @@ impl Guest {
             if !launch.shares.is_empty() {
                 let mut devices: Vec<Retained<VZDirectorySharingDeviceConfiguration>> = Vec::new();
                 for share in &launch.shares {
+                    // WHICH failure, because the fixes are unrelated: an
+                    // absent path is a typo, a file is a VZ limitation with
+                    // a documented alternative. Both used to report "the
+                    // guest image is incomplete … run `rachna doctor`",
+                    // which was wrong about the cause and about the action.
+                    //
+                    // `is_dir` follows symlinks, which is what we want:
+                    // `~/.gitconfig` is a symlink into the Nix store on a
+                    // home-manager machine, and the question is what it
+                    // points AT.
                     if !share.host_path.is_dir() {
-                        return Err(VmError::Missing(share.host_path.clone()));
+                        let why = if share.host_path.exists() {
+                            MountProblem::NotADirectory
+                        } else {
+                            MountProblem::Absent
+                        };
+                        return Err(VmError::UnusableMount {
+                            path: share.host_path.clone(),
+                            why,
+                        });
                     }
                     // `02` §4.1, measured on the guest side: never mount a
                     // host share over a directory systemd owns. The TAG is
@@ -817,6 +908,14 @@ mod tests {
             VmError::StartFailed("no entitlement".to_owned()),
             VmError::StartTimedOut,
             VmError::Missing(std::path::PathBuf::from("/no/kernel")),
+            VmError::UnusableMount {
+                path: std::path::PathBuf::from("/Users/you/.gitconfig"),
+                why: MountProblem::NotADirectory,
+            },
+            VmError::UnusableMount {
+                path: std::path::PathBuf::from("/Users/you/typo"),
+                why: MountProblem::Absent,
+            },
             VmError::SaveRestore("invalidated by a macOS update".to_owned()),
             VmError::SnapshotUnsupported("device set".to_owned()),
         ];
@@ -828,6 +927,66 @@ mod tests {
                 "{case:?} should read as a sentence fragment: {text}"
             );
         }
+    }
+
+    #[test]
+    fn a_bad_mount_blames_the_config_rather_than_the_guest_image() {
+        // MEASURED DEFECT. `filesystem.mounts` with `source = "~/.gitconfig"`
+        // — the shape the README documented — reported
+        //
+        //   the guest image is incomplete: /Users/you/.gitconfig is missing.
+        //     Run `rachna doctor` to re-fetch it
+        //
+        // and every clause of that is wrong: the file EXISTS, the guest image
+        // is fine, and `rachna doctor` cannot fix a `rachna.nix` entry. One
+        // `VmError::Missing` variant was serving two unrelated causes, so its
+        // message had to pick one and picked the other.
+        let file = VmError::UnusableMount {
+            path: std::path::PathBuf::from("/Users/you/.gitconfig"),
+            why: MountProblem::NotADirectory,
+        };
+        let text = file.to_string();
+        assert!(text.contains("filesystem.mounts"), "{text}");
+        assert!(text.contains("/Users/you/.gitconfig"), "{text}");
+        // Does NOT send the user to the wrong tool, or blame the install.
+        assert!(!text.contains("rachna doctor"), "{text}");
+        assert!(!text.contains("guest image"), "{text}");
+        // `00` §3.3: names the ACTION. A refusal with no alternative leaves
+        // a user who wanted their git identity in the guest stuck, and the
+        // tempting workaround — sharing the parent — would silently widen
+        // `~/.gitconfig` to `~`.
+        assert!(
+            text.contains("~/.config/git"),
+            "the message must offer the directory that works: {text}"
+        );
+        assert!(text.contains("never a single file"), "{text}");
+
+        // The other cause keeps its own advice.
+        let absent = VmError::UnusableMount {
+            path: std::path::PathBuf::from("/Users/you/typo"),
+            why: MountProblem::Absent,
+        };
+        let text = absent.to_string();
+        assert!(text.contains("no such path"), "{text}");
+        assert!(text.contains("Check the spelling"), "{text}");
+        assert!(
+            !text.contains("never a single file"),
+            "an absent path is not a file-vs-directory problem: {text}"
+        );
+    }
+
+    #[test]
+    fn the_guest_image_error_still_points_at_doctor() {
+        // The OTHER half of the split: a genuinely incomplete install is
+        // what `rachna doctor` fixes, so that advice must survive.
+        let text = VmError::Missing(std::path::PathBuf::from("/no/kernel")).to_string();
+        assert!(text.contains("guest image is incomplete"), "{text}");
+        assert!(text.contains("rachna doctor"), "{text}");
+        // The run of stray spaces that was in the literal.
+        assert!(
+            !text.contains("  "),
+            "double spaces in the message: {text:?}"
+        );
     }
 
     #[test]

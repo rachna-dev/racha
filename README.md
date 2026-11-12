@@ -130,13 +130,25 @@ The build is a one-time cost — the guest image is shared across every project
   resources = { cpus = 4; memory = "2GB";
                 disk = "500MB"; processes = 512; }; # disk default 20GB, sparse
 
-  filesystem.mounts = [
-    { source = "~/.gitconfig";                     # ~ = your home
-      target = "~/.gitconfig";                     # ~ = the guest's home
+  filesystem.mounts = [                            # DIRECTORIES, not files
+    { source = "~/.config/git";                    # ~ = your home
+      target = "~/.config/git";                    # ~ = the guest's home
       access = "read-only"; }                      # read-only unless stated
   ];
 }
 ```
+
+The project directory containing `rachna.nix` is **mounted automatically** —
+you never declare it. It lands on `/workspace` in the guest, read-write,
+because a guest that cannot write to the workspace cannot compile or install
+anything. `rachna.nix` itself is excluded from that mount: a guest able to
+edit its own policy could grant itself permissions.
+
+`filesystem.mounts` is for everything *else*, and each entry must be a
+**directory** — Virtualization.framework shares a directory, never a single
+file. `source = "~/.gitconfig"` is refused rather than silently widened to
+`~`, which is why the example above shares `~/.config/git` (where git also
+looks) instead.
 
 Every field is optional. An empty `rachna.nix` is valid and gives you the base
 guest, which ships `devenv`, `direnv`, `git`, `fzf`, `ripgrep`, `fd`, `jq`,

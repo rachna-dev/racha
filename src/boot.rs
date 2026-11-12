@@ -316,7 +316,7 @@ fn mount_parameters(shares: &[Share]) -> String {
         .collect()
 }
 
-/// Every directory the guest can see./// Every directory the guest can see.
+/// Every directory the guest can see.
 ///
 /// The workspace, plus whatever `filesystem.mounts` declares. **The
 /// declared mounts were being gated and audited and never mounted** — the
