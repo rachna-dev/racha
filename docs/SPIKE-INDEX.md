@@ -31,6 +31,7 @@ number covers, so a reference can at least be placed.
 | `21` | release engineering: exit codes as an API, integrity of what we ship |
 | `23` | the eval sandbox: four concrete attacks a config can attempt |
 | `24` | snapshot cost, measured |
+| `26` | workspace filesystem performance: 1.5× of local on Linux with one flag, 10× on macOS with no flag available |
 
 Where a citation matters to understanding the code, the comment next to it
 carries the substance. Where it does not, treat it as provenance: somebody

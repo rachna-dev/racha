@@ -414,6 +414,119 @@
   #
   # Temporary, like the other probes — it belongs in the adversarial suite
   # once the agent can execute in the guest.
+  # ---- the workspace filesystem probe -----------------------------------
+
+  # WHY THIS EXISTS: virtiofs metadata cost over the workspace mount was
+  # measured on macOS at ~40000 stats/s against ~400000/s for the guest's
+  # own ext4 — a ~10x gap. Apple's Virtualization.framework exposes no
+  # caching knob for a directory share (`VZVirtioFileSystemDeviceConfiguration`
+  # has only tag/share), and the guest kernel's virtiofs client accepts
+  # only `dax` (Linux 6.18.54, `fs/fuse/virtio_fs.c`). So on macOS the gap
+  # is not configurable.
+  #
+  # `virtiofsd` — the Linux path — DOES offer `--cache={auto,always,never,
+  # metadata}` and `--writeback`. This unit measures whether those move the
+  # number, which decides whether "as fast as native" is reachable on Linux
+  # and therefore whether the two platforms need different work.
+  #
+  # Python, NOT a shell loop. That distinction invalidated four earlier
+  # rounds of this measurement: on a local filesystem a shell loop forking
+  # `/bin/stat` ran 20000 files in 48043 ms while a `python os.stat` loop
+  # took 57 ms — 843x, essentially all of it fork+exec. A probe whose
+  # overhead dwarfs what it measures reports a plausible number about
+  # nothing.
+  #
+  # Temporary, like the other probes here, and removed once the figure is
+  # recorded in a spike doc.
+  systemd.services.rachna-fs-probe = {
+    description = "Measure workspace metadata cost (diagnostic)";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      StandardOutput = "journal+console";
+      StandardError = "journal+console";
+    };
+    script = ''
+      set -u
+      py=${pkgs.python3}/bin/python3
+
+      # The policy under test is passed on the kernel command line, so one
+      # image serves every run and the harness chooses. Reported back so a
+      # console log is self-describing rather than needing the invocation
+      # alongside it.
+      policy=$(sed -n 's/.*rachna\.vfscache=\([a-z]*\).*/\1/p' /proc/cmdline)
+      echo "RACHNA-FS: policy=''${policy:-unset}"
+
+      if ! grep -q " /workspace " /proc/mounts; then
+        echo "RACHNA-FS: VERDICT=NO-WORKSPACE-MOUNT"
+        exit 0
+      fi
+
+      # Both trees built by the same code, so the comparison cannot drift:
+      # 20000 files each, one on the share and one on the guest's own ext4.
+      # Then each is stat'd 20 times — repeat-walk is the real workload,
+      # since an LSP or a build stats the same tree over and over.
+      $py - <<'PROBE'
+      import os, time, sys
+
+      COUNT, PASSES = 20000, 20
+
+      def build(root):
+          os.makedirs(root, exist_ok=True)
+          for i in range(COUNT):
+              with open(f"{root}/f{i}", "w") as handle:
+                  handle.write("x")
+          return len(os.listdir(root))
+
+      def walk(root, n):
+          start = time.monotonic()
+          for _ in range(PASSES):
+              for i in range(n):
+                  os.stat(f"{root}/f{i}")
+          return time.monotonic() - start
+
+      trees = {"virtiofs": "/workspace/.rachna-fs-probe",
+               "ext4": "/var/lib/rachna/fs-probe"}
+      counts, times = {}, {}
+      for name, root in trees.items():
+          try:
+              counts[name] = build(root)
+              times[name] = walk(root, counts[name])
+          except OSError as error:
+              print(f"RACHNA-FS: {name} FAILED: {error}")
+              sys.exit(0)
+
+      # REFUSED rather than reported if the trees differ: a ratio between
+      # two different file counts is not a comparison, and an earlier
+      # version printed one (2664 files vs 20000) as though it were.
+      if counts["virtiofs"] != counts["ext4"]:
+          print("RACHNA-FS: VERDICT=INVALID — "
+                f"virtiofs {counts['virtiofs']} files, ext4 {counts['ext4']}")
+          sys.exit(0)
+
+      for name in trees:
+          ops = counts[name] * PASSES
+          print(f"RACHNA-FS-{name.upper()}: {ops} stats in "
+                f"{times[name]:.2f}s ({ops / times[name]:.0f}/s)")
+      ratio = times["virtiofs"] / times["ext4"]
+      print(f"RACHNA-FS: VERDICT=VALID ratio={ratio:.1f}x "
+            f"(virtiofs/ext4, lower is better)")
+
+      for root in trees.values():
+          for i in range(COUNT):
+              try:
+                  os.unlink(f"{root}/f{i}")
+              except OSError:
+                  pass
+          try:
+              os.rmdir(root)
+          except OSError:
+              pass
+      PROBE
+    '';
+  };
+
   systemd.services.rachna-pids-probe = {
     description = "Measure the process limit, then test it (diagnostic)";
     wantedBy = [ "multi-user.target" ];
