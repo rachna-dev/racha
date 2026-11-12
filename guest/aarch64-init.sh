@@ -147,25 +147,31 @@ if grep -q " /workspace " /proc/mounts 2>/dev/null; then
     # trees "exactly the pathological case", because every operation is a
     # round trip rather than a stream.
     #
-    # 20000. Two scalings: 200, then 2000, both of which finished inside
-    # one tick. 20k small files is also the right ORDER for the workload
-    # being modelled — a `node_modules` tree is tens of thousands of files
-    # — so this is realistic rather than merely slow enough to time.
+    # 20000 files — the right ORDER for the workload being modelled, since
+    # a `node_modules` tree is tens of thousands of files.
     #
-    # The first version used 200 and reported
+    # ONE PROCESS DOING MANY SYSCALLS, never a shell loop forking a
+    # command per file. This is the correction that invalidated three
+    # earlier rounds of numbers from this probe, and it was only caught by
+    # measuring the same 20000 files three ways on a LOCAL filesystem:
     #
-    #   RACHNA-FS-MANY-CREATE: 200 files in 1s (~200/s)
-    #   RACHNA-FS-MANY-STAT:   200 files in 1s (~200/s)
+    #   shell loop forking /bin/stat   48043 ms      (416/s)
+    #   one `stat` with 20000 args     13936 ms
+    #   python os.stat loop               57 ms   (350877/s)
     #
-    # — identical figures, both of which are just "200 ÷ the clock's
-    # smallest unit". Two different operations cannot plausibly cost the
-    # same to the digit; that was the tell. Any workload finishing inside
-    # one tick measures the clock.
+    # 843x. The earlier probe reported "2500 stats/s over virtiofs" while
+    # a bare syscall loop on local disk does 350000/s — so essentially all
+    # of what it measured was fork-and-exec cost, and it could not have
+    # resolved the mount at all. The figure looked plausible, which is
+    # what made it dangerous.
     #
-    # The shell loop's own overhead is included and not subtracted, so
-    # these are a floor on the mount's cost rather than an isolated figure
-    # for it. Named `>=` for that reason.
+    # busybox has no scripting language, so `find -type f` and `ls -lR`
+    # are the fork-free instruments available: both walk and stat every
+    # entry inside a single process.
     many=20000
+    # CREATE still needs a loop — there is no fork-free way to make 20000
+    # files in busybox sh — so this figure is dominated by the shell and
+    # is reported as such rather than as a filesystem measurement.
     t0=$(date +%s)
     i=0
     while [ $i -lt $many ]; do
@@ -175,34 +181,83 @@ if grep -q " /workspace " /proc/mounts 2>/dev/null; then
     sync
     t1=$(date +%s)
     secs=$((t1 - t0)); [ "$secs" -lt 1 ] && secs=1
-    echo "RACHNA-FS-MANY-CREATE: $i files in ${secs}s (>=$((i / secs))/s)"
+    echo "RACHNA-FS-MANY-CREATE: $i files in ${secs}s (shell-bound, not an fs figure)"
 
+    # STAT, in ONE process. `find -type f` opens the directory once and
+    # stats every entry without forking, so what is timed is the mount.
+    #
+    # WALKED 20 TIMES, because one pass over 20000 files finished inside a
+    # single clock tick on BOTH filesystems:
+    #
+    #   RACHNA-FS-WALK-VIRTIOFS: 20001 entries in 1s
+    #   RACHNA-FS-WALK-EXT4:     20000 entries in 1s
+    #
+    # Identical, and both unresolved. Repeating the walk is the way to get
+    # above the clock without the shell-bound cost of creating more files
+    # (creation runs ~1200/s here, so 400k files would take minutes).
+    #
+    # 20 passes also measures the case that matters: an LSP or a build
+    # stats the SAME tree over and over, so repeat-walk cost is the real
+    # workload, not a first cold pass.
+    passes=20
     t0=$(date +%s)
-    j=0
-    while [ $j -lt "$i" ]; do
-      stat "$probe/f$j" >/dev/null 2>&1 || break
-      j=$((j + 1))
+    w=0
+    found=0
+    while [ $w -lt $passes ]; do
+      found=$(find "$probe" -type f 2>/dev/null | wc -l)
+      w=$((w + 1))
     done
     t1=$(date +%s)
     secs=$((t1 - t0)); [ "$secs" -lt 1 ] && secs=1
-    echo "RACHNA-FS-MANY-STAT: $j files in ${secs}s (>=$((j / secs))/s)"
+    total=$((found * passes))
+    echo "RACHNA-FS-WALK-VIRTIOFS: ${passes}x$found = $total entries in ${secs}s (>=$((total / secs))/s)"
 
     # A BASELINE ON THE STATE VOLUME, so the virtiofs figures mean
     # something. `/data` is ext4 on a virtio-blk disk — the same guest, the
     # same shell loop, a different filesystem — so the RATIO isolates what
     # the share costs. Without it a slow number could be the mount, the
     # kernel, busybox's shell, or this probe.
-    t0=$(date +%s)
-    k=0
+    # EXACTLY AS MANY FILES AS THE VIRTIOFS SIDE GOT, not `$many`.
+    #
+    # Measured failure: creation on the share stopped at 11736 of 20000
+    # (the init is time-bounded and the shell is slow), so the walk found
+    # 2664 files on virtiofs and 20000 on ext4 — and the probe cheerfully
+    # printed `>=53280/s` against `>=400000/s` as though that were a
+    # comparison. Two different workloads, reported as a ratio.
+    #
+    # `$found` is what the virtiofs walk actually saw, so both sides now
+    # walk the same number of entries, and the guard below refuses to
+    # compare if they still differ.
     mkdir -p /data/probe 2>/dev/null
-    while [ $k -lt $many ]; do
+    k=0
+    while [ $k -lt "$found" ]; do
       echo x > "/data/probe/f$k" 2>/dev/null || break
       k=$((k + 1))
     done
     sync
+    # The SAME fork-free walk, on ext4. This is the number the virtiofs
+    # walk must be compared against: identical instrument, identical file
+    # count, same guest, same kernel — so the ratio is the mount and
+    # nothing else.
+    t0=$(date +%s)
+    w=0
+    based=0
+    while [ $w -lt $passes ]; do
+      based=$(find /data/probe -type f 2>/dev/null | wc -l)
+      w=$((w + 1))
+    done
     t1=$(date +%s)
     secs=$((t1 - t0)); [ "$secs" -lt 1 ] && secs=1
-    echo "RACHNA-FS-BASELINE-CREATE: $k files on ext4 in ${secs}s (>=$((k / secs))/s)"
+    total=$((based * passes))
+    echo "RACHNA-FS-WALK-EXT4: ${passes}x$based = $total entries in ${secs}s (>=$((based * passes / secs))/s)"
+    # THE GUARD. A ratio between two different file counts is not a
+    # comparison, and printing one is how the previous round produced
+    # 53280/s vs 400000/s from unequal trees.
+    if [ "$based" != "$found" ]; then
+      echo "RACHNA-FS-COMPARISON-INVALID: virtiofs walked $found entries, ext4 walked $based — not comparable"
+    else
+      echo "RACHNA-FS-COMPARISON-VALID: both walked $found entries"
+    fi
     rm -rf /data/probe 2>/dev/null
 
     # IS THE METADATA GAP STRUCTURAL, OR IS THE MOUNT JUST UNTUNED?
@@ -239,14 +294,10 @@ if grep -q " /workspace " /proc/mounts 2>/dev/null; then
     for opt in "cache=always" "cache=auto" "dax=always"; do
       if mount -t virtiofs -o "$opt" workspace /mnt/ws-cached 2>/dev/null; then
         t0=$(date +%s)
-        m=0
-        while [ $m -lt "$i" ]; do
-          stat "/mnt/ws-cached/.rachna-probe/f$m" >/dev/null 2>&1 || break
-          m=$((m + 1))
-        done
+        m=$(find /mnt/ws-cached/.rachna-probe -type f 2>/dev/null | wc -l)
         t1=$(date +%s)
         secs=$((t1 - t0)); [ "$secs" -lt 1 ] && secs=1
-        echo "RACHNA-FS-TUNED-STAT[$opt]: $m files in ${secs}s (>=$((m / secs))/s)"
+        echo "RACHNA-FS-TUNED-WALK[$opt]: $m entries in ${secs}s (>=$((m / secs))/s)"
         umount /mnt/ws-cached 2>/dev/null
       else
         echo "RACHNA-FS-TUNED-STAT[$opt]: mount refused — option unsupported"
