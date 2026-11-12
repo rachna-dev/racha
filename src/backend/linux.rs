@@ -398,8 +398,37 @@ pub fn virtiofsd_args(socket: &Path, shared_dir: &Path) -> Vec<OsString> {
         // confined by default, correcting `11` §6 which claimed otherwise.
         // Sandboxing is left at its default precisely because the default is
         // the confined one.
+        // `metadata`, NOT `auto`. Measured on a real guest, 400 000 stats
+        // against the guest's own ext4 as the baseline (`26` §1):
+        //
+        //   never      8 544/s   44.5x slower than local
+        //   auto      94 540/s    4.1x          <- what this used to pass
+        //   metadata 255 867/s    1.5x
+        //   always   286 905/s    1.5x
+        //
+        // 4.1x to 1.5x for one word, and `metadata` rather than `always`
+        // because `always` is no faster here and additionally caches file
+        // CONTENTS — which changes what the guest sees when the host edits
+        // a file it has open, and the workspace is a live mount of the
+        // user's own directory (`00` §10).
+        //
+        // For scale: a build that stats ~100k paths pays 1.06s of
+        // filesystem overhead under `auto` and 0.39s under `metadata`,
+        // against 0.25s on local disk.
         "--cache".into(),
-        "auto".into(),
+        "metadata".into(),
+        // `--writeback` is NOT passed, and its absence is deliberate.
+        //
+        // It was enabled for every run in `26`'s sweep, so its individual
+        // contribution is unknown — `26` §6 lists it as untested for
+        // exactly this reason. A first version of this function added it
+        // and justified it by citing `04` §1's `--memory shared=on`
+        // finding, which is about MEMORY and says nothing about write
+        // caching; that was a bad argument for a plausible change.
+        //
+        // It stays off until measured on its own, because the workspace is
+        // a live mount of the user's directory and buffering writes
+        // changes when the host sees them.
     ]
 }
 
@@ -865,6 +894,50 @@ mod tests {
         assert!(args.contains(&"/p/vfs.sock".to_owned()));
         assert!(args.contains(&"--shared-dir".to_owned()));
         assert!(args.contains(&"/p/workspace".to_owned()));
+    }
+
+    #[test]
+    fn virtiofsd_caches_metadata_because_that_is_what_was_measured() {
+        // `26` §1, on a real guest, 400 000 stats against the guest's own
+        // ext4 as the baseline:
+        //
+        //   never      8 544/s   44.5x slower than local
+        //   auto      94 540/s    4.1x   <- the previous value
+        //   metadata 255 867/s    1.5x
+        //   always   286 905/s    1.5x
+        //
+        // Pinned as a LITERAL rather than "contains --cache", because the
+        // whole point is the value: `auto` is a valid-looking setting that
+        // costs 2.7x, and a test that only checked the flag was present
+        // would not have noticed.
+        let args: Vec<String> = virtiofsd_args(Path::new("/s"), Path::new("/d"))
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = args
+            .iter()
+            .position(|a| a == "--cache")
+            .expect("a cache policy must be set explicitly");
+        assert_eq!(
+            args[at + 1],
+            "metadata",
+            "`26` §1 measured metadata at 1.5x of local and auto at 4.1x"
+        );
+
+        // `always` is no faster and additionally caches file CONTENTS,
+        // which changes what the guest sees when the host edits a file it
+        // has open — and the workspace is a live mount of the user's own
+        // directory (`00` §10).
+        assert_ne!(args[at + 1], "always");
+
+        // `--writeback` is unmeasured on its own (`26` §6): it was on for
+        // every run in the sweep, so its contribution is unknown. Asserted
+        // ABSENT so enabling it has to be a deliberate change with a
+        // measurement behind it.
+        assert!(
+            !args.iter().any(|a| a == "--writeback"),
+            "writeback is untested in isolation: {args:?}"
+        );
     }
 
     #[test]

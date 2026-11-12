@@ -438,6 +438,104 @@
   #
   # Temporary, like the other probes here, and removed once the figure is
   # recorded in a spike doc.
+  # ---- does devenv actually work in here? --------------------------------
+
+  # `05` §6 recorded this as untested and §7.6 as undecided: devenv is
+  # INSTALLED in the image and reports its version, but a project's
+  # `devenv.nix` had never been evaluated inside the guest, and its normal
+  # mode of operation — building and mutating a Nix store — conflicts with
+  # the read-only store this guest has.
+  #
+  # The conflict is not incidental. `substituters = lib.mkForce [ ]` above
+  # is a SECURITY property: a guest that can fetch its own packages escapes
+  # both the reproducibility contract and the network policy (`19` §3). So
+  # devenv in here cannot download anything, by design.
+  #
+  # Which leaves the question this probe answers: given a `devenv.nix` in
+  # the workspace and no substituters, what does `devenv shell` do? The
+  # three possibilities are all worth distinguishing:
+  #
+  #   WORKS       — the closure it needs is already in the image
+  #   NEEDS-NET   — it tries to fetch and fails, so devenv support means
+  #                 building the closure HOST-SIDE (`05` §7.6's "likely
+  #                 answer") rather than shipping the binary
+  #   BROKEN      — it fails for some other reason entirely
+  #
+  # Reports on every path, including its own failure, per `15` §244.
+  systemd.services.rachna-devenv-probe = {
+    description = "Does devenv work in the guest? (diagnostic)";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      User = "dev";
+      StandardOutput = "journal+console";
+      StandardError = "journal+console";
+      # devenv writes state beside the config, and `/workspace` is the
+      # user's own directory, so this needs a writable HOME for its caches
+      # rather than root's.
+      Environment = [ "HOME=/tmp/devenv-probe" ];
+    };
+    # ABSOLUTE STORE PATHS, not bare names.
+    #
+    # A systemd unit does not inherit the login PATH, and
+    # `environment.systemPackages` populates `/run/current-system/sw/bin`
+    # for INTERACTIVE shells. The first version of this probe called
+    # `devenv` and `nix` by name and got
+    #
+    #   RACHNA-DEVENV: version=…: line 6: devenv: command not found
+    #
+    # on a guest whose closure definitely contains both — which reads as
+    # "devenv is missing from the image" and is not.
+    path = [
+      pkgs.devenv
+      pkgs.nix
+      pkgs.git
+    ];
+    script = ''
+      set -u
+      mkdir -p /tmp/devenv-probe
+      echo "RACHNA-DEVENV: devenv=$(devenv version 2>&1 | head -1)"
+      echo "RACHNA-DEVENV: nix=$(nix --version 2>&1 | head -1)"
+      echo "RACHNA-DEVENV: substituters=[$(nix config show substituters 2>/dev/null | tr -d ' ')]"
+
+      if [ ! -f /workspace/devenv.nix ]; then
+        echo "RACHNA-DEVENV: VERDICT=NO-CONFIG (no devenv.nix in the workspace)"
+        exit 0
+      fi
+
+      # THE STATUS OF THE COMMAND, not of the pipeline's last stage.
+      #
+      # The first version wrote `out=$(… | tail -20); status=$?` and `$?`
+      # was `tail`'s — always 0 — so the probe printed VERDICT=WORKS for a
+      # run whose own output said `failed to run command 'devenv'`. A
+      # probe that reports success when nothing executed is worse than no
+      # probe, which is `15` §244's whole point.
+      #
+      # Bounded, because a devenv that tries to reach the network will sit
+      # there until something gives up and the init must not be what
+      # blocks.
+      set +e
+      out=$(cd /workspace && timeout 120 devenv shell -- true 2>&1)
+      status=$?
+      set -e
+      echo "RACHNA-DEVENV: exit=$status"
+      printf '%s\n' "$out" | head -20 | sed 's/^/RACHNA-DEVENV-OUT: /'
+
+      if [ "$status" = 0 ]; then
+        echo "RACHNA-DEVENV: VERDICT=WORKS"
+      elif [ "$status" = 127 ] || printf '%s' "$out" | grep -qi 'command not found\|No such file or directory'; then
+        echo "RACHNA-DEVENV: VERDICT=NOT-INSTALLED (devenv is not on this unit's PATH)"
+      elif printf '%s' "$out" | grep -qiE 'cannot build|no such host|network|substituter|unable to download|fetch|offline'; then
+        echo "RACHNA-DEVENV: VERDICT=NEEDS-NET (host-side build required)"
+      elif [ "$status" = 124 ]; then
+        echo "RACHNA-DEVENV: VERDICT=TIMEOUT (probably waiting on the network)"
+      else
+        echo "RACHNA-DEVENV: VERDICT=BROKEN"
+      fi
+    '';
+  };
+
   systemd.services.rachna-fs-probe = {
     description = "Measure workspace metadata cost (diagnostic)";
     wantedBy = [ "multi-user.target" ];
