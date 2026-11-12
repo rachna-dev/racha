@@ -286,10 +286,15 @@ chmod +w "$ROOT/bin/busybox"
   # `mke2fs` included: the guest FORMATS its own state volume on first
   # use, because the host handing over a pre-formatted image would put the
   # host's e2fsprogs in the guest's boot path.
+  # `dd` and `time` are for the WORKSPACE THROUGHPUT PROBE in the init.
+  # virtiofs performance was never measured on macOS — `01` §3 lists it as
+  # the deciding risk for the Windows backend and `02` §6 records "no disk
+  # images attached, all benchmarks were RAM-only" — and it is the number
+  # that decides whether editing a project over the mount is usable.
   for c in sh mount umount echo cat ls sleep poweroff mkdir chown su id ps \
            grep env ln date head tail cut printf touch ip ifconfig hostname \
            mke2fs mkfs.ext2 blkid sync halt reboot insmod lsmod find uname stat df \
-           ps tr wc timeout kill; do
+           ps tr wc timeout kill dd time rm; do
     ln -sf busybox "bin/$c"
   done )
 

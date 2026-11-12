@@ -74,6 +74,142 @@ echo "RACHNA-UNAME: $(uname -a)"
 if grep -q " /workspace " /proc/mounts 2>/dev/null; then
   echo "RACHNA-WORKSPACE-MOUNTED"
   echo "RACHNA-WORKSPACE-FILES: $(cd /workspace && echo *)"
+
+  # WORKSPACE THROUGHPUT, because nothing had ever measured it.
+  #
+  # `02` §6 is explicit that the macOS benchmarks were RAM-only with "no
+  # disk images attached", and `01` §3 names filesystem performance — not
+  # the hypervisor — as the deciding risk for a backend. Every claim about
+  # whether you can compile over this mount rested on nothing.
+  #
+  # Two shapes, because they fail differently and a build does both:
+  #
+  #   BULK      one 32 MiB file. Shows the streaming ceiling — reading a
+  #             big artefact, writing a binary.
+  #   MANY      200 small files created then stat'd. This is the
+  #             `node_modules` / `target/` shape, and `06` §215 calls it
+  #             "exactly the pathological case" for a shared filesystem,
+  #             because every operation is a round trip rather than a
+  #             stream.
+  #
+  # Written under /workspace/.rachna-probe and REMOVED, so a user's project
+  # does not grow files it did not ask for. `|| echo` on every step: a
+  # probe that fails silently reports a number nobody can distinguish from
+  # a measurement (`15` §244's false-negative lesson).
+  probe=/workspace/.rachna-probe
+  if mkdir -p "$probe" 2>/dev/null; then
+    # ENOUGH WORK THAT A ONE-SECOND CLOCK CAN RESOLVE IT.
+    #
+    # Two earlier versions measured nothing, each for its own reason, and
+    # both are worth recording because the failures look like results:
+    #
+    #   `date +%s` arithmetic over 32 MiB — one-second granularity, so
+    #   anything faster than 32 MiB/s reported exactly "32 MiB/s". A
+    #   number that is an artefact of the clock, not of the mount.
+    #
+    #   `dd`'s own `bytes/sec` line — busybox's dd does NOT print one.
+    #   Measured: `RACHNA-FS-BULK-WRITE: 32MiB (unreported)`. GNU dd does,
+    #   and the host's dd does, which is how the assumption survived.
+    #
+    # So the work is scaled until the clock resolves it, and the figures are
+    # labelled `>=` because at 1 s granularity a reported 3 s span could be
+    # 2.01 s. 256 MiB and 2000 files BOTH still finished inside one tick —
+    #
+    #   RACHNA-FS-BULK-WRITE: 256MiB in 1s (>=256 MiB/s)
+    #   RACHNA-FS-MANY-CREATE: 2000 files in 1s (>=2000/s)
+    #
+    # which is a real result (the mount is not slow) and still not a
+    # measurement.
+    #
+    # 1 GiB, deliberately NOT more: the guest has 2048 MiB of RAM
+    # (`resources.memory` default), so a 2 GiB file would measure page-cache
+    # eviction and host swap rather than the share. Half of RAM is the
+    # largest size where the number still means what it claims to.
+    bulk_mib=1024
+    t0=$(date +%s)
+    dd if=/dev/zero of="$probe/bulk" bs=1M count=$bulk_mib 2>/dev/null
+    sync
+    t1=$(date +%s)
+    if [ -s "$probe/bulk" ]; then
+      secs=$((t1 - t0)); [ "$secs" -lt 1 ] && secs=1
+      echo "RACHNA-FS-BULK-WRITE: ${bulk_mib}MiB in ${secs}s (>=$((bulk_mib / secs)) MiB/s)"
+      t0=$(date +%s)
+      dd if="$probe/bulk" of=/dev/null bs=1M 2>/dev/null
+      t1=$(date +%s)
+      secs=$((t1 - t0)); [ "$secs" -lt 1 ] && secs=1
+      echo "RACHNA-FS-BULK-READ: ${bulk_mib}MiB in ${secs}s (>=$((bulk_mib / secs)) MiB/s)"
+    else
+      echo "RACHNA-FS-BULK: FAILED to write — mount may be read-only"
+    fi
+
+    # THE METADATA SHAPE, and the number that actually decides whether a
+    # build over this mount is usable: `06` §215 calls `node_modules`-shaped
+    # trees "exactly the pathological case", because every operation is a
+    # round trip rather than a stream.
+    #
+    # 20000. Two scalings: 200, then 2000, both of which finished inside
+    # one tick. 20k small files is also the right ORDER for the workload
+    # being modelled — a `node_modules` tree is tens of thousands of files
+    # — so this is realistic rather than merely slow enough to time.
+    #
+    # The first version used 200 and reported
+    #
+    #   RACHNA-FS-MANY-CREATE: 200 files in 1s (~200/s)
+    #   RACHNA-FS-MANY-STAT:   200 files in 1s (~200/s)
+    #
+    # — identical figures, both of which are just "200 ÷ the clock's
+    # smallest unit". Two different operations cannot plausibly cost the
+    # same to the digit; that was the tell. Any workload finishing inside
+    # one tick measures the clock.
+    #
+    # The shell loop's own overhead is included and not subtracted, so
+    # these are a floor on the mount's cost rather than an isolated figure
+    # for it. Named `>=` for that reason.
+    many=20000
+    t0=$(date +%s)
+    i=0
+    while [ $i -lt $many ]; do
+      echo x > "$probe/f$i" 2>/dev/null || break
+      i=$((i + 1))
+    done
+    sync
+    t1=$(date +%s)
+    secs=$((t1 - t0)); [ "$secs" -lt 1 ] && secs=1
+    echo "RACHNA-FS-MANY-CREATE: $i files in ${secs}s (>=$((i / secs))/s)"
+
+    t0=$(date +%s)
+    j=0
+    while [ $j -lt "$i" ]; do
+      stat "$probe/f$j" >/dev/null 2>&1 || break
+      j=$((j + 1))
+    done
+    t1=$(date +%s)
+    secs=$((t1 - t0)); [ "$secs" -lt 1 ] && secs=1
+    echo "RACHNA-FS-MANY-STAT: $j files in ${secs}s (>=$((j / secs))/s)"
+
+    # A BASELINE ON THE STATE VOLUME, so the virtiofs figures mean
+    # something. `/data` is ext4 on a virtio-blk disk — the same guest, the
+    # same shell loop, a different filesystem — so the RATIO isolates what
+    # the share costs. Without it a slow number could be the mount, the
+    # kernel, busybox's shell, or this probe.
+    t0=$(date +%s)
+    k=0
+    mkdir -p /data/probe 2>/dev/null
+    while [ $k -lt $many ]; do
+      echo x > "/data/probe/f$k" 2>/dev/null || break
+      k=$((k + 1))
+    done
+    sync
+    t1=$(date +%s)
+    secs=$((t1 - t0)); [ "$secs" -lt 1 ] && secs=1
+    echo "RACHNA-FS-BASELINE-CREATE: $k files on ext4 in ${secs}s (>=$((k / secs))/s)"
+    rm -rf /data/probe 2>/dev/null
+
+    rm -rf "$probe" 2>/dev/null \
+      || echo "RACHNA-FS-PROBE-LEFTOVER: could not remove $probe"
+  else
+    echo "RACHNA-FS-PROBE: cannot write to /workspace, skipping"
+  fi
 else
   echo "RACHNA-WORKSPACE-MISSING: no virtiofs share tagged 'workspace'"
 fi
