@@ -205,6 +205,41 @@ if grep -q " /workspace " /proc/mounts 2>/dev/null; then
     echo "RACHNA-FS-BASELINE-CREATE: $k files on ext4 in ${secs}s (>=$((k / secs))/s)"
     rm -rf /data/probe 2>/dev/null
 
+    # IS THE METADATA GAP STRUCTURAL, OR IS THE MOUNT JUST UNTUNED?
+    #
+    # The workspace is mounted with `options = [ "nofail" ]` and nothing
+    # else — no caching at all. virtiofs supports attribute and dentry
+    # caching (`cache=`, `dax`), and without them every `stat` is a
+    # guest->host round trip while a local `stat` is a page-cache hit.
+    # That alone could explain the ~10x gap, so it has to be measured
+    # before anyone concludes the share is inherently slow.
+    #
+    # The same host directory is mounted a SECOND time with caching on,
+    # and the identical loop runs against it. Two mounts of one share is
+    # exactly what `shares_for` refuses for policy reasons — here it is
+    # deliberate and read-only, inside a diagnostic.
+    #
+    # Reported whatever happens: an option the kernel rejects is a result
+    # ("this knob does not exist on this build"), not a reason to print
+    # nothing.
+    mkdir -p /mnt/ws-cached 2>/dev/null
+    for opt in "cache=always" "cache=auto" "dax=always"; do
+      if mount -t virtiofs -o "$opt" workspace /mnt/ws-cached 2>/dev/null; then
+        t0=$(date +%s)
+        m=0
+        while [ $m -lt "$i" ]; do
+          stat "/mnt/ws-cached/.rachna-probe/f$m" >/dev/null 2>&1 || break
+          m=$((m + 1))
+        done
+        t1=$(date +%s)
+        secs=$((t1 - t0)); [ "$secs" -lt 1 ] && secs=1
+        echo "RACHNA-FS-TUNED-STAT[$opt]: $m files in ${secs}s (>=$((m / secs))/s)"
+        umount /mnt/ws-cached 2>/dev/null
+      else
+        echo "RACHNA-FS-TUNED-STAT[$opt]: mount refused — option unsupported"
+      fi
+    done
+
     rm -rf "$probe" 2>/dev/null \
       || echo "RACHNA-FS-PROBE-LEFTOVER: could not remove $probe"
   else
