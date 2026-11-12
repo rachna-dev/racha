@@ -208,11 +208,24 @@ if grep -q " /workspace " /proc/mounts 2>/dev/null; then
     # IS THE METADATA GAP STRUCTURAL, OR IS THE MOUNT JUST UNTUNED?
     #
     # The workspace is mounted with `options = [ "nofail" ]` and nothing
-    # else — no caching at all. virtiofs supports attribute and dentry
-    # caching (`cache=`, `dax`), and without them every `stat` is a
-    # guest->host round trip while a local `stat` is a page-cache hit.
-    # That alone could explain the ~10x gap, so it has to be measured
-    # before anyone concludes the share is inherently slow.
+    # else, so the ~10x metadata gap could have been an untuned mount
+    # rather than a property of virtiofs. Worth ruling out before anyone
+    # concludes the share is inherently slow.
+    #
+    # ANSWERED, and `cache=` turned out not to exist. Linux 6.18.54's
+    # `fs/fuse/virtio_fs.c` declares its ENTIRE option table as:
+    #
+    #   static const struct fs_parameter_spec virtio_fs_parameters[] = {
+    #       fsparam_flag("dax", OPT_DAX),
+    #       fsparam_enum("dax", OPT_DAX_ENUM, dax_param_enums),
+    #       {}
+    #   };
+    #
+    # One option, `dax`, taking always/never/inode. There is no attribute
+    # or dentry cache knob to set. The `cache=` lines below are kept
+    # because a refusal is itself the measurement — and because reading
+    # that from the kernel source came AFTER guessing it from fuse, which
+    # does have such options and is a different filesystem.
     #
     # The same host directory is mounted a SECOND time with caching on,
     # and the identical loop runs against it. Two mounts of one share is
