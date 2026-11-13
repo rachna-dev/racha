@@ -203,10 +203,21 @@ impl Provenance {
     pub const fn warning(self) -> Option<&'static str> {
         match self {
             Self::Base | Self::Project => None,
+            // DOES NOT CLAIM `devenv shell` STILL WORKS, which an earlier
+            // version of this message did. `26` §6b measured it inside the
+            // real guest: devenv 2.4.0 and nix 2.34.8 are both present and
+            // working, and `devenv shell` fails at its first step —
+            // locking `github:cachix/devenv` — because
+            // `substituters = mkForce []` and deny-by-default networking
+            // mean the guest cannot fetch anything. Telling a user to fall
+            // back on something that cannot work is worse than saying
+            // nothing.
             Self::BaseNotYetBuilt => Some(
-                "this project declares packages, but no image is built for \
-                 them yet — booting the base guest, where `devenv shell` \
-                 still works",
+                "this project declares packages and no image is built for \
+                 them yet, so the base guest is booting WITHOUT them. Run \
+                 `rachna build` first — the packages are fetched on the \
+                 host, because a guest that could fetch its own would \
+                 escape the network policy",
             ),
         }
     }
@@ -583,10 +594,9 @@ mod tests {
 
     #[test]
     fn a_declared_package_set_with_no_image_yet_says_so_rather_than_booting_quietly() {
-        // `idea.md` §16.2 forbids a silent downgrade. The base guest ships
-        // `devenv`, so booting it is usable — but the declared packages are
-        // NOT there, and a user who is not told will debug a missing `node`
-        // as though the image were broken.
+        // `idea.md` §16.2 forbids a silent downgrade: the declared packages
+        // are NOT there, and a user who is not told will debug a missing
+        // `node` as though the image were broken.
         let root = scratch("not-built");
         install_image(&crate::layout::guest_dir(
             &root,
@@ -600,8 +610,22 @@ mod tests {
         let warning = provenance.warning().expect("this case must warn");
         assert!(warning.contains("no image is built"), "{warning}");
         assert!(
-            warning.contains("devenv"),
-            "say what still works: {warning}"
+            warning.contains("WITHOUT them"),
+            "say that the packages are absent, not merely that a build is \
+             pending: {warning}"
+        );
+        // NAMES THE COMMAND (`00` §3.3). A warning with no action leaves
+        // the user guessing what to run.
+        assert!(warning.contains("rachna build"), "{warning}");
+        // MUST NOT claim `devenv shell` is a workaround. An earlier version
+        // said "where `devenv shell` still works", and `26` §6b measured
+        // that inside the real guest: devenv is present and FAILS, because
+        // `substituters = mkForce []` means it cannot lock its own inputs.
+        // Pointing a user at something that cannot work is worse than
+        // saying nothing.
+        assert!(
+            !warning.contains("devenv shell"),
+            "`26` §6b: devenv shell cannot work in the guest: {warning}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

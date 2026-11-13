@@ -30,8 +30,8 @@ fn every_verb_the_parser_accepts_appears_in_the_help() {
     let (help, _, code) = rachna(&["--help"]);
     assert_eq!(code, 0);
     for verb in [
-        "init", "start", "stop", "suspend", "resume", "status", "doctor", "config", "audit",
-        "explain", "allow",
+        "init", "start", "stop", "suspend", "resume", "status", "build", "doctor", "config",
+        "audit", "explain", "allow",
     ] {
         assert!(help.contains(verb), "`{verb}` is undocumented:\n{help}");
     }

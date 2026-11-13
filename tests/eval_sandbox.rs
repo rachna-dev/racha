@@ -351,3 +351,72 @@ fn a_config_with_an_unknown_option_is_refused_end_to_end() {
         "a misspelled option must be refused, not read as no grants: {stdout}"
     );
 }
+
+// MOVED HERE FROM `cli_binary`, because it spawns a real `nix` and took
+// **153 seconds**. `ci/gate.sh` excludes this binary from the fast gate
+// (`-E 'not binary(eval_sandbox)'`) and runs it in a dedicated CI job for
+// exactly this reason — a 2.5-minute test in the gate is a gate people stop
+// running.
+//
+// `//!` would be an INNER doc comment, which is only legal at the top of a
+// file; appended here it produced five `expected outer doc comment` errors.
+#[test]
+fn build_on_a_project_with_no_packages_succeeds_and_explains_why() {
+    // A bare spec is the COMMON case, and building for it would produce an
+    // image identical to the shared base one. So `rachna build` has to
+    // succeed and say nothing needs doing — exiting non-zero would make a
+    // perfectly good project look broken, and silence would leave a user
+    // wondering whether it worked.
+    let dir = std::env::temp_dir().join(format!("rachna-build-bare-{}", std::process::id()));
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&home).expect("scratch dirs");
+    std::fs::write(
+        dir.join("rachna.nix"),
+        "{ tier = \"none\"; profile = \"sealed\"; }\n",
+    )
+    .expect("write a config");
+
+    // THIS FILE'S skip rule, which is stricter than a bare `println!`: a
+    // printed skip still exits 0, so a CI job with no Nix would report
+    // green having proven nothing. `RACHNA_REQUIRE_NIX=1` — which the CI
+    // job that installs Nix sets — turns a missing Nix into a failure.
+    if std::process::Command::new("nix")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        assert!(
+            skip_is_permitted(),
+            "RACHNA_REQUIRE_NIX is set but nix is unavailable — this job \
+             would otherwise pass having tested nothing"
+        );
+        eprintln!("SKIPPED build_on_a_project_with_no_packages: no nix");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rachna"))
+        .arg("build")
+        .current_dir(&dir)
+        .env("HOME", &home)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a bare spec is not a failure: {text}"
+    );
+    assert!(
+        text.contains("nothing needs building"),
+        "say why there was nothing to do: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -262,6 +262,31 @@ impl ProjectPaths {
 /// whole versioning scheme exists to prevent.
 pub const GUEST_VERSION: &str = "26.11-3181085";
 
+/// The FULL nixpkgs revision the guest and every project closure are built
+/// against.
+///
+/// `GUEST_VERSION` above carries the short form, which is enough to NAME a
+/// guest and not enough to fetch one: `nixpkgs/3181085` is ambiguous to Nix
+/// and a short hash is not a pin. So the full rev lives here, and
+/// [`nixpkgs_flake_ref`] composes the reference that resolves it.
+///
+/// Must match `guest/flake.lock`'s `nixpkgs` rev and `ci/build-guest.sh`'s
+/// `PINNED`. A test asserts all three agree, because a project closure built
+/// against a different nixpkgs than the guest would produce packages linked
+/// against the wrong libc — which fails at exec with "not found" rather than
+/// with anything mentioning a version.
+pub const NIXPKGS_REV: &str = "3181085bfd08663b6b9e60bc7a8395c2aaa741bd";
+
+/// The flake reference for the pinned nixpkgs.
+///
+/// A reference rather than a store path, because the store path only exists
+/// after a fetch and this is what performs it. `nix eval --raw <ref>#path`
+/// turns it into the path `closure.rs` needs for its `-I`.
+#[must_use]
+pub fn nixpkgs_flake_ref() -> String {
+    format!("nixpkgs/{NIXPKGS_REV}")
+}
+
 /// The shared guest directory for one guest version and architecture.
 ///
 /// `08` §4.1.1 calls this **the only shared thing**, and `24` §3 measured why
@@ -321,6 +346,54 @@ pub fn default_root(home: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pinned_nixpkgs_rev_agrees_everywhere_it_is_written() {
+        // THREE copies, and they must match. A project closure built
+        // against a different nixpkgs than the guest produces packages
+        // linked against the wrong libc, which fails at exec with
+        // "not found" — an error mentioning nothing about versions.
+        //
+        // Read from the files rather than asserted as a literal, so a
+        // deliberate bump is one edit and an accidental drift is a test
+        // failure.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lock = std::fs::read_to_string(root.join("guest/flake.lock"))
+            .expect("guest/flake.lock is part of the repo");
+        assert!(
+            lock.contains(NIXPKGS_REV),
+            "guest/flake.lock does not pin {NIXPKGS_REV}"
+        );
+        let script = std::fs::read_to_string(root.join("ci/build-guest.sh"))
+            .expect("ci/build-guest.sh is part of the repo");
+        assert!(
+            script.contains(NIXPKGS_REV),
+            "ci/build-guest.sh does not pin {NIXPKGS_REV}"
+        );
+
+        // And the SHORT form in `GUEST_VERSION` must be a prefix of the
+        // full one, or the directory name claims a guest built from a
+        // different revision.
+        let short = GUEST_VERSION
+            .split_once('-')
+            .map(|(_release, rev)| rev)
+            .expect("GUEST_VERSION carries a rev after the release");
+        assert!(
+            NIXPKGS_REV.starts_with(short),
+            "GUEST_VERSION's {short} is not a prefix of {NIXPKGS_REV}"
+        );
+    }
+
+    #[test]
+    fn the_flake_reference_names_the_full_revision() {
+        // A SHORT hash is not a pin: `nixpkgs/3181085` is ambiguous to Nix
+        // and would resolve to whatever matches. The reference must carry
+        // all 40 characters.
+        let reference = nixpkgs_flake_ref();
+        assert_eq!(reference, format!("nixpkgs/{NIXPKGS_REV}"));
+        assert_eq!(NIXPKGS_REV.len(), 40, "a git rev is 40 hex characters");
+        assert!(NIXPKGS_REV.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn a_project_image_directory_is_the_base_one_plus_its_key() {

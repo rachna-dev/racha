@@ -227,6 +227,16 @@ pub enum Command {
     Snapshots,
     /// `rachna status`
     Status,
+    /// `rachna build`
+    ///
+    /// Builds this project's package closure on the HOST, because the
+    /// guest cannot: `26` §6b measured `devenv shell` failing inside the
+    /// real guest at its first step, since `substituters = mkForce []`
+    /// means it has nothing to fetch from. Separate from `start` rather
+    /// than implicit in it, because a first build is a several-hundred-
+    /// megabyte download and `00` §3.10c's principle is that a user is
+    /// told what is about to happen rather than discovering it.
+    Build,
     /// `rachna doctor`
     Doctor,
     /// `rachna config inspect | diff | validate`
@@ -268,6 +278,7 @@ impl Command {
         match *self {
             // `00` §5.3's editing verbs wait on the CST editor.
             Self::Edit(_)
+            | Self::Build
             | Self::Doctor
             | Self::Config { .. }
             | Self::Audit { .. }
@@ -303,6 +314,7 @@ impl Command {
             Self::Resume { .. } => "resume",
             Self::Snapshots => "snapshots",
             Self::Status => "status",
+            Self::Build => "build",
             Self::Doctor => "doctor",
             Self::Config { action } => match action {
                 ConfigAction::Inspect => "config inspect",
@@ -606,6 +618,7 @@ fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
         "resume" => parse_named("resume", rest),
         "snapshots" => expect_no_args("snapshots", rest, Command::Snapshots),
         "status" => expect_no_args("status", rest, Command::Status),
+        "build" => expect_no_args("build", rest, Command::Build),
         "doctor" => expect_no_args("doctor", rest, Command::Doctor),
         "config" => parse_config(rest),
         "audit" => parse_audit(rest),
@@ -1092,6 +1105,7 @@ ENVIRONMENT
   resume [name]             bring a suspended environment back
   snapshots                 what is parked, and what can be resumed
   status                    what is running, and what it is allowed
+  build                     fetch this project's packages, host-side
   doctor                    check this host, and verify enforcement
 
 CONFIG

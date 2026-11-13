@@ -91,6 +91,7 @@ fn run(command: Command) -> ExitCode {
         Command::Resume { name } => commands::resume(name.as_deref()),
         Command::Snapshots => commands::snapshots(),
         Command::Status => commands::status(),
+        Command::Build => commands::build(),
         // Everything below still needs work that has not landed. Naming them
         // individually rather than with a catch-all so adding one is a
         // compile error here, not a silently-missing verb.
@@ -1349,6 +1350,201 @@ mod commands {
     const RESUME_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// `rachna snapshots`.
+    /// `rachna build` — build this project's package closure, host-side.
+    ///
+    /// # Why this is a command and not part of `start`
+    ///
+    /// A first build is a several-hundred-megabyte download. `00` §3.10c's
+    /// principle is that a user is told what is about to happen rather than
+    /// discovering it mid-launch, and the same reasoning applies: `start`
+    /// warns that packages are missing and names this command, rather than
+    /// quietly spending ten minutes on the network.
+    ///
+    /// # Why the host builds and not the guest
+    ///
+    /// `26` §6b measured `devenv shell` inside the real guest: devenv 2.4.0
+    /// and nix 2.34.8 are both present and working, and it fails at its
+    /// first step — locking `github:cachix/devenv` — because
+    /// `substituters = mkForce []` and deny-by-default networking mean the
+    /// guest can fetch nothing. That is `19` §3's rule working: a guest
+    /// able to fetch its own packages escapes both the reproducibility
+    /// contract and the network policy.
+    pub(crate) fn build() -> ExitCode {
+        let context = match context() {
+            Ok(context) => context,
+            Err(why) => {
+                eprintln!("rachna: {why}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        let (_, exec) = match run::evaluate_both(&context) {
+            Ok(both) => both,
+            Err(error) => return report(&error),
+        };
+
+        // THE PIN, RESOLVED TO A STORE PATH.
+        //
+        // `context.nixpkgs` is the placeholder `<nixpkgs>` — honest about
+        // being unfinished, and useless as a `-I` value: measured, the
+        // build failed with
+        //
+        //   error: file 'nixpkgs' was not found in the Nix search path
+        //
+        // because `-I nixpkgs=<nixpkgs>` names nothing. `layout` owns the
+        // full revision, and this fetches it. The fetch is itself a
+        // download rather than a build, so it is subject to the same
+        // "never compile" promise as everything else here.
+        let pin = match nix(
+            &[
+                "eval".into(),
+                "--raw".into(),
+                format!("{}#path", rachna::layout::nixpkgs_flake_ref()).into(),
+            ],
+            &["NIX_PATH"],
+        ) {
+            Ok(output) if output.ok && !output.stdout.trim().is_empty() => {
+                PathBuf::from(output.stdout.trim())
+            }
+            Ok(output) => {
+                eprintln!(
+                    "rachna: cannot resolve the pinned nixpkgs ({}):\n{}",
+                    rachna::layout::nixpkgs_flake_ref(),
+                    output.stderr.trim()
+                );
+                return ExitCode::from(FAILED);
+            }
+            Err(why) => {
+                eprintln!("rachna: {why}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        let plan = match rachna::closure::BuildPlan::for_spec(&exec, &pin) {
+            Ok(plan) => plan,
+            // `PlanError::Bare` is not a failure: it means the shared base
+            // image is the right one, which is the common case.
+            Err(why) => {
+                println!("{why}");
+                return ExitCode::from(OK);
+            }
+        };
+
+        // ASKED FIRST, because `06` §27 promises "a download, never a
+        // compile" and no flag can enforce it: `--max-jobs 0` refuses the
+        // `buildEnv` wrapper, which is never cached because it is unique
+        // to one package list (`26`, and the measured error is recorded in
+        // `closure.rs`). So a dry run says what WOULD be compiled, and a
+        // package that is not prebuilt is reported rather than silently
+        // becoming a long wait.
+        let dry = match nix(&plan.dry_run_args(), plan.cleared_env()) {
+            Ok(output) => output,
+            Err(why) => {
+                eprintln!("rachna: {why}");
+                return ExitCode::from(FAILED);
+            }
+        };
+        let would_compile = rachna::closure::would_compile(&dry.stderr, plan.closure_key());
+        if !would_compile.is_empty() {
+            // Separate `eprintln!`s, not one continued string. A `\`
+            // continuation in Rust keeps the NEXT line's indentation, so
+            // the measured output was
+            //
+            //   …no prebuilt binary for this                  system…
+            //
+            // with eighteen spaces mid-sentence. However this is spelled,
+            // the user reads the result.
+            eprintln!("rachna: these packages have no prebuilt binary for this system,");
+            eprintln!("so building them here would compile from source:");
+            for name in &would_compile {
+                eprintln!("  {name}");
+            }
+            eprintln!();
+            eprintln!("Rachna fetches, it does not compile. Pick a package that is");
+            eprintln!("cached for this system, or add a prebuilt one to your store.");
+            return ExitCode::from(FAILED);
+        }
+
+        println!("building {} package(s)", exec.packages.len());
+        let built = match nix(plan.args(), plan.cleared_env()) {
+            Ok(output) if output.ok => output,
+            Ok(output) => {
+                eprintln!("rachna: the build failed:\n{}", output.stderr.trim());
+                return ExitCode::from(FAILED);
+            }
+            Err(why) => {
+                eprintln!("rachna: {why}");
+                return ExitCode::from(FAILED);
+            }
+        };
+
+        let store_path = built.stdout.trim();
+        if store_path.is_empty() {
+            eprintln!("rachna: the build reported success but printed no store path");
+            return ExitCode::from(FAILED);
+        }
+
+        // RECORDED beside the image, because `nix build --print-out-paths`
+        // is the only thing that knows this path and re-running the build
+        // to ask again would defeat the caching this exists for.
+        let dir = rachna::layout::project_guest_dir(
+            &context.rachna_root,
+            rachna::layout::GUEST_VERSION,
+            rachna::boot::host_arch(),
+            plan.closure_key(),
+        );
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            eprintln!("rachna: cannot create {}: {error}", dir.display());
+            return ExitCode::from(FAILED);
+        }
+        let record = rachna::closure::closure_record(&dir);
+        if let Err(error) = std::fs::write(&record, format!("{store_path}\n")) {
+            eprintln!("rachna: cannot write {}: {error}", record.display());
+            return ExitCode::from(FAILED);
+        }
+
+        println!("  closure: {store_path}");
+        println!("  recorded: {}", record.display());
+        // HONEST ABOUT WHAT IS LEFT. The closure exists; turning it into a
+        // bootable image is the next step and is not built, so saying
+        // "done" here would be the "declared and never enforced" shape
+        // this project keeps finding.
+        println!();
+        println!("The closure is built. Assembling it into a guest image is not");
+        println!("wired up yet, so `rachna start` still boots the base guest");
+        println!("and says so.");
+        ExitCode::from(OK)
+    }
+
+    /// Runs `nix` with the given arguments and cleared environment.
+    ///
+    /// One helper rather than two call sites spawning it, because the
+    /// cleared environment is security-relevant: `23` §2 found `NIX_PATH`
+    /// load-bearing, and a second spawn site is how one of them comes to
+    /// forget.
+    fn nix(args: &[std::ffi::OsString], cleared: &[&str]) -> Result<NixOutput, String> {
+        let mut command = std::process::Command::new("nix");
+        command.args(args);
+        for name in cleared {
+            command.env_remove(name);
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("could not run `nix`: {error}"))?;
+        Ok(NixOutput {
+            ok: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    /// What a `nix` invocation produced.
+    struct NixOutput {
+        ok: bool,
+        stdout: String,
+        stderr: String,
+    }
+
     pub(crate) fn snapshots() -> ExitCode {
         let context = match context() {
             Ok(context) => context,
