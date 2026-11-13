@@ -794,7 +794,29 @@ mod commands {
                     // is over — and a snapshot no live process can restore
                     // is one `snapshots` would list and `resume` could not
                     // honour.
+                    //
+                    // SAID OUT LOUD, which it was not. Measured:
+                    //
+                    //   $ rachna suspend keepme
+                    //   suspended as `keepme` (140 MiB)
+                    //   $ rachna stop
+                    //   stopped 1 process(es), removed 0 file(s)
+                    //   $ rachna snapshots
+                    //   no snapshots. `rachna suspend` takes one
+                    //
+                    // The file was gone and the report said "removed 0
+                    // file(s)" — so a user who parked work under a name
+                    // and then stopped the environment lost it with no
+                    // message at all. The DELETION is right (`02` §6.11:
+                    // only the saving process can restore it, and that
+                    // process is exiting); the silence is not.
                     if let Some(name) = held.take() {
+                        eprintln!(
+                            "rachna: discarding snapshot `{name}` — `stop` ends \
+                             the session, and `02` §6.11 means no other process \
+                             could have restored it. Use `rachna suspend` alone \
+                             to keep it parked."
+                        );
                         let _ = std::fs::remove_file(name.path(&paths));
                     }
                     let _ = std::fs::remove_file(rachna::supervise::held_marker(&paths));
