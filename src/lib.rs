@@ -209,6 +209,7 @@ mod json_limits {
 pub mod backend;
 pub mod boot;
 pub mod cli;
+pub mod closure;
 pub mod config;
 pub mod eval;
 pub mod protocol;
