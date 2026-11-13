@@ -532,21 +532,24 @@ mod commands {
         supervise: bool,
         accepted: bool,
     ) -> ExitCode {
-        // WARNED HERE, ON THE USER'S TERMINAL, before anything forks.
+        // WARNED HERE, ON THE USER'S TERMINAL, before anything forks —
+        // and ONLY when this process is about to fork.
         //
-        // `launch_approved` also reports this, but it runs in the SUPERVISOR
-        // — a different process whose stderr goes to `supervisor.log`. So
-        // the warning was written somewhere nobody reads, which is the same
-        // silent-downgrade failure it exists to prevent. Verified by
-        // running it: the message appeared only in
-        // `~/.rachna/projects/<id>/run/supervisor.log`.
+        // `launch_approved` warns too, from inside the supervisor, whose
+        // stderr is `supervisor.log`. On a plain `rachna start` that file is
+        // the only place it would appear, so this line exists. But on
+        // `--supervise` the supervisor IS this process, and warning in both
+        // places printed the message TWICE — which reads as two separate
+        // problems rather than one. Measured on a real start.
         //
-        // A `Provenance` lookup here is a filesystem check and nothing
-        // more, so asking twice is cheaper than plumbing the answer into
-        // the child.
-        if let Ok((_, provenance)) = rachna::boot::Image::find_for(&context.rachna_root, exec) {
-            if let Some(warning) = provenance.warning() {
-                eprintln!("rachna: {warning}");
+        // A `Provenance` lookup is a filesystem check and nothing more, so
+        // asking twice is cheaper than plumbing the answer into the child.
+        #[cfg(target_os = "macos")]
+        if !supervise {
+            if let Ok((_, provenance)) = rachna::boot::Image::find_for(&context.rachna_root, exec) {
+                if let Some(warning) = provenance.warning() {
+                    eprintln!("rachna: {warning}");
+                }
             }
         }
 
@@ -586,11 +589,17 @@ mod commands {
         // which is the common case and must not need a build.
         let image = match Image::find_for(&context.rachna_root, exec) {
             Ok((image, provenance)) => {
-                // SAID OUT LOUD when the declared packages are not there.
-                // `idea.md` §16.2 forbids a silent downgrade, and booting
-                // the base image for a project that asked for packages is
-                // exactly that unless it is stated — a user would otherwise
-                // debug a missing `node` as though the image were broken.
+                // RECORDED, not printed. `launch_or_supervise` already
+                // warned on the user's own terminal before forking, and
+                // printing again here put the message out TWICE on a
+                // plain `rachna start` — once to the terminal and once
+                // into `supervisor.log`, which reads as two separate
+                // problems.
+                //
+                // `idea.md` §16.2's no-silent-downgrade rule is satisfied
+                // by the pre-fork warning; this line keeps the fact in the
+                // supervisor's own log, where someone reading only that
+                // file can still see which image was booted.
                 if let Some(warning) = provenance.warning() {
                     eprintln!("rachna: {warning}");
                 }

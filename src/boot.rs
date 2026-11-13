@@ -150,11 +150,41 @@ impl Image {
             host_arch(),
             &exec.closure_key(),
         );
-        if dir.is_dir() {
+        // THE KERNEL, not the directory.
+        //
+        // `dir.is_dir()` was the first version and it broke `rachna start`
+        // as soon as `rachna build` existed:
+        //
+        //   $ rachna build      # writes <dir>/closure-path
+        //   $ rachna start
+        //   rachna: the guest image is incomplete:
+        //     …-35e97d38cf5431ea/Image is missing. Rebuild it:
+        //       ./ci/build-guest.sh
+        //
+        // `build` creates that directory to record the closure path, so
+        // the directory exists with no image in it — and the old check
+        // committed to it, then reported a broken install and pointed at
+        // the wrong script. The advice was unfollowable: `build-guest.sh`
+        // builds the BASE image and would never populate a project
+        // directory.
+        //
+        // An image's identity is its kernel, so that is what is tested.
+        // `in_dir` still reports a SPECIFIC missing file afterwards, which
+        // keeps the real case — a kernel present and an initramfs missing,
+        // i.e. a genuinely broken install — distinguishable from a build
+        // that has not produced an image yet.
+        if dir.join("Image").is_file() {
             return Ok((Self::in_dir(dir)?, Provenance::Project));
         }
-        // Not built yet. The base still boots, and the caller says so.
-        Ok((Self::find(rachna_root)?, Provenance::BaseNotYetBuilt))
+        // A CLOSURE WITHOUT AN IMAGE is its own state, because the advice
+        // differs: telling someone to run `rachna build` after they just
+        // ran it reads as the tool being broken.
+        let provenance = if crate::closure::closure_record(&dir).is_file() {
+            Provenance::ClosureBuiltButNoImage
+        } else {
+            Provenance::BaseNotYetBuilt
+        };
+        Ok((Self::find(rachna_root)?, provenance))
     }
 
     /// The three files, verified, in one directory.
@@ -190,11 +220,20 @@ pub enum Provenance {
     Base,
     /// An image built for this project's package set.
     Project,
-    /// The project declared packages, but no image is built for them yet.
+    /// The project declared packages and nothing has been built for them.
     ///
-    /// The base guest boots and ships `devenv`, so this is usable — but the
-    /// declared packages are NOT present, and the user must be told.
+    /// The base guest boots, but the declared packages are NOT present and
+    /// the user must be told — and told to run `rachna build`.
     BaseNotYetBuilt,
+    /// The closure IS built; turning it into an image is not implemented.
+    ///
+    /// Distinct from [`Self::BaseNotYetBuilt`] because the advice differs
+    /// and the wrong advice is worse than none. Measured: after a
+    /// successful `rachna build`, `start` told the user to run `rachna
+    /// build` — which they had just done, and which would change nothing.
+    /// A message that names an action the user already took reads as the
+    /// tool not working.
+    ClosureBuiltButNoImage,
 }
 
 impl Provenance {
@@ -212,6 +251,14 @@ impl Provenance {
             // mean the guest cannot fetch anything. Telling a user to fall
             // back on something that cannot work is worse than saying
             // nothing.
+            // The closure exists, so "run `rachna build`" would be wrong
+            // advice — they did. Says what is actually missing instead.
+            Self::ClosureBuiltButNoImage => Some(
+                "this project's packages are built, but assembling them \
+                 into a guest image is not implemented yet — so the base \
+                 guest is booting WITHOUT them. Nothing you can run fixes \
+                 this today; it is the next piece of work",
+            ),
             Self::BaseNotYetBuilt => Some(
                 "this project declares packages and no image is built for \
                  them yet, so the base guest is booting WITHOUT them. Run \
@@ -681,6 +728,114 @@ mod tests {
         let (_, provenance) = Image::find_for(&root, &spec_with(&["python3"]))
             .expect("the base image is the fallback");
         assert_eq!(provenance, Provenance::BaseNotYetBuilt);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_built_closure_does_not_tell_you_to_build_it_again() {
+        // MEASURED DEFECT. After a successful `rachna build`, `start` said
+        //
+        //   this project declares packages and no image is built for them
+        //   yet … Run `rachna build` first
+        //
+        // to a user who had just run exactly that. Advice naming an action
+        // already taken reads as the tool not working, which is how this
+        // was reported.
+        let root = scratch("closure-advice");
+        let exec = spec_with(&["jq"]);
+        install_image(&crate::layout::guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+        ));
+        let project_dir = crate::layout::project_guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+            &exec.closure_key(),
+        );
+        std::fs::create_dir_all(&project_dir).expect("dirs");
+        std::fs::write(
+            crate::closure::closure_record(&project_dir),
+            "/nix/store/abc-rachna-project-x\n",
+        )
+        .expect("record");
+
+        let (_, provenance) = Image::find_for(&root, &exec).expect("the base image boots");
+        assert_eq!(provenance, Provenance::ClosureBuiltButNoImage);
+        let warning = provenance.warning().expect("this case must warn");
+        assert!(
+            !warning.contains("rachna build"),
+            "do not re-suggest a command the user just ran: {warning}"
+        );
+        assert!(warning.contains("WITHOUT them"), "{warning}");
+        assert!(
+            warning.contains("not implemented yet"),
+            "say what is actually missing: {warning}"
+        );
+
+        // And WITHOUT the record it is the other state, with the other
+        // advice. The two must not collapse into one message.
+        std::fs::remove_file(crate::closure::closure_record(&project_dir)).expect("rm");
+        let (_, provenance) = Image::find_for(&root, &exec).expect("still boots");
+        assert_eq!(provenance, Provenance::BaseNotYetBuilt);
+        assert!(provenance
+            .warning()
+            .expect("must warn")
+            .contains("rachna build"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_holding_only_a_closure_record_is_not_an_image() {
+        // THE REGRESSION. `rachna build` writes `closure-path` into the
+        // project image directory, so that directory exists with no image
+        // in it. The first version of `find_for` tested `dir.is_dir()` and
+        // committed to it, which broke `rachna start` the moment `build`
+        // existed:
+        //
+        //   rachna: the guest image is incomplete:
+        //     …-35e97d38cf5431ea/Image is missing. Rebuild it:
+        //       ./ci/build-guest.sh
+        //
+        // Two things wrong at once: it reported a broken install for a
+        // directory nothing had built an image into, and the advice was
+        // unfollowable — `build-guest.sh` builds the BASE image and never
+        // populates a project directory.
+        let root = scratch("closure-only");
+        let exec = spec_with(&["jq"]);
+        install_image(&crate::layout::guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+        ));
+        let project_dir = crate::layout::project_guest_dir(
+            &root,
+            crate::layout::GUEST_VERSION,
+            host_arch(),
+            &exec.closure_key(),
+        );
+        std::fs::create_dir_all(&project_dir).expect("dirs");
+        std::fs::write(
+            crate::closure::closure_record(&project_dir),
+            "/nix/store/abc-rachna-project-x\n",
+        )
+        .expect("record");
+
+        let (image, provenance) =
+            Image::find_for(&root, &exec).expect("a closure record is not a broken image");
+        // `ClosureBuiltButNoImage`, not `BaseNotYetBuilt`: the record IS
+        // present, and the two states carry different advice.
+        assert_eq!(provenance, Provenance::ClosureBuiltButNoImage);
+        assert!(
+            image.kernel.starts_with(crate::layout::guest_dir(
+                &root,
+                crate::layout::GUEST_VERSION,
+                host_arch()
+            )),
+            "must fall back to the BASE image: {:?}",
+            image.kernel
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
